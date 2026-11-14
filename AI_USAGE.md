@@ -1,0 +1,1 @@
+- crates/core/Cargo.toml, Cargo.lock: serde dependency added. Tool: Gemini 3.8 Flash (High) via agy
