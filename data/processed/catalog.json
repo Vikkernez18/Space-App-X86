@@ -1,0 +1,37 @@
+{
+  "version": "1.0.0",
+  "default_weights": {
+    "slope_safety": 0.35,
+    "roughness_similarity": 0.25,
+    "elevation_relief": 0.20,
+    "geomorphology_match": 0.20
+  },
+  "sites": [
+    {
+      "id": "test_site",
+      "name": "Synthetic Crater & Ridge UV Verification Site",
+      "body": "moon",
+      "description": "Synthetic lunar crater and ridge terrain in Z-up meter coordinates used to verify DemExtent planar UV alignment against an 8x8 checkerboard texture.",
+      "center_lat_lon": [-89.5, 0.0],
+      "dem_extent": {
+        "min_x": -1000.0,
+        "max_x": 1000.0,
+        "min_y": -1000.0,
+        "max_y": 1000.0
+      },
+      "elevation_range_m": [-45.0, 120.0],
+      "triangle_count": 2048,
+      "mesh_path": "test_site/terrain.stl",
+      "texture_path": "test_site/checkerboard.png",
+      "feature_scores": {
+        "slope_safety": 0.85,
+        "roughness_similarity": 0.90,
+        "elevation_relief": 0.75,
+        "geomorphology_match": 0.88
+      },
+      "canonical_score": 0.8485,
+      "generated_by": "AI-assisted (Gemini 4 Argon via Antigravity)"
+    }
+  ],
+  "generated_by": "AI-assisted (Gemini 4 Argon via Antigravity)"
+}

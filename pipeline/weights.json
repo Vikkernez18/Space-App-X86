@@ -1,0 +1,9 @@
+{
+  "weights": {
+    "slope_safety": 0.35,
+    "roughness_similarity": 0.25,
+    "elevation_relief": 0.20,
+    "geomorphology_match": 0.20
+  },
+  "generated_by": "AI-assisted (Gemini 4 Argon via Antigravity)"
+}
