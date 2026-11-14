@@ -1,0 +1,199 @@
+// AI-assisted
+//! Terrain mesh (`.stl` and `.tif`/`.tiff`) and surface texture (`.png` and procedural
+//! UV checkerboard) loader for the Bevy 3D viewer.
+//!
+//! Strictly enforces `AGENTS.md` §2:
+//! - Converts Z-up STL / DEM coordinates to Bevy's right-handed Y-up space via `analog_core`.
+//! - Uses planar UVs derived strictly from `DemExtent` (`min_x`, `max_x`, `min_y`, `max_y`).
+//! - Uses `Indices::U32` and enforces `<= 50,000` triangles per site.
+
+use std::io::Cursor;
+
+use analog_core::models::{DemExtent, MeshFormat, SiteMetadata};
+use analog_core::stl::{WeldedMesh, encode_binary_stl, parse_and_weld_stl};
+use analog_core::tiff_dem::parse_dem_tiff;
+use bevy::prelude::*;
+use bevy::render::mesh::{Indices, PrimitiveTopology};
+use bevy::render::render_asset::RenderAssetUsages;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+
+/// Parses either a binary `.stl` or a `.tif`/`.tiff` elevation DEM into a [`WeldedMesh`]
+/// in Bevy right-handed Y-up space with `DemExtent` planar UVs.
+///
+/// Note: For `.tif`/`.tiff` DEMs, `vertical_exaggeration` is passed as `1.0` during mesh
+/// generation because Bevy scales the vertical axis dynamically via
+/// `Transform.scale = Vec3::new(1.0, exaggeration, 1.0)` per `AGENTS.md` §2.3.
+pub fn parse_site_terrain_bytes(
+    bytes: &[u8],
+    site: &SiteMetadata,
+) -> Result<WeldedMesh, String> {
+    let is_tiff_magic = bytes.starts_with(b"II*\x00") || bytes.starts_with(b"MM\x00*");
+    let format = if is_tiff_magic {
+        MeshFormat::Tiff
+    } else {
+        site.resolved_mesh_format()
+    };
+
+    match format {
+        MeshFormat::Stl => parse_and_weld_stl(bytes, &site.dem_extent)
+            .map_err(|e| format!("STL parse error for site '{}': {e}", site.id)),
+        MeshFormat::Tiff => parse_dem_tiff(bytes, &site.dem_extent, 1.0)
+            .map_err(|e| format!("DEM TIFF parse error for site '{}': {e}", site.id)),
+    }
+}
+
+/// Converts an `analog_core::WeldedMesh` into a GPU-ready Bevy [`Mesh`] with `Indices::U32`.
+pub fn welded_mesh_to_bevy_mesh(welded: WeldedMesh) -> Mesh {
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, welded.positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, welded.normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, welded.uvs);
+    mesh.insert_indices(Indices::U32(welded.indices));
+    mesh
+}
+
+/// Decodes an in-memory `.png` byte buffer into an `Rgba8UnormSrgb` Bevy [`Image`].
+pub fn decode_png_to_bevy_image(png_bytes: &[u8]) -> Result<Image, String> {
+    let mut decoder = png::Decoder::new(Cursor::new(png_bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("Failed to read PNG header: {e}"))?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| format!("Failed to decode PNG frame: {e}"))?;
+
+    let raw = &buf[..info.buffer_size()];
+    let pixel_count = (info.width as usize) * (info.height as usize);
+    let mut rgba = Vec::with_capacity(pixel_count * 4);
+
+    match info.color_type {
+        png::ColorType::Rgba => {
+            rgba.extend_from_slice(raw);
+        }
+        png::ColorType::Rgb => {
+            for chunk in raw.chunks_exact(3) {
+                rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+            }
+        }
+        png::ColorType::Grayscale => {
+            for &g in raw {
+                rgba.extend_from_slice(&[g, g, g, 255]);
+            }
+        }
+        png::ColorType::GrayscaleAlpha => {
+            for chunk in raw.chunks_exact(2) {
+                rgba.extend_from_slice(&[chunk[0], chunk[0], chunk[0], chunk[1]]);
+            }
+        }
+        png::ColorType::Indexed => {
+            for &b in raw {
+                rgba.extend_from_slice(&[b, b, b, 255]);
+            }
+        }
+    }
+
+    Ok(Image::new(
+        Extent3d {
+            width: info.width,
+            height: info.height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        rgba,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    ))
+}
+
+/// Builds a procedural 8x8 UV verification checkerboard [`Image`] (`AGENTS.md` §2.4):
+/// - North-West corner tile (`u=0, v=0`) is highlighted in Cyan/Teal.
+/// - South-East corner tile (`u=1, v=1`) is highlighted in Amber/Orange.
+/// - Alternating interior tiles are Light Silver and Dark Slate.
+pub fn build_checkerboard_bevy_image(width: u32, height: u32, tiles: u32) -> Image {
+    let safe_tiles = tiles.max(2);
+    let tile_w = (width / safe_tiles).max(1);
+    let tile_h = (height / safe_tiles).max(1);
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+
+    for y in 0..height {
+        let ty = (y / tile_h).min(safe_tiles - 1);
+        for x in 0..width {
+            let tx = (x / tile_w).min(safe_tiles - 1);
+            let color: [u8; 4] = if tx == 0 && ty == 0 {
+                // North-West corner (u=0, v=0)
+                [0, 210, 220, 255]
+            } else if tx == safe_tiles - 1 && ty == safe_tiles - 1 {
+                // South-East corner (u=1, v=1)
+                [245, 140, 30, 255]
+            } else if (tx + ty) % 2 == 0 {
+                [220, 226, 234, 255]
+            } else {
+                [36, 44, 58, 255]
+            };
+            rgba.extend_from_slice(&color);
+        }
+    }
+
+    Image::new(
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        rgba,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    )
+}
+
+/// Generates the synthetic crater-and-ridge [`WeldedMesh`] in memory for `test_site`
+/// so that the 3D viewer always has an immediate fallback mesh even before disk assets load.
+pub fn generate_synthetic_test_site_welded_mesh(extent: &DemExtent) -> WeldedMesh {
+    let grid_cells = 32usize;
+    let dx = extent.width() / (grid_cells as f32);
+    let dy = extent.height() / (grid_cells as f32);
+    let mut triangles: Vec<[[f32; 3]; 3]> = Vec::with_capacity(grid_cells * grid_cells * 2);
+
+    let elev = |x: f32, y: f32| -> f32 {
+        let r = (x * x + y * y).sqrt();
+        let bowl = -65.0 * (-(r / 320.0).powi(2)).exp();
+        let rim = 85.0 * (-((r - 450.0) / 140.0).powi(2)).exp();
+        let ridge = 20.0 * (x / 350.0).sin() * (y / 400.0).cos();
+        (bowl + rim + ridge + 15.0).clamp(-45.0, 120.0)
+    };
+
+    for iy in 0..grid_cells {
+        let y0 = extent.min_y + (iy as f32) * dy;
+        let y1 = if iy + 1 == grid_cells {
+            extent.max_y
+        } else {
+            extent.min_y + ((iy + 1) as f32) * dy
+        };
+        for ix in 0..grid_cells {
+            let x0 = extent.min_x + (ix as f32) * dx;
+            let x1 = if ix + 1 == grid_cells {
+                extent.max_x
+            } else {
+                extent.min_x + ((ix + 1) as f32) * dx
+            };
+
+            let v00 = [x0, y0, elev(x0, y0)];
+            let v10 = [x1, y0, elev(x1, y0)];
+            let v11 = [x1, y1, elev(x1, y1)];
+            let v01 = [x0, y1, elev(x0, y1)];
+
+            triangles.push([v00, v10, v11]);
+            triangles.push([v00, v11, v01]);
+        }
+    }
+
+    let stl_bytes = encode_binary_stl(&triangles);
+    parse_and_weld_stl(&stl_bytes, extent).expect("synthetic test_site STL must be valid")
+}

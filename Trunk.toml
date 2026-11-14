@@ -1,0 +1,11 @@
+# AI-assisted
+[build]
+target = "crates/viewer/index.html"
+dist = "dist"
+public_url = "/Space-App-X86/"
+
+[watch]
+ignore = ["dist", "target"]
+
+[[proxy]]
+backend = "http://127.0.0.1:8080/api"
