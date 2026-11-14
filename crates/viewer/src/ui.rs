@@ -401,10 +401,11 @@ pub fn viewer_ui_system(
                     .map(|s| (s.id.clone(), s.name.clone(), s.body))
                     .collect();
 
+                let current_primary_label = app_state.primary_site_id.clone();
                 ui.horizontal(|ui| {
                     ui.label("Primary Site:");
                     egui::ComboBox::from_id_source("primary_site_combo")
-                        .selected_text(&app_state.primary_site_id)
+                        .selected_text(current_primary_label)
                         .width(230.0)
                         .show_ui(ui, |ui| {
                             for (id, name, body) in &filtered_sites {
@@ -428,12 +429,13 @@ pub fn viewer_ui_system(
                 });
 
                 // Side-by-side comparison site selector
+                let all_sites: Vec<SiteMetadata> = app_state.catalog.sites.clone();
+                let current_comp_label = app_state
+                    .comparison_site_id
+                    .clone()
+                    .unwrap_or_else(|| "None (Single View)".to_string());
                 ui.horizontal(|ui| {
                     ui.label("Compare With:");
-                    let current_comp_label = app_state
-                        .comparison_site_id
-                        .as_deref()
-                        .unwrap_or("None (Single View)");
                     egui::ComboBox::from_id_source("comparison_site_combo")
                         .selected_text(current_comp_label)
                         .width(230.0)
@@ -448,15 +450,18 @@ pub fn viewer_ui_system(
                                 app_state.comparison_site_id = None;
                                 app_state.pending_reload_comparison = true;
                             }
-                            for s in &app_state.catalog.sites {
-                                let label =
-                                    format!("[{}] {} ({})", s.body.as_str().to_uppercase(), s.name, s.id);
+                            for s in &all_sites {
+                                let label = format!(
+                                    "[{}] {} ({})",
+                                    s.body.as_str().to_uppercase(),
+                                    s.name,
+                                    s.id
+                                );
                                 let selected =
                                     app_state.comparison_site_id.as_deref() == Some(s.id.as_str());
                                 if ui.selectable_label(selected, label).clicked() {
-                                    let site_clone = s.clone();
-                                    app_state.comparison_site_id = Some(site_clone.id.clone());
-                                    net.fetch_site_assets(TerrainSlot::Comparison, &site_clone);
+                                    app_state.comparison_site_id = Some(s.id.clone());
+                                    net.fetch_site_assets(TerrainSlot::Comparison, s);
                                     app_state.pending_reload_comparison = true;
                                 }
                             }
