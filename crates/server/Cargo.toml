@@ -1,6 +1,19 @@
+# AI-assisted
 [package]
 name = "analog_server"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+analog_core = { path = "../core" }
+argon2 = { version = "0.5", features = ["std"] }
+axum = "0.8"
+dotenvy = "0.15"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
