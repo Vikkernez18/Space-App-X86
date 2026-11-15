@@ -26,9 +26,9 @@ use bevy_egui::EguiPlugin;
 
 use camera::{OrbitCamera, orbit_camera_system};
 use mesh_loader::{
-    build_checkerboard_bevy_image, compute_mesh_bounding_radius, decode_png_to_bevy_image,
-    generate_synthetic_test_site_welded_mesh, parse_site_terrain_bytes, summarize_site_mesh,
-    welded_mesh_to_bevy_mesh,
+    SurfaceSkinMode, apply_surface_skin_to_bevy_mesh, build_checkerboard_bevy_image,
+    compute_mesh_bounding_radius, decode_png_to_bevy_image, generate_synthetic_test_site_welded_mesh,
+    parse_site_terrain_bytes, summarize_site_mesh, welded_mesh_to_bevy_mesh,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use net::BrowserSelectedFile;
@@ -56,6 +56,8 @@ pub struct TerrainSceneHandles {
     pub comparison_mesh: Handle<Mesh>,
     pub primary_material: Handle<StandardMaterial>,
     pub comparison_material: Handle<StandardMaterial>,
+    pub applied_skin: SurfaceSkinMode,
+    pub applied_checkerboard: bool,
 }
 
 fn main() {
@@ -67,6 +69,7 @@ fn main() {
         })
         .init_resource::<NetBridge>()
         .init_resource::<ViewerAppState>()
+        .init_resource::<SurfaceSkinMode>()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "Space-App-X86 — Lunar & Martian Terrestrial Analogs 3D Explorer"
@@ -209,6 +212,8 @@ fn setup_scene_system(
         comparison_mesh: comparison_mesh_handle,
         primary_material: primary_mat_handle,
         comparison_material: comparison_mat_handle,
+        applied_skin: SurfaceSkinMode::JmarsTexture,
+        applied_checkerboard: app_state.show_checkerboard_uv,
     });
 
     // Query existing session status and initial catalog/assets
@@ -223,6 +228,7 @@ fn setup_scene_system(
 fn process_net_events_system(
     net: Res<NetBridge>,
     mut app_state: ResMut<ViewerAppState>,
+    skin_mode: Res<SurfaceSkinMode>,
     mut handles: ResMut<TerrainSceneHandles>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
@@ -404,7 +410,13 @@ fn process_net_events_system(
                         let tri_count = welded.triangle_count;
                         let bounding_radius = compute_mesh_bounding_radius(&welded);
                         let summary = summarize_site_mesh(&welded, &site);
-                        let bevy_mesh = welded_mesh_to_bevy_mesh(welded);
+                        let mut bevy_mesh = welded_mesh_to_bevy_mesh(welded);
+                        let effective_skin = if app_state.show_checkerboard_uv {
+                            SurfaceSkinMode::JmarsTexture
+                        } else {
+                            *skin_mode
+                        };
+                        apply_surface_skin_to_bevy_mesh(&mut bevy_mesh, effective_skin);
                         match slot {
                             TerrainSlot::Primary => {
                                 if let Some(m) = meshes.get_mut(&handles.primary_mesh) {
@@ -414,8 +426,11 @@ fn process_net_events_system(
                                 app_state.loaded_primary_bounding_radius = bounding_radius;
                                 app_state.loaded_primary_summary = summary;
                                 app_state.status_message = format!(
-                                    "Loaded 3D mesh for '{}' ({} triangles, centered at origin, R={:.1}m).",
-                                    site.name, tri_count, bounding_radius
+                                    "Loaded 3D mesh for '{}' ({} tris, safe <15 deg: {:.1}%, pad <5 deg: {:.1}%).",
+                                    site.name,
+                                    tri_count,
+                                    summary.safe_landing_pct_under_15deg,
+                                    summary.optimal_pad_pct_under_5deg
                                 );
                                 for (mut cam, mut proj) in &mut cam_query {
                                     cam.frame_terrain(Vec3::ZERO, bounding_radius);
@@ -471,10 +486,12 @@ fn process_net_events_system(
 
 /// Synchronizes vertical exaggeration (`Transform.scale = Vec3::new(1.0, exaggeration, 1.0)`),
 /// synchronized Split-Screen 3D placement along the camera's left/right viewport rays,
-/// and active surface/checkerboard textures.
+/// dynamic per-vertex [`SurfaceSkinMode`] colors (`Mesh::ATTRIBUTE_COLOR`), and active textures.
 fn sync_terrain_visuals_system(
     app_state: Res<ViewerAppState>,
-    handles: Res<TerrainSceneHandles>,
+    skin_mode: Res<SurfaceSkinMode>,
+    mut handles: ResMut<TerrainSceneHandles>,
+    mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     cam_q: Query<
         (&OrbitCamera, &Transform, &Projection),
@@ -570,33 +587,62 @@ fn sync_terrain_visuals_system(
         }
     }
 
-    // Update primary material texture (Checkerboard vs loaded PNG)
-    if let Some(mat) = materials.get_mut(&handles.primary_material) {
-        let target_tex = if app_state.show_checkerboard_uv {
-            handles.checkerboard_texture.clone()
+    // Recompute per-vertex colors when SurfaceSkinMode or Checkerboard UV toggle changes
+    if handles.applied_skin != *skin_mode
+        || handles.applied_checkerboard != app_state.show_checkerboard_uv
+    {
+        let effective_skin = if app_state.show_checkerboard_uv {
+            SurfaceSkinMode::JmarsTexture
         } else {
-            handles
-                .primary_site_texture
-                .clone()
-                .unwrap_or_else(|| handles.checkerboard_texture.clone())
+            *skin_mode
         };
-        if mat.base_color_texture.as_ref() != Some(&target_tex) {
-            mat.base_color_texture = Some(target_tex);
+        if let Some(m) = meshes.get_mut(&handles.primary_mesh) {
+            apply_surface_skin_to_bevy_mesh(m, effective_skin);
+        }
+        if let Some(m) = meshes.get_mut(&handles.comparison_mesh) {
+            apply_surface_skin_to_bevy_mesh(m, effective_skin);
+        }
+        handles.applied_skin = *skin_mode;
+        handles.applied_checkerboard = app_state.show_checkerboard_uv;
+    }
+
+    let use_texture = app_state.show_checkerboard_uv || skin_mode.uses_surface_texture();
+
+    // Update primary material texture (Checkerboard vs loaded PNG vs vertex-colored skin)
+    if let Some(mat) = materials.get_mut(&handles.primary_material) {
+        let target_tex = if !use_texture {
+            None
+        } else if app_state.show_checkerboard_uv {
+            Some(handles.checkerboard_texture.clone())
+        } else {
+            Some(
+                handles
+                    .primary_site_texture
+                    .clone()
+                    .unwrap_or_else(|| handles.checkerboard_texture.clone()),
+            )
+        };
+        if mat.base_color_texture != target_tex {
+            mat.base_color_texture = target_tex;
         }
     }
 
     // Update comparison material texture
     if let Some(mat) = materials.get_mut(&handles.comparison_material) {
-        let target_tex = if app_state.show_checkerboard_uv {
-            handles.checkerboard_texture.clone()
+        let target_tex = if !use_texture {
+            None
+        } else if app_state.show_checkerboard_uv {
+            Some(handles.checkerboard_texture.clone())
         } else {
-            handles
-                .comparison_site_texture
-                .clone()
-                .unwrap_or_else(|| handles.checkerboard_texture.clone())
+            Some(
+                handles
+                    .comparison_site_texture
+                    .clone()
+                    .unwrap_or_else(|| handles.checkerboard_texture.clone()),
+            )
         };
-        if mat.base_color_texture.as_ref() != Some(&target_tex) {
-            mat.base_color_texture = Some(target_tex);
+        if mat.base_color_texture != target_tex {
+            mat.base_color_texture = target_tex;
         }
     }
 }

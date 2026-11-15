@@ -15,7 +15,7 @@ use analog_core::stl::{WeldedMesh, encode_binary_stl, parse_and_weld_stl};
 use analog_core::terrain_analysis::compute_topology_metrics;
 use analog_core::tiff_dem::parse_dem_tiff;
 use bevy::prelude::*;
-use bevy::render::mesh::{Indices, PrimitiveTopology};
+use bevy::render::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
@@ -23,8 +23,64 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 /// `.png` textures never exceed WebGL2 `MAX_TEXTURE_SIZE` or exhaust WASM memory.
 pub const MAX_VIEWER_TEXTURE_DIM: u32 = 2048;
 
-/// Summary of elevation bounds and topological invariants (0D Persistent Homology $\beta_0$
-/// and simplicial Euler characteristic $\chi = V - E + F$) for a terrain site.
+/// Real-time 3D surface skin / scientific color palette modes (`Resource`).
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SurfaceSkinMode {
+    /// 1. Uses the uploaded `.png` JMARS / albedo texture or generated hypsometric texture.
+    #[default]
+    JmarsTexture,
+    /// 2. Lunar LOLA Hypsometric: dark basalt mare -> silver regolith -> golden crest.
+    LunarLolaHypsometric,
+    /// 3. Martian MOLA Relief: deep sienna/blue basin -> ferric oxide rust -> bright ochre.
+    MartianMolaRelief,
+    /// 4. Terrestrial Topo Analog: basin green -> slope ochre -> grey rock -> white summit.
+    TerrestrialTopoAnalog,
+    /// 5. Landing Slope Hazard (<5° / 15°): green `#22C55E` (<5°), amber `#F59E0B` (5°–15°), red `#EF4444` (>15°).
+    LandingSlopeHazard,
+    /// 6. Raw Clay Mesh (Untextured): classic neutral grey clay mesh.
+    RawClayMesh,
+}
+
+impl SurfaceSkinMode {
+    pub const ALL: [Self; 6] = [
+        Self::JmarsTexture,
+        Self::LunarLolaHypsometric,
+        Self::MartianMolaRelief,
+        Self::TerrestrialTopoAnalog,
+        Self::LandingSlopeHazard,
+        Self::RawClayMesh,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::JmarsTexture => "1. JMARS / Albedo Texture",
+            Self::LunarLolaHypsometric => "2. Lunar LOLA Hypsometric",
+            Self::MartianMolaRelief => "3. Martian MOLA Relief",
+            Self::TerrestrialTopoAnalog => "4. Terrestrial Topo Analog",
+            Self::LandingSlopeHazard => "5. Landing Slope Hazard (<5° / 15°)",
+            Self::RawClayMesh => "6. Raw Clay Mesh (Untextured)",
+        }
+    }
+
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            Self::JmarsTexture => "JMARS Texture",
+            Self::LunarLolaHypsometric => "Lunar LOLA",
+            Self::MartianMolaRelief => "Mars MOLA",
+            Self::TerrestrialTopoAnalog => "Earth Topo",
+            Self::LandingSlopeHazard => "Slope <5°/15°",
+            Self::RawClayMesh => "Raw Clay",
+        }
+    }
+
+    pub fn uses_surface_texture(&self) -> bool {
+        matches!(self, Self::JmarsTexture)
+    }
+}
+
+/// Summary of elevation bounds, landing slope safety metrics, and topological invariants
+/// (0D Persistent Homology $\beta_0$ and simplicial Euler characteristic $\chi = V - E + F$)
+/// for a terrain site.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SiteMeshSummary {
     pub triangle_count: u32,
@@ -33,17 +89,26 @@ pub struct SiteMeshSummary {
     pub persistent_basins_b0: usize,
     pub persistent_peaks_b0: usize,
     pub euler_characteristic: i64,
+    /// Percentage of terrain surface with slope `< 15°` (safe for lander touchdown & rover traverse).
+    pub safe_landing_pct_under_15deg: f32,
+    /// Percentage of terrain surface with slope `< 5°` (optimal flat pad for habitat foundation).
+    pub optimal_pad_pct_under_5deg: f32,
+    /// Mean surface slope angle in degrees computed from mesh vertex normals.
+    pub mean_slope_deg: f32,
 }
 
 impl Default for SiteMeshSummary {
     fn default() -> Self {
         Self {
             triangle_count: 2048,
-            min_elevation_m: -45.0,
-            max_elevation_m: 120.0,
+            min_elevation_m: -45.0_f32,
+            max_elevation_m: 120.0_f32,
             persistent_basins_b0: 2,
             persistent_peaks_b0: 2,
             euler_characteristic: 1,
+            safe_landing_pct_under_15deg: 78.5_f32,
+            optimal_pad_pct_under_5deg: 34.2_f32,
+            mean_slope_deg: 8.4_f32,
         }
     }
 }
@@ -82,7 +147,17 @@ pub fn extract_tda_from_description(desc: &str) -> Option<(usize, usize, i64)> {
 /// Estimates [`SiteMeshSummary`] directly from [`SiteMetadata`] (used before a site's 3D mesh
 /// bytes have finished loading over HTTP).
 pub fn estimate_site_summary_from_metadata(site: &SiteMetadata) -> SiteMeshSummary {
-    let [min_elevation_m, max_elevation_m] = site.elevation_range_m.unwrap_or([-50.0, 50.0]);
+    let [min_elevation_m, max_elevation_m] =
+        site.elevation_range_m.unwrap_or([-50.0_f32, 50.0_f32]);
+    let slope_safety = site
+        .feature_scores
+        .get("slope_safety")
+        .copied()
+        .unwrap_or(0.75) as f32;
+    let safe_landing_pct_under_15deg = (slope_safety * 94.0_f32).clamp(5.0_f32, 99.0_f32);
+    let optimal_pad_pct_under_5deg = (slope_safety * 58.0_f32).clamp(2.0_f32, 92.0_f32);
+    let mean_slope_deg = ((1.0_f32 - slope_safety) * 24.0_f32).clamp(1.5_f32, 35.0_f32);
+
     let (persistent_basins_b0, persistent_peaks_b0, euler_characteristic) =
         extract_tda_from_description(&site.description).unwrap_or_else(|| {
             let relief_score = site
@@ -96,7 +171,8 @@ pub fn estimate_site_summary_from_metadata(site: &SiteMetadata) -> SiteMeshSumma
                 .copied()
                 .unwrap_or(0.5);
             let est_basins = ((relief_score * 8.0 + rough_score * 6.0).round() as usize).max(1);
-            let est_peaks = ((relief_score * 5.0 + (1.0 - rough_score) * 4.0).round() as usize).max(1);
+            let est_peaks =
+                ((relief_score * 5.0 + (1.0 - rough_score) * 4.0).round() as usize).max(1);
             (est_basins, est_peaks, 1)
         });
 
@@ -107,7 +183,41 @@ pub fn estimate_site_summary_from_metadata(site: &SiteMetadata) -> SiteMeshSumma
         persistent_basins_b0,
         persistent_peaks_b0,
         euler_characteristic,
+        safe_landing_pct_under_15deg,
+        optimal_pad_pct_under_5deg,
+        mean_slope_deg,
     }
+}
+
+/// Computes landing slope percentages (`< 15°` safe area, `< 5°` optimal pad, and mean slope)
+/// directly from the Bevy Y-up vertex normals (`acos(|normal.y|)`).
+fn compute_landing_safety_from_normals(normals: &[[f32; 3]]) -> (f32, f32, f32) {
+    if normals.is_empty() {
+        return (75.0_f32, 30.0_f32, 9.0_f32);
+    }
+    let mut safe_15_count = 0usize;
+    let mut optimal_5_count = 0usize;
+    let mut slope_sum = 0.0_f32;
+
+    for n in normals {
+        let ny = n[1].abs().clamp(0.0_f32, 1.0_f32);
+        let slope_deg = ny.acos().to_degrees();
+        if slope_deg.is_finite() {
+            slope_sum += slope_deg;
+            if slope_deg < 15.0_f32 {
+                safe_15_count += 1;
+            }
+            if slope_deg < 5.0_f32 {
+                optimal_5_count += 1;
+            }
+        }
+    }
+
+    let total = (normals.len().max(1)) as f32;
+    let safe_15_pct = (safe_15_count as f32 / total * 100.0_f32).clamp(0.0_f32, 100.0_f32);
+    let optimal_5_pct = (optimal_5_count as f32 / total * 100.0_f32).clamp(0.0_f32, 100.0_f32);
+    let mean_slope = (slope_sum / total).clamp(0.0_f32, 90.0_f32);
+    (safe_15_pct, optimal_5_pct, mean_slope)
 }
 
 /// Computes an exact [`SiteMeshSummary`] from a loaded [`WeldedMesh`] and its [`SiteMetadata`].
@@ -139,8 +249,11 @@ pub fn summarize_site_mesh(mesh: &WeldedMesh, site: &SiteMetadata) -> SiteMeshSu
     } else if min_y.is_finite() && max_y.is_finite() {
         (min_y, max_y)
     } else {
-        (-50.0, 50.0)
+        (-50.0_f32, 50.0_f32)
     };
+
+    let (safe_landing_pct_under_15deg, optimal_pad_pct_under_5deg, mean_slope_deg) =
+        compute_landing_safety_from_normals(&mesh.normals);
 
     if let Some((basins, peaks, euler)) = extract_tda_from_description(&site.description) {
         return SiteMeshSummary {
@@ -150,33 +263,36 @@ pub fn summarize_site_mesh(mesh: &WeldedMesh, site: &SiteMetadata) -> SiteMeshSu
             persistent_basins_b0: basins,
             persistent_peaks_b0: peaks,
             euler_characteristic: euler,
+            safe_landing_pct_under_15deg,
+            optimal_pad_pct_under_5deg,
+            mean_slope_deg,
         };
     }
 
     // Fast 48x48 elevation projection for live 0D Persistent Homology & simplicial Euler χ
     let gw = 48usize;
     let gh = 48usize;
-    let span_x = (max_x - min_x).max(1.0);
-    let span_z = (max_z - min_z).max(1.0);
+    let span_x = (max_x - min_x).max(1.0_f32);
+    let span_z = (max_z - min_z).max(1.0_f32);
     let mut accum = vec![0.0_f32; gw * gh];
     let mut counts = vec![0_u32; gw * gh];
     for p in &mesh.positions {
-        let u = ((p[0] - min_x) / span_x).clamp(0.0, 1.0);
-        let v = ((p[2] - min_z) / span_z).clamp(0.0, 1.0);
+        let u = ((p[0] - min_x) / span_x).clamp(0.0_f32, 1.0_f32);
+        let v = ((p[2] - min_z) / span_z).clamp(0.0_f32, 1.0_f32);
         let cx = ((u * ((gw - 1) as f32)).round() as usize).min(gw - 1);
         let cy = ((v * ((gh - 1) as f32)).round() as usize).min(gh - 1);
         let idx = cy * gw + cx;
         accum[idx] += p[1];
         counts[idx] += 1;
     }
-    let mean_elev = 0.5 * (min_y + max_y);
+    let mean_elev = 0.5_f32 * (min_y + max_y);
     let mut grid = vec![mean_elev; gw * gh];
     for i in 0..(gw * gh) {
         if counts[i] > 0 {
             grid[i] = accum[i] / (counts[i] as f32);
         }
     }
-    let elev_range = f64::from((max_elevation_m - min_elevation_m).abs().max(1.0));
+    let elev_range = f64::from((max_elevation_m - min_elevation_m).abs().max(1.0_f32));
     let topo = compute_topology_metrics(gw, gh, &grid, elev_range, mesh);
 
     SiteMeshSummary {
@@ -186,6 +302,9 @@ pub fn summarize_site_mesh(mesh: &WeldedMesh, site: &SiteMetadata) -> SiteMeshSu
         persistent_basins_b0: topo.persistent_basins_b0,
         persistent_peaks_b0: topo.persistent_peaks_b0,
         euler_characteristic: topo.euler_characteristic,
+        safe_landing_pct_under_15deg,
+        optimal_pad_pct_under_5deg,
+        mean_slope_deg,
     }
 }
 
@@ -289,8 +408,128 @@ pub fn parse_site_terrain_bytes(
     Ok(welded)
 }
 
+/// Linearly interpolates between two RGB colors `[r, g, b]` in `[0.0, 1.0]`.
+#[inline]
+fn lerp_rgb(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 4] {
+    let tc = t.clamp(0.0_f32, 1.0_f32);
+    [
+        a[0] + (b[0] - a[0]) * tc,
+        a[1] + (b[1] - a[1]) * tc,
+        a[2] + (b[2] - a[2]) * tc,
+        1.0_f32,
+    ]
+}
+
+/// Dynamically computes and assigns `Mesh::ATTRIBUTE_COLOR` per vertex on `mesh` according to
+/// the active [`SurfaceSkinMode`] (normalized vertex elevation `y` or local slope angle `acos(|normal.y|)`).
+pub fn apply_surface_skin_to_bevy_mesh(mesh: &mut Mesh, skin: SurfaceSkinMode) {
+    let Some(VertexAttributeValues::Float32x3(positions)) =
+        mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+    else {
+        return;
+    };
+    let n_verts = positions.len();
+    if n_verts == 0 {
+        return;
+    }
+
+    if matches!(skin, SurfaceSkinMode::JmarsTexture) {
+        let white = vec![[1.0_f32, 1.0_f32, 1.0_f32, 1.0_f32]; n_verts];
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, white);
+        return;
+    }
+
+    if matches!(skin, SurfaceSkinMode::RawClayMesh) {
+        let clay = vec![[0.76_f32, 0.80_f32, 0.85_f32, 1.0_f32]; n_verts];
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, clay);
+        return;
+    }
+
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for p in positions {
+        if p[1].is_finite() {
+            min_y = min_y.min(p[1]);
+            max_y = max_y.max(p[1]);
+        }
+    }
+    let span_y = (max_y - min_y).max(1e-3_f32);
+
+    let normals_opt = match mesh.attribute(Mesh::ATTRIBUTE_NORMAL) {
+        Some(VertexAttributeValues::Float32x3(norms)) => Some(norms.as_slice()),
+        _ => None,
+    };
+
+    let mut colors = Vec::with_capacity(n_verts);
+    for i in 0..n_verts {
+        let y = positions[i][1];
+        let t = ((y - min_y) / span_y).clamp(0.0_f32, 1.0_f32);
+        let ny = normals_opt
+            .and_then(|ns| ns.get(i))
+            .map(|n| n[1].abs().clamp(0.0_f32, 1.0_f32))
+            .unwrap_or(1.0_f32);
+        let slope_deg = ny.acos().to_degrees();
+
+        let rgba = match skin {
+            SurfaceSkinMode::JmarsTexture => [1.0_f32, 1.0_f32, 1.0_f32, 1.0_f32],
+            SurfaceSkinMode::RawClayMesh => [0.76_f32, 0.80_f32, 0.85_f32, 1.0_f32],
+            SurfaceSkinMode::LunarLolaHypsometric => {
+                // Dark basalt mare -> silver regolith -> golden crest
+                let mare = [0.12_f32, 0.14_f32, 0.19_f32];
+                let regolith = [0.58_f32, 0.64_f32, 0.72_f32];
+                let crest = [0.98_f32, 0.82_f32, 0.22_f32];
+                if t < 0.55_f32 {
+                    lerp_rgb(mare, regolith, t / 0.55_f32)
+                } else {
+                    lerp_rgb(regolith, crest, (t - 0.55_f32) / 0.45_f32)
+                }
+            }
+            SurfaceSkinMode::MartianMolaRelief => {
+                // Deep basin blue/sienna -> ferric oxide rust -> bright ochre
+                let basin = [0.16_f32, 0.23_f32, 0.36_f32];
+                let rust = [0.76_f32, 0.26_f32, 0.08_f32];
+                let ochre = [0.98_f32, 0.74_f32, 0.45_f32];
+                if t < 0.45_f32 {
+                    lerp_rgb(basin, rust, t / 0.45_f32)
+                } else {
+                    lerp_rgb(rust, ochre, (t - 0.45_f32) / 0.55_f32)
+                }
+            }
+            SurfaceSkinMode::TerrestrialTopoAnalog => {
+                // Basin green -> slope ochre -> grey rock -> white peak
+                let green = [0.09_f32, 0.50_f32, 0.24_f32];
+                let ochre = [0.79_f32, 0.54_f32, 0.04_f32];
+                let rock = [0.47_f32, 0.44_f32, 0.42_f32];
+                let snow = [0.96_f32, 0.98_f32, 0.99_f32];
+                if t < 0.35_f32 {
+                    lerp_rgb(green, ochre, t / 0.35_f32)
+                } else if t < 0.75_f32 {
+                    lerp_rgb(ochre, rock, (t - 0.35_f32) / 0.40_f32)
+                } else {
+                    lerp_rgb(rock, snow, (t - 0.75_f32) / 0.25_f32)
+                }
+            }
+            SurfaceSkinMode::LandingSlopeHazard => {
+                // Scientific landing safety map:
+                // < 5 deg: green #22C55E | 5-15 deg: amber #F59E0B | > 15 deg: red #EF4444
+                if slope_deg < 5.0_f32 {
+                    [0.133_f32, 0.773_f32, 0.369_f32, 1.0_f32]
+                } else if slope_deg <= 15.0_f32 {
+                    [0.961_f32, 0.620_f32, 0.043_f32, 1.0_f32]
+                } else {
+                    [0.937_f32, 0.267_f32, 0.267_f32, 1.0_f32]
+                }
+            }
+        };
+        colors.push(rgba);
+    }
+
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+}
+
 /// Converts an `analog_core::WeldedMesh` into a GPU-ready Bevy [`Mesh`] with `Indices::U32`.
 pub fn welded_mesh_to_bevy_mesh(welded: WeldedMesh) -> Mesh {
+    let n_verts = welded.positions.len();
     let mut mesh = Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
@@ -298,6 +537,10 @@ pub fn welded_mesh_to_bevy_mesh(welded: WeldedMesh) -> Mesh {
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, welded.positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, welded.normals);
     mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, welded.uvs);
+    mesh.insert_attribute(
+        Mesh::ATTRIBUTE_COLOR,
+        vec![[1.0_f32, 1.0_f32, 1.0_f32, 1.0_f32]; n_verts],
+    );
     mesh.insert_indices(Indices::U32(welded.indices));
     mesh
 }

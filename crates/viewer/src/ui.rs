@@ -25,7 +25,9 @@ use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
 
 use crate::camera::OrbitCamera;
-use crate::mesh_loader::{SiteMeshSummary, estimate_site_summary_from_metadata};
+use crate::mesh_loader::{
+    SiteMeshSummary, SurfaceSkinMode, estimate_site_summary_from_metadata,
+};
 use crate::net::{
     BrowserSelectedFile, NetBridge, TerrainSlot, fallback_synthetic_catalog,
     open_browser_file_dialog,
@@ -240,6 +242,14 @@ pub struct PairwiseAnalogSimilarity {
     pub dimensions: Vec<(String, f64, f64, f64)>,
     pub delta_b0_basins: Option<i64>,
     pub delta_euler_chi: Option<i64>,
+    pub primary_safe_landing_15_pct: f32,
+    pub primary_optimal_pad_5_pct: f32,
+    pub primary_mean_slope_deg: f32,
+    pub primary_b0_basins: usize,
+    pub compare_safe_landing_15_pct: f32,
+    pub compare_optimal_pad_5_pct: f32,
+    pub compare_mean_slope_deg: f32,
+    pub compare_b0_basins: usize,
 }
 
 /// Global UI & application state resource for `analog_viewer`.
@@ -458,6 +468,14 @@ impl ViewerAppState {
             dimensions,
             delta_b0_basins,
             delta_euler_chi,
+            primary_safe_landing_15_pct: prim_sum.safe_landing_pct_under_15deg,
+            primary_optimal_pad_5_pct: prim_sum.optimal_pad_pct_under_5deg,
+            primary_mean_slope_deg: prim_sum.mean_slope_deg,
+            primary_b0_basins: prim_sum.persistent_basins_b0,
+            compare_safe_landing_15_pct: comp_sum.safe_landing_pct_under_15deg,
+            compare_optimal_pad_5_pct: comp_sum.optimal_pad_pct_under_5deg,
+            compare_mean_slope_deg: comp_sum.mean_slope_deg,
+            compare_b0_basins: comp_sum.persistent_basins_b0,
         })
     }
 }
@@ -536,6 +554,7 @@ fn format_hms(seconds_of_day: f64) -> String {
 pub fn viewer_ui_system(
     mut contexts: EguiContexts,
     mut app_state: ResMut<ViewerAppState>,
+    mut skin_mode: ResMut<SurfaceSkinMode>,
     net: Res<NetBridge>,
     keys: Res<ButtonInput<KeyCode>>,
     mut camera_query: Query<(&mut OrbitCamera, &mut Projection)>,
@@ -842,6 +861,7 @@ pub fn viewer_ui_system(
                                 render_tab_view_and_camera(
                                     ui,
                                     &mut app_state,
+                                    &mut skin_mode,
                                     &mut camera_query,
                                 );
                             }
@@ -1012,6 +1032,21 @@ pub fn viewer_ui_system(
                         cam.apply_perspective_clip_planes(&mut proj);
                     }
                 }
+
+                egui::ComboBox::from_id_source("toolbar_surface_skin_combo")
+                    .selected_text(format!("Skin: {}", skin_mode.short_label()))
+                    .width(138.0_f32)
+                    .show_ui(ui, |ui| {
+                        for candidate in SurfaceSkinMode::ALL {
+                            if ui
+                                .selectable_label(*skin_mode == candidate, candidate.label())
+                                .clicked()
+                            {
+                                *skin_mode = candidate;
+                                app_state.show_checkerboard_uv = false;
+                            }
+                        }
+                    });
 
                 if ui
                     .small_button("[Full 3D]")
@@ -1788,13 +1823,19 @@ fn render_tab_sites_and_compare(
                 let s = &app_state.loaded_primary_summary;
                 let relief_dz = (s.max_elevation_m - s.min_elevation_m).max(0.0);
                 ui.monospace(format!(
-                    "Extent: {:.1}m x {:.1}m | Relief dz: {:.1}m | b0 basins: {} | chi: {} | {} tris",
+                    "Extent: {:.1}m × {:.1}m | Relief Δz: {:.1}m | β₀ basins: {} | χ: {} | {} tris",
                     site.dem_extent.width(),
                     site.dem_extent.height(),
                     relief_dz,
                     s.persistent_basins_b0,
                     s.euler_characteristic,
                     app_state.loaded_primary_triangles
+                ));
+                ui.monospace(format!(
+                    "Landing Safety: <15° Safe = {:.1}% | <5° Optimal Pad = {:.1}% | Mean θ = {:.1}°",
+                    s.safe_landing_pct_under_15deg,
+                    s.optimal_pad_pct_under_5deg,
+                    s.mean_slope_deg
                 ));
             });
     }
@@ -1815,14 +1856,14 @@ fn render_tab_sites_and_compare(
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(
-                        "Planetary Analog Similarity Breakdown (Earth <-> Moon/Mars)",
+                        "Planetary Analog Similarity Breakdown (Earth ↔ Moon/Mars)",
                     )
                     .strong()
                     .color(egui::Color32::from_rgb(125, 211, 252)),
                 );
                 ui.label(
                     egui::RichText::new(format!(
-                        "{} [{}]  <->  {} [{}]",
+                        "{} [{}]  ↔  {} [{}]",
                         sim.primary_name,
                         sim.primary_body.as_str().to_uppercase(),
                         sim.compare_name,
@@ -1864,7 +1905,7 @@ fn render_tab_sites_and_compare(
                 if sim.delta_b0_basins.is_some() || sim.delta_euler_chi.is_some() {
                     ui.add_space(4.0);
                     ui.monospace(format!(
-                        "TDA Invariants: b0 basins = {} | Euler chi = {}",
+                        "TDA Invariants: Δβ₀ basins = {} | Δχ Euler = {}",
                         sim.delta_b0_basins
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "n/a".to_string()),
@@ -1873,6 +1914,52 @@ fn render_tab_sites_and_compare(
                             .unwrap_or_else(|| "n/a".to_string()),
                     ));
                 }
+
+                // Mission Engineering Indicator: Landing Safety & Cold-Trap Proxy Comparison
+                ui.add_space(6.0);
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(9, 14, 24))
+                    .inner_margin(egui::Margin::same(8.0))
+                    .rounding(egui::Rounding::same(5.0))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(34, 197, 94),
+                    ))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Mission Engineering: Landing Safety & Cold-Trap Proxy",
+                            )
+                            .small()
+                            .strong()
+                            .color(egui::Color32::from_rgb(74, 222, 128)),
+                        );
+                        ui.monospace(format!(
+                            "Safe Landing (< 15°): {:.1}% ({})  ↔  {:.1}% ({})",
+                            sim.primary_safe_landing_15_pct,
+                            sim.primary_body.as_str().to_uppercase(),
+                            sim.compare_safe_landing_15_pct,
+                            sim.compare_body.as_str().to_uppercase(),
+                        ));
+                        ui.monospace(format!(
+                            "Optimal Pad  (<  5°): {:.1}% (θ̄ {:.1}°) ↔  {:.1}% (θ̄ {:.1}°)",
+                            sim.primary_optimal_pad_5_pct,
+                            sim.primary_mean_slope_deg,
+                            sim.compare_optimal_pad_5_pct,
+                            sim.compare_mean_slope_deg,
+                        ));
+                        ui.monospace(format!(
+                            "Cold-Trap / Shielding Basins (β₀): {}  ↔  {}",
+                            sim.primary_b0_basins, sim.compare_b0_basins
+                        ));
+                        ui.label(
+                            egui::RichText::new(
+                                "Artemis Lunar South Pole & Martian Habitat Utility: Quantifies rollover-safe lander touchdown zones (< 15°), level pressurized habitat foundations (< 5°), and β₀ depression cold-trap / radiation-shielding basins.",
+                            )
+                            .small()
+                            .color(COLOR_TEXT_SECONDARY),
+                        );
+                    });
 
                 ui.add_space(6.0);
                 let split_active =
@@ -1913,14 +2000,181 @@ fn render_tab_sites_and_compare(
     }
 }
 
-/// Tab 2: 3D Vertical Exaggeration, Planar UV Checkerboard test, and Mouse/Keyboard Camera controls.
+/// Tab 2: Real-Time 3D Surface Skin / Palette Selector, Mission Engineering Landing Safety Card,
+/// Vertical Exaggeration, Planar UV Checkerboard test, and Mouse/Keyboard Camera controls.
 fn render_tab_view_and_camera(
     ui: &mut egui::Ui,
     app_state: &mut ViewerAppState,
+    skin_mode: &mut SurfaceSkinMode,
     camera_query: &mut Query<(&mut OrbitCamera, &mut Projection)>,
 ) {
-    ui.heading("2. 3D Terrain & Camera Controls");
+    ui.heading("2. 3D Terrain, Surface Skins & Camera");
     ui.add_space(4.0);
+
+    // -------------------------------------------------------------------------
+    // Card A: Real-Time 3D Surface Skin / Palette Selector (6 Scientific Modes)
+    // -------------------------------------------------------------------------
+    egui::Frame::none()
+        .fill(COLOR_CARD_BG)
+        .inner_margin(egui::Margin::same(10.0))
+        .rounding(egui::Rounding::same(6.0))
+        .stroke(egui::Stroke::new(
+            1.2,
+            egui::Color32::from_rgb(56, 189, 248),
+        ))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Real-Time 3D Surface Skin / Palette Selector")
+                    .strong()
+                    .color(egui::Color32::from_rgb(125, 211, 252)),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Dynamically recolors Primary and Split-View 3D meshes via vertex attributes (elevation y or normal slope angle θ = arccos(n_y)) and material texture switching:",
+                )
+                .small()
+                .color(COLOR_TEXT_SECONDARY),
+            );
+            ui.add_space(4.0);
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Active 3D Skin:").strong());
+                egui::ComboBox::from_id_source("surface_skin_combo")
+                    .selected_text(skin_mode.label())
+                    .width(235.0_f32)
+                    .show_ui(ui, |ui| {
+                        for candidate in SurfaceSkinMode::ALL {
+                            if ui
+                                .selectable_label(*skin_mode == candidate, candidate.label())
+                                .clicked()
+                            {
+                                *skin_mode = candidate;
+                                app_state.show_checkerboard_uv = false;
+                            }
+                        }
+                    });
+            });
+
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                for candidate in SurfaceSkinMode::ALL {
+                    let is_active = *skin_mode == candidate && !app_state.show_checkerboard_uv;
+                    let btn = egui::Button::new(
+                        egui::RichText::new(candidate.short_label())
+                            .small()
+                            .strong()
+                            .color(if is_active {
+                                egui::Color32::WHITE
+                            } else {
+                                COLOR_TEXT_PRIMARY
+                            }),
+                    )
+                    .fill(if is_active {
+                        egui::Color32::from_rgb(37, 99, 235)
+                    } else {
+                        egui::Color32::from_rgb(30, 41, 59)
+                    });
+                    if ui
+                        .add(btn)
+                        .on_hover_text(candidate.label())
+                        .clicked()
+                    {
+                        *skin_mode = candidate;
+                        app_state.show_checkerboard_uv = false;
+                    }
+                }
+            });
+
+            if *skin_mode == SurfaceSkinMode::LandingSlopeHazard {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(34, 197, 94),
+                        "■ Green (#22C55E): Optimal Pad < 5°",
+                    );
+                    ui.colored_label(
+                        egui::Color32::from_rgb(245, 158, 11),
+                        "■ Amber (#F59E0B): Caution 5°–15°",
+                    );
+                    ui.colored_label(
+                        egui::Color32::from_rgb(239, 68, 68),
+                        "■ Red (#EF4444): Hazard > 15°",
+                    );
+                });
+            }
+        });
+
+    ui.add_space(6.0);
+
+    // -------------------------------------------------------------------------
+    // Card B: Scientific Mission Engineering Indicator (Landing Safety & Cold-Trap Proxy)
+    // -------------------------------------------------------------------------
+    let prim_summary = app_state.loaded_primary_summary;
+    egui::Frame::none()
+        .fill(COLOR_CARD_BG)
+        .inner_margin(egui::Margin::same(10.0))
+        .rounding(egui::Rounding::same(6.0))
+        .stroke(egui::Stroke::new(
+            1.2,
+            egui::Color32::from_rgb(34, 197, 94),
+        ))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("Mission Engineering: Landing Safety & Cold-Trap Proxy")
+                        .strong()
+                        .color(egui::Color32::from_rgb(74, 222, 128)),
+                );
+                if *skin_mode != SurfaceSkinMode::LandingSlopeHazard {
+                    if ui
+                        .small_button("Visualize Slope Hazard Map")
+                        .on_hover_text("Switch 3D skin to Landing Slope Hazard (<5° / 15°)")
+                        .clicked()
+                    {
+                        *skin_mode = SurfaceSkinMode::LandingSlopeHazard;
+                        app_state.show_checkerboard_uv = false;
+                    }
+                }
+            });
+
+            ui.add_space(4.0);
+            let safe_15_frac = (prim_summary.safe_landing_pct_under_15deg / 100.0_f32).clamp(0.0, 1.0);
+            ui.add(
+                egui::ProgressBar::new(safe_15_frac)
+                    .text(format!(
+                        "Safe Landing Area (θ < 15°): {:.1}% of surface",
+                        prim_summary.safe_landing_pct_under_15deg
+                    ))
+                    .fill(egui::Color32::from_rgb(245, 158, 11)),
+            );
+
+            let opt_5_frac = (prim_summary.optimal_pad_pct_under_5deg / 100.0_f32).clamp(0.0, 1.0);
+            ui.add(
+                egui::ProgressBar::new(opt_5_frac)
+                    .text(format!(
+                        "Optimal Habitat Pad (θ < 5°): {:.1}% of surface",
+                        prim_summary.optimal_pad_pct_under_5deg
+                    ))
+                    .fill(egui::Color32::from_rgb(34, 197, 94)),
+            );
+
+            ui.add_space(4.0);
+            ui.monospace(format!(
+                "Mean Slope θ̄: {:.2}° | Persistent Basins β₀: {} | Euler χ: {}",
+                prim_summary.mean_slope_deg,
+                prim_summary.persistent_basins_b0,
+                prim_summary.euler_characteristic
+            ));
+            ui.label(
+                egui::RichText::new(
+                    "Mission Utility: Identifies level touchdown ellipses (θ < 15°) and pressurized habitat foundations (θ < 5°) while β₀ basins locate candidate Permanently Shadowed Region (PSR) ice cold-traps for Artemis (Lunar South Pole) and radiation-shielded depressions for Mars.",
+                )
+                .small()
+                .color(COLOR_TEXT_SECONDARY),
+            );
+        });
+
+    ui.add_space(6.0);
 
     ui.label("Vertical Exaggeration (scales Bevy +Y up axis only):");
     ui.add(
@@ -1997,9 +2251,9 @@ fn render_tab_view_and_camera(
             );
             ui.label(
                 egui::RichText::new(
-                    "- Blender / JMARS Z-up STL centered in f64 to (0,0,0) and mapped to Bevy Y-up: X_bevy = X_stl, Y_bevy = Z_stl (Up), Z_bevy = -Y_stl (South).\n\
-                     - Planar UVs from centered DemExtent: u = (X - min_x)/(max_x - min_x), v = (max_y - Y)/(max_y - min_y).\n\
-                     - Mouse / Touchpad: Left-drag = Orbit | Right-drag or Shift+Left-drag = Pan | Scroll = Zoom.",
+                    "• Blender / JMARS Z-up STL centered in f64 to (0,0,0) and mapped to Bevy Y-up: X_bevy = X_stl, Y_bevy = Z_stl (Up), Z_bevy = −Y_stl (South).\n\
+                     • Planar UVs from centered DemExtent: u = (X − min_x)/(max_x − min_x), v = (max_y − Y)/(max_y − min_y).\n\
+                     • Mouse / Touchpad: Left-drag = Orbit | Right-drag or Shift+Left-drag = Pan | Scroll = Zoom.",
                 )
                 .small()
                 .color(COLOR_TEXT_SECONDARY),
@@ -2067,6 +2321,62 @@ fn render_tab_charts_and_math(
     });
 }
 
+/// Helper to render a single mathematical equation card using clean Unicode symbols,
+/// cyan/amber `TextStyle::Monospace` formula boxes, and indented English variable explanations.
+fn render_unicode_equation_card(
+    ui: &mut egui::Ui,
+    id_source: &str,
+    title: &str,
+    title_color: egui::Color32,
+    formula: &str,
+    formula_color: egui::Color32,
+    variables: &[(&str, &str)],
+) {
+    egui::Frame::none()
+        .fill(COLOR_CARD_BG)
+        .inner_margin(egui::Margin::same(10.0))
+        .rounding(egui::Rounding::same(6.0))
+        .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(title).strong().color(title_color));
+            ui.add_space(4.0);
+
+            // Highlighted Monospace Equation Banner
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(9, 14, 24))
+                .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+                .rounding(egui::Rounding::same(4.0))
+                .stroke(egui::Stroke::new(1.0, formula_color))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(formula)
+                            .text_style(egui::TextStyle::Monospace)
+                            .strong()
+                            .color(formula_color),
+                    );
+                });
+
+            ui.add_space(4.0);
+            ui.indent(id_source, |ui| {
+                for (symbol, explanation) in variables {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(*symbol)
+                                .text_style(egui::TextStyle::Monospace)
+                                .strong()
+                                .color(egui::Color32::from_rgb(125, 211, 252)),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("— {explanation}"))
+                                .small()
+                                .color(COLOR_TEXT_SECONDARY),
+                        );
+                    });
+                }
+            });
+        });
+}
+
 /// Draws custom `egui::Painter` multi-bar charts, overall catalog analog ranking bars, and the
 /// collapsible **"Mathematical Foundation & TDA Equations"** reference card.
 fn render_similarity_charts_and_math(ui: &mut egui::Ui, app_state: &ViewerAppState) {
@@ -2079,7 +2389,7 @@ fn render_similarity_charts_and_math(ui: &mut egui::Ui, app_state: &ViewerAppSta
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(format!(
-                        "Pairwise Feature Chart: {} [{}] vs {} [{}] ({:.1}% Match)",
+                        "Pairwise Feature Chart: {} [{}] ↔ {} [{}] ({:.1}% Match)",
                         sim.primary_name,
                         sim.primary_body.as_str().to_uppercase(),
                         sim.compare_name,
@@ -2213,57 +2523,79 @@ fn render_similarity_charts_and_math(ui: &mut egui::Ui, app_state: &ViewerAppSta
             }
         });
 
-    // Collapsible Mathematical Foundation & TDA Equations Card
+    // Collapsible Mathematical Foundation & TDA Equations Card (Styled Unicode Equation Cards)
     ui.add_space(6.0);
     egui::CollapsingHeader::new(
-        egui::RichText::new("Mathematical Foundation & TDA Equations")
+        egui::RichText::new("Mathematical Foundation & TDA Equations (Unicode Reference)")
             .strong()
             .color(egui::Color32::from_rgb(125, 211, 252)),
     )
     .default_open(true)
     .show(ui, |ui| {
-        egui::Frame::none()
-            .fill(COLOR_CARD_BG)
-            .inner_margin(egui::Margin::same(10.0))
-            .rounding(egui::Rounding::same(6.0))
-            .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new("1. Weighted Morphometric Similarity (S_analog):")
-                        .strong()
-                        .color(egui::Color32::from_rgb(74, 222, 128)),
-                );
-                ui.monospace("S_analog(A, B) = sum_i w_i * (1 - |f_{i,A} - f_{i,B}|)");
-                ui.label(
-                    egui::RichText::new(
-                        "where sum_i w_i = 1 and each feature f_i in [0, 1] is normalized from meter-projected DEMs:\n\
-                         * Elevation Relief: dz = z_max - z_min (vertical dynamic range in meters).\n\
-                         * Hypsometric Integral (Geomorphology Match): HI = (z_mean - z_min) / (z_max - z_min), measuring highland vs basin mass distribution.\n\
-                         * Terrain Ruggedness Index (Roughness Similarity): TRI = sqrt((1/8) * sum_{n=1..8} (z_n - z_0)^2) over 3x3 local neighborhood cells.\n\
-                         * Slope Safety: theta = arctan(sqrt((dz/dx)^2 + (dz/dy)^2)), rewarding low-gradient landing pads.",
-                    )
-                    .small()
-                    .color(COLOR_TEXT_SECONDARY),
-                );
+        let cyan = egui::Color32::from_rgb(56, 189, 248);
+        let amber = egui::Color32::from_rgb(250, 204, 21);
+        let green = egui::Color32::from_rgb(74, 222, 128);
 
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(
-                        "2. 0D Persistent Homology (beta_0) & Euler Characteristic (chi):",
-                    )
-                    .strong()
-                    .color(egui::Color32::from_rgb(250, 204, 21)),
-                );
-                ui.monospace("chi = V - E + F   |   Persistence p_k = |d_k - b_k| > tau");
-                ui.label(
-                    egui::RichText::new(
-                        "* Sublevel (-z) and superlevel (+z) filtration via Union-Find (Elder Rule) tracks connected component birth-death pairs (b_k, d_k) to count persistent basins (b0 depressions/craters) and peaks invariant to rigid rotations.\n\
-                         * Simplicial Euler characteristic chi = V - E + F (vertices - edges + faces) captures global genus and multi-scale roughness, penalizing normalized topological discrepancies Delta_b0 and Delta_chi.",
-                    )
-                    .small()
-                    .color(COLOR_TEXT_SECONDARY),
-                );
-            });
+        render_unicode_equation_card(
+            ui,
+            "eq_weighted_similarity",
+            "1. Weighted Morphometric Analog Similarity (S_analog)",
+            green,
+            "S_analog(A, B) = ∑ᵢ wᵢ · (1 − |fᵢ(A) − fᵢ(B)|)     where ∑ᵢ wᵢ = 1",
+            cyan,
+            &[
+                ("S_analog(A, B)", "Pairwise planetary analog similarity in [0, 1] (Earth ↔ Moon/Mars)."),
+                ("wᵢ", "Normalized researcher weight for morphometric dimension i (∑ᵢ wᵢ = 1)."),
+                ("fᵢ(A), fᵢ(B)", "Pre-normalized feature scores in [0, 1] computed from meter-projected DEMs."),
+                ("|fᵢ(A) − fᵢ(B)|", "Absolute feature discrepancy between Primary site A and Partner site B."),
+            ],
+        );
+
+        ui.add_space(6.0);
+        render_unicode_equation_card(
+            ui,
+            "eq_relief_hypsometric",
+            "2. Elevation Relief (Δz) & Hypsometric Integral (HI)",
+            green,
+            "Δz = z_max − z_min     |     HI = (z_mean − z_min) / (z_max − z_min)",
+            cyan,
+            &[
+                ("Δz", "Total vertical relief in meters between peak elevation z_max and basin floor z_min."),
+                ("z_mean", "Mean surface elevation across all welded mesh vertices or DEM cells."),
+                ("HI ≈ 0.5", "Hypsometric Integral measuring basin vs. highland mass distribution in [0, 1]."),
+            ],
+        );
+
+        ui.add_space(6.0);
+        render_unicode_equation_card(
+            ui,
+            "eq_tri_roughness",
+            "3. Terrain Ruggedness Index (TRI) & Surface Slope Safety (θ)",
+            amber,
+            "TRI = √( (1/8) · ∑ₙ₌₁..₈ (zₙ − z₀)² )     |     θ = arctan( ‖∇z‖ ) = arccos( n_y )",
+            amber,
+            &[
+                ("z₀, zₙ", "Center cell elevation z₀ and its 8 immediate 3×3 neighbors zₙ (meters)."),
+                ("∇z", "Horizontal surface gradient (∂z/∂x, ∂z/∂y) in local meter projection (+units=m)."),
+                ("θ ≤ 5° / 15°", "Local slope angle from vertical normal n_y: θ < 5° optimal habitat pad, θ < 15° safe lander touchdown."),
+            ],
+        );
+
+        ui.add_space(6.0);
+        render_unicode_equation_card(
+            ui,
+            "eq_tda_homology",
+            "4. 0D Persistent Homology (β₀) & Simplicial Euler Characteristic (χ)",
+            amber,
+            "χ = V − E + F     |     Persistence  pₖ = |dₖ − bₖ| ≥ τ_noise",
+            amber,
+            &[
+                ("β₀", "0D Betti number counting persistent topological basins (craters/cold-traps) and peaks."),
+                ("(bₖ, dₖ)", "Component birth height bₖ and merge death height dₖ tracked via Union-Find Elder Rule."),
+                ("τ_noise", "Persistence threshold (5% of Δz) filtering micro-roughness from true craters/ridges."),
+                ("χ = V − E + F", "Euler characteristic (Vertices − Edges + Faces); Δβ₀ and Δχ measure topological match."),
+            ],
+        );
     });
 }
 
@@ -2281,27 +2613,27 @@ fn render_tab_settlement_guide(ui: &mut egui::Ui) {
 
     let items = [
         (
-            "1. Landing & Habitat Slope Stability (theta < 5 deg - 15 deg)",
-            "Challenge: Lunar and Martian landers risk dynamic rollover on slopes exceeding 10-15 deg, and pressurized habitat modules require stable, low-gradient foundations (< 5 deg).",
-            "Solved by: Slope Safety & meter-projected DEM gradient analysis (theta = arctan(||grad(z)||)), ranking flat landing ellipses and highlighting steep crater wall hazards in 3D.",
+            "1. Landing & Habitat Slope Stability (θ < 5° .. 15°)",
+            "Challenge: Lunar and Martian landers risk dynamic rollover on slopes exceeding 10°–15°, and pressurized habitat modules require stable, low-gradient foundations (θ < 5°).",
+            "Solved by: Slope Safety & meter-projected DEM gradient analysis (θ = arctan(‖∇z‖) = arccos(n_y)), live Landing Slope Hazard 3D skin, and automated Safe Landing Area % (< 15° and < 5°).",
         ),
         (
             "2. Solar Power & Cryogenic Volatile Access (Lunar South Pole)",
             "Challenge: Equatorial lunar nights last 354 hours (~100 K), whereas South Pole crater rims ('peaks of eternal light') receive >80% sunlight right next to ~40 K Permanently Shadowed Regions (PSRs) rich in water ice.",
-            "Solved by: Elevation Relief (dz), Hypsometric Integral (HI), and the live Planetary Telemetry HUD (tracking Lunar Solar Time, synodic illumination %, and surface thermal range).",
+            "Solved by: Elevation Relief (Δz), Hypsometric Integral (HI), and the live Planetary Telemetry HUD (tracking Lunar Solar Time, synodic illumination %, and surface thermal range).",
         ),
         (
             "3. Rover Trafficability & Crew EVA Mobility",
             "Challenge: High boulder density and sharp decameter-scale ejecta ridges cause wheel slip, chassis high-centering, and elevated metabolic/battery energy consumption during EVAs.",
-            "Solved by: Terrain Ruggedness Index (TRI = sqrt(1/8 * sum(z_n - z_0)^2)) & Roughness Similarity, quantifying local root-mean-square elevation steps across the entire site.",
+            "Solved by: Terrain Ruggedness Index (TRI = √((1/8) · ∑(zₙ − z₀)²)) & Roughness Similarity, quantifying local root-mean-square elevation steps across the entire site.",
         ),
         (
             "4. Natural Radiation & Micrometeorite Shielding",
             "Challenge: Outside Earth's magnetosphere, Galactic Cosmic Rays (GCR), Solar Particle Events (SPE), and secondary regolith ejecta require subterranean lava tubes, pit craters, or enclosed basin berms.",
-            "Solved by: 0D Persistent Homology (beta_0 sublevel filtration via Union-Find Elder Rule) & Euler Characteristic (chi = V - E + F), automatically counting persistent closed basins and depressions for natural regolith shielding.",
+            "Solved by: 0D Persistent Homology (β₀ sublevel filtration via Union-Find Elder Rule) & Euler Characteristic (χ = V − E + F), automatically counting persistent closed basins and depressions for natural regolith shielding.",
         ),
         (
-            "5. Pre-Flight Terrestrial Analog Validation (Earth <-> Moon/Mars)",
+            "5. Pre-Flight Terrestrial Analog Validation (Earth ↔ Moon/Mars)",
             "Challenge: Every habitat deployment mechanism, ISRU drill, and autonomous rover navigation stack must be field-tested on Earth in terrains that match target extraterrestrial geomorphology.",
             "Solved by: Cross-Body Analog Similarity Ranking (S_analog) & synchronized Split-Screen 3D Comparison, pairing terrestrial volcanic/impact sites directly with Lunar and Martian targets.",
         ),
