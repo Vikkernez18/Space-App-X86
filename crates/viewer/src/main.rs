@@ -181,6 +181,7 @@ fn setup_scene_system(
             mesh: primary_mesh_handle.clone(),
             material: primary_mat_handle.clone(),
             transform: Transform::from_scale(Vec3::new(1.0, app_state.vertical_exaggeration, 1.0)),
+            visibility: Visibility::Hidden,
             ..default()
         },
         NoFrustumCulling,
@@ -315,6 +316,29 @@ fn process_net_events_system(
                 app_state.error_message = None;
                 app_state.apply_catalog(catalog);
             }
+            NetEvent::CatalogReset {
+                catalog,
+                restore_demo,
+            } => {
+                app_state.comparison_site_id = None;
+                app_state.last_analysis_report = None;
+                app_state.error_message = None;
+                app_state.apply_catalog(catalog);
+                if restore_demo {
+                    app_state.status_message =
+                        "Restored reference demo site (test_site) in catalog.".to_string();
+                    if let Some(site) = app_state.primary_site().cloned() {
+                        net.fetch_site_assets(TerrainSlot::Primary, &site);
+                    }
+                } else {
+                    app_state.primary_site_id.clear();
+                    app_state.loaded_primary_triangles = 0;
+                    app_state.loaded_comparison_triangles = 0;
+                    app_state.status_message =
+                        "Workspace reset: cleared all preloaded maps. Ready to upload new terrains."
+                            .to_string();
+                }
+            }
             NetEvent::SiteSaved(saved_site) => {
                 app_state.status_message = format!(
                     "Saved site '{}' to catalog (POST /api/sites).",
@@ -343,7 +367,7 @@ fn process_net_events_system(
                 app_state.error_message = None;
                 let new_site = uploaded.report.generated_site_metadata.clone();
                 app_state.status_message = format!(
-                    "Analyzed '{}': proposed {} analog (score={:.4}, tris: {}->{}, χ={}, β₀ basins={}).",
+                    "Analyzed '{}': proposed {} analog (score={:.4}, tris: {}->{}, chi={}, b0 basins={}).",
                     new_site.name,
                     uploaded.report.proposal.proposed_body.as_str().to_uppercase(),
                     uploaded.report.proposal.analog_score,
@@ -457,7 +481,7 @@ fn sync_terrain_visuals_system(
         (Without<PrimaryTerrain>, Without<ComparisonTerrain>),
     >,
     mut primary_q: Query<
-        &mut Transform,
+        (&mut Transform, &mut Visibility),
         (
             With<PrimaryTerrain>,
             Without<ComparisonTerrain>,
@@ -474,7 +498,20 @@ fn sync_terrain_visuals_system(
     >,
 ) {
     let scale = Vec3::new(1.0, app_state.vertical_exaggeration, 1.0);
-    let split_active = app_state.comparison_site_id.is_some();
+    let show_scene = app_state.mode_selected && !app_state.catalog.sites.is_empty();
+    let split_active = show_scene && app_state.comparison_site_id.is_some();
+
+    if !show_scene {
+        for (mut transform, mut vis) in &mut primary_q {
+            transform.scale = scale;
+            *vis = Visibility::Hidden;
+        }
+        for (mut transform, mut vis) in &mut comp_q {
+            transform.scale = scale;
+            *vis = Visibility::Hidden;
+        }
+        return;
+    }
 
     if split_active
         && let Ok((cam, cam_transform, cam_proj)) = cam_q.get_single()
@@ -511,9 +548,10 @@ fn sync_terrain_visuals_system(
         let comp_pos =
             cam_pos + cam_forward * d_comp + cam_right * (d_comp * half_tan_x * ndc_x_right);
 
-        for mut transform in &mut primary_q {
+        for (mut transform, mut vis) in &mut primary_q {
             transform.translation = prim_pos;
             transform.scale = scale;
+            *vis = Visibility::Visible;
         }
         for (mut transform, mut vis) in &mut comp_q {
             transform.translation = comp_pos;
@@ -521,9 +559,10 @@ fn sync_terrain_visuals_system(
             *vis = Visibility::Visible;
         }
     } else {
-        for mut transform in &mut primary_q {
+        for (mut transform, mut vis) in &mut primary_q {
             transform.translation = Vec3::ZERO;
             transform.scale = scale;
+            *vis = Visibility::Visible;
         }
         for (mut transform, mut vis) in &mut comp_q {
             transform.scale = scale;

@@ -29,7 +29,16 @@ use crate::auth::{
     build_logout_cookie_header, build_session_cookie_header_from_token, create_session_token,
     extract_authenticated_researcher, extract_client_key, verify_argon2_password,
 };
-use crate::state::AppState;
+use crate::state::{AppState, default_synthetic_catalog};
+
+/// Optional request body for `POST /api/sites/reset`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResetCatalogRequest {
+    /// When `true`, restores the reference synthetic `test_site`; when `false` (default),
+    /// clears all preloaded sites from `catalog.json` so only newly uploaded maps appear.
+    #[serde(default)]
+    pub restore_demo: bool,
+}
 
 /// Maximum request body size for `/api/sites/upload` (512 MiB to accommodate full batches of
 /// 50–100+ MiB real `.stl`, `.tif`/`.tiff`, and `.png` files via binary `multipart/form-data`).
@@ -120,6 +129,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/sites", post(upsert_site_body_handler))
         .route("/sites/upload", post(upload_and_analyze_site_handler))
+        .route("/sites/reset", post(reset_catalog_handler))
         .route("/sites/{id}", put(upsert_site_path_handler))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BODY_BYTES));
 
@@ -605,4 +615,54 @@ fn upsert_site_inner(
     };
 
     Ok(Json(updated_site))
+}
+
+/// `POST /api/sites/reset` — Authenticated researcher endpoint to clear preloaded catalog maps
+/// (or restore the reference synthetic `test_site` when `restore_demo: true` is passed) and
+/// persist the clean `data/processed/catalog.json`.
+async fn reset_catalog_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Option<Json<ResetCatalogRequest>>,
+) -> Result<Json<Catalog>, Response> {
+    let researcher = require_researcher(&headers, &state)?;
+    let restore_demo = payload.map(|Json(p)| p.restore_demo).unwrap_or(false);
+
+    let updated_catalog = {
+        let mut catalog = state
+            .catalog
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if restore_demo {
+            let demo_catalog = default_synthetic_catalog();
+            catalog.sites = demo_catalog.sites;
+            let default_weights = catalog.default_weights.clone();
+            for site in &mut catalog.sites {
+                site.canonical_score =
+                    compute_weighted_score(&site.feature_scores, &default_weights);
+            }
+            catalog.generated_by =
+                Some("analog_server (reset_catalog: restored reference test_site)".to_string());
+        } else {
+            catalog.sites.clear();
+            catalog.generated_by =
+                Some("analog_server (reset_catalog: cleared preloaded maps)".to_string());
+        }
+
+        let snapshot = catalog.clone();
+        if let Err(err) = state.persist_catalog(&snapshot) {
+            warn!("Failed to persist reset catalog.json: {err}");
+        }
+        snapshot
+    };
+
+    info!(
+        "Researcher '{}' reset catalog (restore_demo = {}, remaining sites = {})",
+        researcher,
+        restore_demo,
+        updated_catalog.sites.len()
+    );
+
+    Ok(Json(updated_catalog))
 }

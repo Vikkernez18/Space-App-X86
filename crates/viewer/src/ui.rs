@@ -1,471 +1,48 @@
 // AI-assisted
-//! `bevy_egui` side panel, persistent top-left quick toolbar, auto-wrapping `ScrollArea::both()`
-//! layout, live Planetary Telemetry HUD (`MOON`, `MARS`, `EARTH`), custom `egui::Painter`
-//! Similarity Charts, and Researcher Terrain Upload + TDA UI (100% English, zero NASA logos).
-//!
-//! Provides:
-//! - Persistent top-left quick toolbar (`[Panel]`, `[Charts]`, `[Rotate: ON/OFF]`, `[Split: ON/OFF]`,
-//!   `[Telemetry: ON/OFF]`, `[H] Hide UI`) and resizable left panel (`default_width(390.0)`,
-//!   `width_range(320.0..=680.0)`, `ScrollArea::both()`) with zero clipped text or buttons on 14" laptops.
-//! - Smooth orbital `Auto-Rotate` animation (`[Rotate]` button or key `A`) that automatically
-//!   pauses while the user drags with the mouse or touchpad.
-//! - Top-right collapsible **Planetary Telemetry HUD** computed live from the current UTC clock
-//!   (`js_sys::Date::now()` on WASM / `SystemTime` on native) for `MOON` (LST, synodic phase &
-//!   illumination %, polar PSR vs sunlit thermal range, `1.62 m/s²`, `1.28 s` latency), `MARS`
-//!   (MTC & Sol, seasonal $L_s$, `~195 K / -78 °C`, `~610 Pa CO₂`, `3.72 m/s²`), and `EARTH`
-//!   (UTC clock, `101.3 kPa`, `9.81 m/s²`, baseline analog status).
-//! - Custom `egui::Painter` **Similarity Charts** (both inside the panel and in a floating `[Charts]`
-//!   window): Global Analog Similarity bar chart across all sites + 5-axis grouped vertical bar chart
-//!   (*Elevation Relief*, *Geomorphology*, *Roughness*, *Slope Safety*, *0D TDA Topology*).
+//! `bevy_egui` interface for:
+//! 1. Legible 14" Laptop Typography & High-Contrast Visual Hierarchy (`egui::Style` with
+//!    explicit `Heading: 17.5px`, `Body/Button: 13.5px`, `Monospace: 13.0px`, `Small: 12.0px`,
+//!    `#F1F5F9` primary text, `#CBD5E1` secondary text, generous spacing, and line wrapping).
+//! 2. Homogeneous Startup Access Gate (`Space-App-X86 Access Gate` full-screen central panel
+//!    before entering Guest Demo Mode or logging in as an authenticated Researcher, with clean
+//!    return on `Log Out`).
+//! 3. Clean ASCII-only UI controls (no `□` missing-glyph boxes), full mouse + touchpad +
+//!    keyboard navigation (`H`, `A`, `C`, `R`, `Up`/`Down`, `+`/`-`), and 5 structured tabs:
+//!    - `1. Sites & Compare`
+//!    - `2. 3D & Camera`
+//!    - `3. Charts & Math` (custom `egui::Painter` charts + collapsible Mathematical Foundation)
+//!    - `4. Settlement Guide` (Lunar & Martian habitat engineering guide)
+//!    - `5. Upload & Reset` (512 MiB binary `multipart/form-data` upload, TDA report, and
+//!      Workspace Reset / Restore Reference Demo Site).
+//! 4. Live Planetary Telemetry HUD (`MOON`, `MARS`, `EARTH`) computed from real-time UTC clock.
 
 use std::collections::BTreeMap;
 
-use analog_core::scoring::recalculate_catalog;
-use analog_core::stl::{MAX_TRIANGLES, encode_binary_stl, read_stl_triangle_count};
-use analog_core::terrain_analysis::{
-    TerrainAnalysisReport, UploadSiteRequest, infer_extent_from_stl_bytes,
-};
+use analog_core::scoring::{normalize_weights, recalculate_catalog};
+use analog_core::terrain_analysis::{TerrainAnalysisReport, UploadSiteRequest};
 use analog_core::{Body, Catalog, DemExtent, ScoredSite, SiteMetadata};
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, egui};
 
 use crate::camera::OrbitCamera;
-use crate::mesh_loader::{
-    SiteMeshSummary, estimate_site_summary_from_metadata, generate_synthetic_test_site_welded_mesh,
-};
+use crate::mesh_loader::{SiteMeshSummary, estimate_site_summary_from_metadata};
 use crate::net::{
     BrowserSelectedFile, NetBridge, TerrainSlot, fallback_synthetic_catalog,
     open_browser_file_dialog,
 };
 
-#[inline]
-fn bytes_to_mib(bytes: usize) -> f64 {
-    (bytes as f64) / (1024.0 * 1024.0)
-}
+/// High-contrast primary text color (`#F1F5F9`).
+const COLOR_TEXT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(241, 245, 249);
+/// High-contrast secondary label color (`#CBD5E1`).
+const COLOR_TEXT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(203, 213, 225);
+/// Dark slate surface background for cards (`#0F172A`).
+const COLOR_CARD_BG: egui::Color32 = egui::Color32::from_rgb(15, 23, 42);
+/// Elevated dark panel background (`#111827`).
+const COLOR_PANEL_BG: egui::Color32 = egui::Color32::from_rgb(17, 24, 39);
+/// Subtle border stroke color (`#334155`).
+const COLOR_BORDER: egui::Color32 = egui::Color32::from_rgb(51, 65, 85);
 
-/// Returns a distinct high-contrast accent color for each planetary body (`EARTH`, `MOON`, `MARS`).
-#[inline]
-fn body_accent_color(body: Body) -> egui::Color32 {
-    match body {
-        Body::Earth => egui::Color32::from_rgb(55, 225, 155),
-        Body::Moon => egui::Color32::from_rgb(0, 210, 235),
-        Body::Mars => egui::Color32::from_rgb(255, 145, 65),
-    }
-}
-
-/// Returns the current Unix timestamp in seconds (`f64`) using `js_sys::Date::now()` on WASM
-/// and `std::time::SystemTime::now()` on native builds.
-fn current_unix_timestamp_secs() -> f64 {
-    #[cfg(target_arch = "wasm32")]
-    {
-        js_sys::Date::now() / 1000.0
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(1_763_220_000.0)
-    }
-}
-
-/// Formats a day-fraction `[0.0, 24.0)` in hours into `HH:MM:SS`.
-fn format_hms_from_hours(hours: f64) -> String {
-    let h_norm = hours.rem_euclid(24.0);
-    let total_secs = (h_norm * 3600.0).floor() as u64;
-    let hh = (total_secs / 3600) % 24;
-    let mm = (total_secs / 60) % 60;
-    let ss = total_secs % 60;
-    format!("{hh:02}:{mm:02}:{ss:02}")
-}
-
-/// Live astronomical and environmental telemetry for the top-right Planetary Telemetry HUD card.
-#[derive(Debug, Clone)]
-pub struct PlanetaryTelemetry {
-    pub body: Body,
-    pub header_title: String,
-    pub clock_label: String,
-    pub clock_value: String,
-    pub ephemeris_label: String,
-    pub ephemeris_value: String,
-    pub thermal_label: String,
-    pub thermal_value: String,
-    pub atmosphere_or_signal_label: String,
-    pub atmosphere_or_signal_value: String,
-    pub gravity_value: String,
-}
-
-/// Computes live planetary telemetry for `MOON`, `MARS`, or `EARTH` from the current UTC timestamp.
-pub fn compute_planetary_telemetry(
-    site: &SiteMetadata,
-    summary: &SiteMeshSummary,
-) -> PlanetaryTelemetry {
-    let unix_secs = current_unix_timestamp_secs();
-    let utc_hours = (unix_secs / 3600.0).rem_euclid(24.0);
-    let utc_hms = format_hms_from_hours(utc_hours);
-
-    // Julian Date (UTC) and Terrestrial Time (TT = UTC + 69.184 s)
-    let jd_utc = (unix_secs / 86_400.0) + 2_440_587.5;
-    let jd_tt = jd_utc + (69.184 / 86_400.0);
-
-    let [lat_deg, lon_deg] = site.center_lat_lon.unwrap_or_else(|| match site.body {
-        Body::Moon => [-88.1, 45.0],
-        Body::Mars => [-84.5, 0.0],
-        Body::Earth => [35.5, -111.6],
-    });
-
-    match site.body {
-        Body::Moon => {
-            // Synodic lunar cycle (mean synodic month = 29.530588853 days; ref New Moon JD 2451550.1)
-            let synodic_month = 29.530_588_853_f64;
-            let synodic_age_days = (jd_utc - 2_451_550.1).rem_euclid(synodic_month);
-            let phase_frac = synodic_age_days / synodic_month;
-            let illum_pct = 0.5 * (1.0 - (std::f64::consts::TAU * phase_frac).cos()) * 100.0;
-
-            let phase_name = if !(0.03..0.97).contains(&phase_frac) {
-                "New Moon"
-            } else if phase_frac < 0.22 {
-                "Waxing Crescent"
-            } else if phase_frac < 0.28 {
-                "First Quarter"
-            } else if phase_frac < 0.47 {
-                "Waxing Gibbous"
-            } else if phase_frac < 0.53 {
-                "Full Moon"
-            } else if phase_frac < 0.72 {
-                "Waning Gibbous"
-            } else if phase_frac < 0.78 {
-                "Last Quarter"
-            } else {
-                "Waning Crescent"
-            };
-
-            // Local Lunar Solar Time (LST): 12:00 LST at subsolar meridian (Full Moon at lon=0)
-            let lst_hours =
-                ((phase_frac - 0.5) * 24.0 + f64::from(lon_deg) / 15.0 + 12.0).rem_euclid(24.0);
-            let lst_hms = format_hms_from_hours(lst_hours);
-
-            let name_lower = site.name.to_ascii_lowercase();
-            let is_polar_crater = lat_deg.abs() >= 75.0
-                || name_lower.contains("shoemaker")
-                || name_lower.contains("shackleton")
-                || name_lower.contains("pole")
-                || name_lower.contains("crater");
-
-            let thermal_value = if is_polar_crater {
-                "PSR Floor: ~45–110 K (-228 to -163 °C) | Sunlit Rim: ~250–385 K".to_string()
-            } else {
-                let sun_factor = ((lst_hours - 6.0) * std::f64::consts::PI / 12.0)
-                    .sin()
-                    .max(0.0);
-                let est_k = 100.0 + 285.0 * sun_factor;
-                format!(
-                    "~{est_k:.0} K ({:.0} °C) [Polar PSR: 45–110 K | Lit: 250–385 K]",
-                    est_k - 273.15
-                )
-            };
-
-            PlanetaryTelemetry {
-                body: Body::Moon,
-                header_title: "LUNAR TELEMETRY & EPHEMERIS (MOON)".to_string(),
-                clock_label: "Lunar Solar Time (LST)".to_string(),
-                clock_value: format!(
-                    "{lst_hms} LST (Synodic Day {:.1}/29.5 | {utc_hms} UTC)",
-                    synodic_age_days
-                ),
-                ephemeris_label: "Synodic Phase & Illum.".to_string(),
-                ephemeris_value: format!("{phase_name} ({illum_pct:.1}% Illuminated)"),
-                thermal_label: "Surface Thermal Regime".to_string(),
-                thermal_value,
-                atmosphere_or_signal_label: "Earth–Moon Signal OWLT".to_string(),
-                atmosphere_or_signal_value: "1.28 s one-way latency (UHV Exosphere ~3×10⁻¹⁰ Pa)"
-                    .to_string(),
-                gravity_value: format!(
-                    "1.62 m/s² (0.165 g) | Relief Δz = {:.1} m",
-                    (summary.max_elevation_m - summary.min_elevation_m).abs()
-                ),
-            }
-        }
-        Body::Mars => {
-            // Mars Sol Date (MSD) and Coordinated Mars Time (MTC) per Allison & McEwen (2000)
-            let msd = ((jd_tt - 2_451_549.5) / 1.027_491_251_7) + 44_796.0 - 0.000_962_6;
-            let sol_number = msd.floor() as i64;
-            let mtc_hours = (msd * 24.0).rem_euclid(24.0);
-            let mtc_hms = format_hms_from_hours(mtc_hours);
-
-            // Areocentric solar longitude Ls (degrees)
-            let dj2000 = jd_tt - 2_451_545.0;
-            let m_deg = (19.3871 + 0.524_020_73 * dj2000).rem_euclid(360.0);
-            let m_rad = m_deg.to_radians();
-            let eq_center = 10.691 * m_rad.sin() + 0.623 * (2.0 * m_rad).sin();
-            let ls_deg = (m_deg + eq_center + 270.3871).rem_euclid(360.0);
-
-            let season = if ls_deg < 90.0 {
-                "NH Spring / SH Autumn"
-            } else if ls_deg < 180.0 {
-                "NH Summer / SH Winter"
-            } else if ls_deg < 270.0 {
-                "NH Autumn / SH Spring"
-            } else {
-                "NH Winter / SH Summer"
-            };
-
-            let diurnal_wave = ((mtc_hours - 14.0) * std::f64::consts::TAU / 24.0).cos();
-            let inst_temp_k = (195.0 + 22.0 * diurnal_wave).clamp(145.0, 265.0);
-            let inst_temp_c = inst_temp_k - 273.15;
-
-            PlanetaryTelemetry {
-                body: Body::Mars,
-                header_title: "MARTIAN TELEMETRY & EPHEMERIS (MARS)".to_string(),
-                clock_label: "Coordinated Mars Time".to_string(),
-                clock_value: format!("{mtc_hms} MTC | Sol {sol_number} ({utc_hms} UTC)"),
-                ephemeris_label: "Solar Longitude (Ls)".to_string(),
-                ephemeris_value: format!("Ls = {ls_deg:.1}° ({season})"),
-                thermal_label: "Est. Surface Temp".to_string(),
-                thermal_value: format!(
-                    "~195 K / -78 °C (Live MTC: {inst_temp_k:.0} K / {inst_temp_c:.0} °C)"
-                ),
-                atmosphere_or_signal_label: "Atmospheric Pressure".to_string(),
-                atmosphere_or_signal_value: "~610 Pa CO₂ (6.1 mbar, 95.3% CO₂ / 2.6% N₂)"
-                    .to_string(),
-                gravity_value: format!(
-                    "3.72 m/s² (0.379 g) | Relief Δz = {:.1} m",
-                    (summary.max_elevation_m - summary.min_elevation_m).abs()
-                ),
-            }
-        }
-        Body::Earth => PlanetaryTelemetry {
-            body: Body::Earth,
-            header_title: "TERRESTRIAL ANALOG TELEMETRY (EARTH)".to_string(),
-            clock_label: "Reference UTC Clock".to_string(),
-            clock_value: format!("{utc_hms} UTC (JD {jd_utc:.3})"),
-            ephemeris_label: "Analog Calibration".to_string(),
-            ephemeris_value: "Baseline Terrestrial Reference Site (Active Field Calibration)"
-                .to_string(),
-            thermal_label: "Ambient Thermal Ref.".to_string(),
-            thermal_value: "~288 K / +15 °C (Standard Geomorphological Baseline)".to_string(),
-            atmosphere_or_signal_label: "Atmospheric Pressure".to_string(),
-            atmosphere_or_signal_value: "101.3 kPa (1013.25 hPa N₂/O₂ | 0.00 s Local Latency)"
-                .to_string(),
-            gravity_value: format!(
-                "9.81 m/s² (1.000 g) | Relief Δz = {:.1} m",
-                (summary.max_elevation_m - summary.min_elevation_m).abs()
-            ),
-        },
-    }
-}
-
-/// Filter for the planetary body selector in the UI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BodyFilter {
-    All,
-    Moon,
-    Mars,
-    Earth,
-}
-
-impl BodyFilter {
-    pub fn matches(self, body: Body) -> bool {
-        match self {
-            Self::All => true,
-            Self::Moon => body == Body::Moon,
-            Self::Mars => body == Body::Mars,
-            Self::Earth => body == Body::Earth,
-        }
-    }
-}
-
-/// Compact navigation tabs for the left control panel (optimized for 14" laptop screens).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PanelTab {
-    /// `1. Sites & Compare`: Site selector, Split-Screen toggle, and Planetary Analog Similarity Breakdown.
-    SitesAndCompare,
-    /// `2. 3D & Camera`: Vertical exaggeration, Checkerboard UV toggle, Auto-Rotate, and keyboard shortcuts.
-    View3dAndCamera,
-    /// `3. Weights & TDA`: Live feature weight sliders, ranked scores table, and TDA reports.
-    WeightsAndTda,
-    /// `4. Researcher Upload`: Argon2id login, binary `.stl`/`.tif`/`.png` upload, TDA report, and site editor.
-    ResearcherUpload,
-}
-
-/// Editable form state for uploading and analyzing `.stl` / `.tif` / `.png` terrain files
-/// via binary `multipart/form-data` (`POST /api/sites/upload`, zero Base64).
-#[derive(Debug, Clone)]
-pub struct TerrainUploadForm {
-    pub id: String,
-    pub name: String,
-    /// `None` = auto-propose planetary body from morphometric & topological similarity.
-    pub body_override: Option<Body>,
-    pub description: String,
-    pub min_x: f32,
-    pub max_x: f32,
-    pub min_y: f32,
-    pub max_y: f32,
-    pub stl_filename: Option<String>,
-    pub stl_size_bytes: usize,
-    pub stl_detected_triangles: Option<u32>,
-    pub stl_bytes: Option<Vec<u8>>,
-    pub tiff_filename: Option<String>,
-    pub tiff_size_bytes: usize,
-    pub tiff_bytes: Option<Vec<u8>>,
-    pub png_filename: Option<String>,
-    pub png_size_bytes: usize,
-    pub png_bytes: Option<Vec<u8>>,
-    pub is_uploading: bool,
-}
-
-impl Default for TerrainUploadForm {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            name: "Uploaded Candidate Terrain".to_string(),
-            body_override: None,
-            description: String::new(),
-            min_x: -1000.0,
-            max_x: 1000.0,
-            min_y: -1000.0,
-            max_y: 1000.0,
-            stl_filename: None,
-            stl_size_bytes: 0,
-            stl_detected_triangles: None,
-            stl_bytes: None,
-            tiff_filename: None,
-            tiff_size_bytes: 0,
-            tiff_bytes: None,
-            png_filename: None,
-            png_size_bytes: 0,
-            png_bytes: None,
-            is_uploading: false,
-        }
-    }
-}
-
-impl TerrainUploadForm {
-    /// Assigns a selected or dropped binary file to the `.stl`, `.tif`/`.tiff`, or `.png` slot.
-    pub fn ingest_selected_file(&mut self, file: BrowserSelectedFile) -> Result<String, String> {
-        let lower = file.name.to_ascii_lowercase();
-        if self.name.trim().is_empty() || self.name == "Uploaded Candidate Terrain" {
-            if let Some(stem) = file.name.rsplit_once('.').map(|(s, _)| s)
-                && !stem.trim().is_empty()
-            {
-                self.name = stem.replace('_', " ");
-            }
-        }
-
-        let mib = bytes_to_mib(file.size);
-
-        if lower.ends_with(".stl") {
-            let tri_count = read_stl_triangle_count(&file.bytes).ok();
-            if let Ok(ext) = infer_extent_from_stl_bytes(&file.bytes) {
-                self.min_x = ext.min_x;
-                self.max_x = ext.max_x;
-                self.min_y = ext.min_y;
-                self.max_y = ext.max_y;
-            }
-            let tri_note = match tri_count {
-                Some(c) if c > MAX_TRIANGLES => {
-                    format!(", {c} triangles -> will auto-simplify to <= {MAX_TRIANGLES}")
-                }
-                Some(c) => format!(", {c} triangles"),
-                None => String::new(),
-            };
-            let msg = format!(
-                "Staged STL mesh '{}' ({:.2} MiB{tri_note})",
-                file.name, mib
-            );
-            self.stl_filename = Some(file.name);
-            self.stl_size_bytes = file.size;
-            self.stl_detected_triangles = tri_count;
-            self.stl_bytes = Some(file.bytes);
-            Ok(msg)
-        } else if lower.ends_with(".tif") || lower.ends_with(".tiff") {
-            let msg = format!("Staged GeoTIFF DEM '{}' ({:.2} MiB)", file.name, mib);
-            self.tiff_filename = Some(file.name);
-            self.tiff_size_bytes = file.size;
-            self.tiff_bytes = Some(file.bytes);
-            Ok(msg)
-        } else if lower.ends_with(".png") {
-            let msg = format!("Staged PNG texture '{}' ({:.2} MiB)", file.name, mib);
-            self.png_filename = Some(file.name);
-            self.png_size_bytes = file.size;
-            self.png_bytes = Some(file.bytes);
-            Ok(msg)
-        } else {
-            Err(format!(
-                "Unsupported file '{}': please select a .stl, .tif/.tiff, or .png file.",
-                file.name
-            ))
-        }
-    }
-
-    pub fn has_elevation_source(&self) -> bool {
-        self.stl_bytes.is_some() || self.tiff_bytes.is_some()
-    }
-
-    pub fn total_staged_bytes(&self) -> usize {
-        self.stl_size_bytes + self.tiff_size_bytes + self.png_size_bytes
-    }
-
-    pub fn clear_files(&mut self) {
-        self.stl_filename = None;
-        self.stl_size_bytes = 0;
-        self.stl_detected_triangles = None;
-        self.stl_bytes = None;
-        self.tiff_filename = None;
-        self.tiff_size_bytes = 0;
-        self.tiff_bytes = None;
-        self.png_filename = None;
-        self.png_size_bytes = 0;
-        self.png_bytes = None;
-        self.is_uploading = false;
-    }
-
-    /// Populates the upload form with an in-memory synthetic crater STL so researchers can test
-    /// the full upload + TDA pipeline in one click.
-    pub fn stage_synthetic_demo_stl(&mut self) {
-        let extent = DemExtent::new(self.min_x, self.max_x, self.min_y, self.max_y);
-        let welded = generate_synthetic_test_site_welded_mesh(&extent);
-        let mut tris = Vec::with_capacity(welded.indices.len() / 3);
-        for tri in welded.indices.chunks_exact(3) {
-            let p0 = welded.positions[tri[0] as usize];
-            let p1 = welded.positions[tri[1] as usize];
-            let p2 = welded.positions[tri[2] as usize];
-            tris.push([
-                [p0[0], -p0[2], p0[1]],
-                [p1[0], -p1[2], p1[1]],
-                [p2[0], -p2[2], p2[1]],
-            ]);
-        }
-        let stl_bytes = encode_binary_stl(&tris);
-        self.stl_filename = Some("synthetic_crater_ridge.stl".to_string());
-        self.stl_size_bytes = stl_bytes.len();
-        self.stl_detected_triangles = Some(tris.len() as u32);
-        self.stl_bytes = Some(stl_bytes);
-        if self.name.trim().is_empty() {
-            self.name = "Synthetic Crater Candidate".to_string();
-        }
-    }
-
-    pub fn to_upload_request(&self) -> UploadSiteRequest {
-        UploadSiteRequest {
-            site_id: self.id.trim().to_string(),
-            site_name: self.name.trim().to_string(),
-            body: self.body_override,
-            description: self.description.trim().to_string(),
-            dem_extent: Some(DemExtent::new(
-                self.min_x, self.max_x, self.min_y, self.max_y,
-            )),
-            stl_base64: None,
-            tiff_base64: None,
-            png_base64: None,
-            stl_bytes: self.stl_bytes.clone(),
-            tiff_bytes: self.tiff_bytes.clone(),
-            png_bytes: self.png_bytes.clone(),
-        }
-    }
-}
-
-/// Editable form state for registering or updating a site in authenticated Researcher Mode (`POST /api/sites`).
+/// Editable form state for authenticated researchers to register or update a site in the catalog.
 #[derive(Debug, Clone)]
 pub struct SiteEditorForm {
     pub id: String,
@@ -487,7 +64,7 @@ impl SiteEditorForm {
         Self {
             id: site.id.clone(),
             name: site.name.clone(),
-            body: site.body,
+            body: site.body.clone(),
             description: site.description.clone(),
             min_x: site.dem_extent.min_x,
             max_x: site.dem_extent.max_x,
@@ -500,11 +77,11 @@ impl SiteEditorForm {
         }
     }
 
-    pub fn into_site_metadata(&self) -> SiteMetadata {
+    pub fn to_site_metadata(&self) -> SiteMetadata {
         SiteMetadata {
             id: self.id.trim().to_string(),
             name: self.name.trim().to_string(),
-            body: self.body,
+            body: self.body.clone(),
             description: self.description.trim().to_string(),
             center_lat_lon: None,
             dem_extent: DemExtent::new(self.min_x, self.max_x, self.min_y, self.max_y),
@@ -515,108 +92,190 @@ impl SiteEditorForm {
             texture_path: self.texture_path.trim().to_string(),
             feature_scores: self.feature_scores.clone(),
             canonical_score: 0.0,
-            generated_by: Some("analog_viewer researcher editor".to_string()),
+            generated_by: Some("analog_viewer researcher form".to_string()),
         }
     }
 }
 
-/// Quantitative similarity breakdown between a primary site and a comparison site.
+/// Form state for uploading `.stl`, `.tif`/`.tiff`, and `.png` files for automatic
+/// morphometric + Topological Data Analysis (TDA) and site registration.
+/// Stores raw `Vec<u8>` bytes for binary `multipart/form-data` transport (zero Base64).
 #[derive(Debug, Clone)]
-pub struct PairwiseSimilarityBreakdown {
-    pub global_similarity_pct: f64,
-    pub elevation_relief_sim: f64,
-    pub primary_relief_score: f64,
-    pub compare_relief_score: f64,
-    pub geomorphology_sim: f64,
-    pub primary_geom_score: f64,
-    pub compare_geom_score: f64,
-    pub roughness_sim: f64,
-    pub primary_rough_score: f64,
-    pub compare_rough_score: f64,
-    pub slope_safety_sim: f64,
-    pub primary_slope_score: f64,
-    pub compare_slope_score: f64,
-    pub topology_sim: f64,
-    pub primary_topo_score: f64,
-    pub compare_topo_score: f64,
-    pub primary_summary: SiteMeshSummary,
-    pub compare_summary: SiteMeshSummary,
-    pub delta_basins_b0: usize,
-    pub delta_peaks_b0: usize,
-    pub delta_euler_chi: i64,
+pub struct TerrainUploadForm {
+    pub site_id: String,
+    pub site_name: String,
+    pub source_body: Body,
+    pub description: String,
+    pub horizontal_scale_m: f64,
+    pub stl_file_name: Option<String>,
+    pub stl_bytes: Option<Vec<u8>>,
+    pub tif_file_name: Option<String>,
+    pub tif_bytes: Option<Vec<u8>>,
+    pub png_file_name: Option<String>,
+    pub png_bytes: Option<Vec<u8>>,
+    pub is_uploading: bool,
 }
 
-/// Global UI & application state resource for the viewer.
+impl Default for TerrainUploadForm {
+    fn default() -> Self {
+        Self {
+            site_id: String::new(),
+            site_name: String::new(),
+            source_body: Body::Earth,
+            description: String::new(),
+            horizontal_scale_m: 1.0,
+            stl_file_name: None,
+            stl_bytes: None,
+            tif_file_name: None,
+            tif_bytes: None,
+            png_file_name: None,
+            png_bytes: None,
+            is_uploading: false,
+        }
+    }
+}
+
+impl TerrainUploadForm {
+    pub fn has_terrain_file(&self) -> bool {
+        self.stl_bytes.is_some() || self.tif_bytes.is_some()
+    }
+
+    pub fn format_mib(bytes_len: usize) -> String {
+        let mib = bytes_len as f64 / (1024.0 * 1024.0);
+        if mib >= 0.01 {
+            format!("{mib:.2} MiB")
+        } else {
+            format!("{:.1} KiB", bytes_len as f64 / 1024.0)
+        }
+    }
+
+    pub fn total_payload_bytes(&self) -> usize {
+        self.stl_bytes.as_ref().map_or(0, Vec::len)
+            + self.tif_bytes.as_ref().map_or(0, Vec::len)
+            + self.png_bytes.as_ref().map_or(0, Vec::len)
+    }
+
+    pub fn ingest_selected_file(&mut self, file: BrowserSelectedFile) -> Result<String, String> {
+        let lower = file.name.to_ascii_lowercase();
+        if self.site_name.trim().is_empty()
+            && let Some(stem) = file.name.rsplit('/').next().and_then(|s| s.split('.').next())
+            && !stem.is_empty()
+        {
+            self.site_name = stem.replace(['_', '-'], " ");
+            self.site_id = stem.to_ascii_lowercase();
+        }
+
+        let size_str = Self::format_mib(file.size);
+
+        if lower.ends_with(".stl") {
+            let msg = format!(
+                "Attached 3D STL mesh '{}' ({size_str}, raw binary ready).",
+                file.name
+            );
+            self.stl_file_name = Some(file.name);
+            self.stl_bytes = Some(file.bytes);
+            Ok(msg)
+        } else if lower.ends_with(".tif") || lower.ends_with(".tiff") {
+            let msg = format!(
+                "Attached elevation DEM '{}' ({size_str}, raw binary ready).",
+                file.name
+            );
+            self.tif_file_name = Some(file.name);
+            self.tif_bytes = Some(file.bytes);
+            Ok(msg)
+        } else if lower.ends_with(".png") {
+            let msg = format!(
+                "Attached surface texture '{}' ({size_str}, raw binary ready).",
+                file.name
+            );
+            self.png_file_name = Some(file.name);
+            self.png_bytes = Some(file.bytes);
+            Ok(msg)
+        } else {
+            Err(format!(
+                "Unsupported file '{}'. Please select a .stl, .tif/.tiff, or .png file.",
+                file.name
+            ))
+        }
+    }
+
+    pub fn to_upload_request(&self) -> UploadSiteRequest {
+        UploadSiteRequest {
+            site_id: self.site_id.trim().to_string(),
+            site_name: self.site_name.trim().to_string(),
+            body: Some(self.source_body),
+            description: self.description.trim().to_string(),
+            dem_extent: None,
+            stl_base64: None,
+            tiff_base64: None,
+            png_base64: None,
+            stl_bytes: self.stl_bytes.clone(),
+            tiff_bytes: self.tif_bytes.clone(),
+            png_bytes: self.png_bytes.clone(),
+        }
+    }
+}
+
+/// Compact tabs inside the left navigation panel for 14" laptop screens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelTab {
+    SitesAndCompare,
+    ViewAndCamera,
+    ChartsAndMath,
+    SettlementGuide,
+    UploadAndReset,
+}
+
+/// Pairwise similarity breakdown between the primary site and a comparison site (or top analog).
+#[derive(Debug, Clone)]
+pub struct PairwiseAnalogSimilarity {
+    pub primary_name: String,
+    pub primary_body: Body,
+    pub primary_elev: Option<[f32; 2]>,
+    pub compare_id: String,
+    pub compare_name: String,
+    pub compare_body: Body,
+    pub compare_elev: Option<[f32; 2]>,
+    pub overall_similarity_pct: f64,
+    pub dimensions: Vec<(String, f64, f64, f64)>,
+    pub delta_b0_basins: Option<i64>,
+    pub delta_euler_chi: Option<i64>,
+}
+
+/// Global UI & application state resource for `analog_viewer`.
 #[derive(Resource)]
 pub struct ViewerAppState {
-    /// Whether the user has dismissed the initial welcome/mode-selection dialog.
-    pub mode_selected: bool,
-    /// When `true` (`[H] Hide UI`), hides all HUD panels/toolbars except a minimal `[H] Show UI` pill.
-    pub ui_hidden: bool,
-    /// Whether the left side panel is open (`[Panel]` button).
-    pub panel_visible: bool,
-    /// Whether the floating Similarity Charts window is open (`[Charts]` button).
-    pub charts_window_open: bool,
-    /// Whether orbital camera Auto-Rotate is active (`[Rotate: ON/OFF]` button or key `A`).
-    pub auto_rotate: bool,
-    /// Whether the top-right Planetary Telemetry HUD card is visible (`[Telemetry: ON/OFF]` button).
-    pub telemetry_visible: bool,
-    /// Whether the top-right Planetary Telemetry HUD card is expanded (`true`) or collapsed (`false`).
-    pub telemetry_expanded: bool,
-    /// Active tab in the compact left control panel (`1`–`4`).
-    pub active_tab: PanelTab,
-    /// Fraction `[0.0, 0.75]` of the window width occupied by the left side panel (`0.0` when hidden).
-    pub viewport_left_fraction: f32,
-    /// Whether the user is authenticated as a researcher (`GET /api/me` or `POST /api/login`).
-    pub authenticated: bool,
-    /// Active researcher username when `authenticated == true`.
-    pub researcher_username: Option<String>,
-    /// Login form username input (defaults to `"equipo_analog"`).
-    pub login_username_input: String,
-    /// Login form password input.
-    pub login_password_input: String,
-    /// Status banner message displayed at the top of the side panel.
-    pub status_message: String,
-    /// Optional last error message from an API call or parser.
-    pub error_message: Option<String>,
-    /// Loaded site catalog.
     pub catalog: Catalog,
-    /// Active planetary body filter in the site selector.
-    pub body_filter: BodyFilter,
-    /// Currently selected primary site ID (starts at `"test_site"`).
-    pub primary_site_id: String,
-    /// Optional secondary site ID for side-by-side 3D Split-Screen comparison (`C` shortcut).
-    pub comparison_site_id: Option<String>,
-    /// Vertical exaggeration factor (`Transform.scale = Vec3::new(1.0, exaggeration, 1.0)`).
-    pub vertical_exaggeration: f32,
-    /// When `true`, forces the procedural 8x8 NW/SE UV verification checkerboard texture on the 3D mesh.
-    pub show_checkerboard_uv: bool,
-    /// Live scientific feature weights adjusted via UI sliders.
     pub active_weights: BTreeMap<String, f64>,
-    /// Ranked analog scores computed from `active_weights`.
     pub ranked_scores: Vec<ScoredSite>,
-    /// Triangle count of the currently rendered primary 3D mesh.
+    pub primary_site_id: String,
+    pub comparison_site_id: Option<String>,
+    pub vertical_exaggeration: f32,
+    pub show_checkerboard_uv: bool,
+    pub mode_selected: bool,
+    pub authenticated: bool,
+    pub researcher_username: Option<String>,
+    pub login_username: String,
+    pub login_password: String,
+    pub show_login_modal: bool,
+    pub show_left_panel: bool,
+    pub hide_all_ui: bool,
+    pub show_similarity_charts_window: bool,
+    pub show_planetary_telemetry: bool,
+    pub viewport_left_fraction: f32,
+    pub active_tab: PanelTab,
+    pub status_message: String,
+    pub error_message: Option<String>,
     pub loaded_primary_triangles: u32,
-    /// Bounding sphere radius in meters of the currently rendered primary 3D mesh.
-    pub loaded_primary_bounding_radius: f32,
-    /// Triangle count of the currently rendered comparison 3D mesh.
     pub loaded_comparison_triangles: u32,
-    /// Bounding sphere radius in meters of the currently rendered comparison 3D mesh.
+    pub loaded_primary_bounding_radius: f32,
     pub loaded_comparison_bounding_radius: f32,
-    /// Live elevation & topological summary for the primary site.
     pub loaded_primary_summary: SiteMeshSummary,
-    /// Live elevation & topological summary for the comparison site (when loaded).
     pub loaded_comparison_summary: Option<SiteMeshSummary>,
-    /// Editable site form for authenticated researchers (`POST /api/sites`).
     pub site_editor: SiteEditorForm,
-    /// Upload & TDA analysis form for `.stl` / `.tif` / `.png` files (`POST /api/sites/upload`).
     pub upload_form: TerrainUploadForm,
-    /// Most recent mathematical & topological analysis report returned by `POST /api/sites/upload`.
     pub last_analysis_report: Option<TerrainAnalysisReport>,
-    /// Request flag signaling the 3D scene system to reload the primary site mesh/texture.
-    pub pending_reload_primary: bool,
-    /// Request flag signaling the 3D scene system to reload the comparison site mesh/texture.
-    pub pending_reload_comparison: bool,
+    pub style_configured: bool,
 }
 
 impl Default for ViewerAppState {
@@ -624,65 +283,81 @@ impl Default for ViewerAppState {
         let catalog = fallback_synthetic_catalog();
         let active_weights = catalog.default_weights.clone();
         let recalc = recalculate_catalog(&catalog, &active_weights);
-        let first_site = catalog.sites.first().cloned().unwrap_or(SiteMetadata {
-            id: "test_site".to_string(),
-            name: "Synthetic Crater & Ridge UV Verification Site".to_string(),
-            body: Body::Moon,
-            description: String::new(),
-            center_lat_lon: None,
-            dem_extent: DemExtent::new(-1000.0, 1000.0, -1000.0, 1000.0),
-            elevation_range_m: Some([-45.0, 120.0]),
-            triangle_count: 2048,
-            mesh_path: "test_site/terrain.stl".to_string(),
-            mesh_format: None,
-            texture_path: "test_site/checkerboard.png".to_string(),
-            feature_scores: BTreeMap::new(),
-            canonical_score: 0.8485,
-            generated_by: None,
+        let primary_site = catalog.sites.first().cloned().unwrap_or_else(|| {
+            fallback_synthetic_catalog()
+                .sites
+                .into_iter()
+                .next()
+                .expect("synthetic catalog has 1 site")
         });
-        let primary_summary = estimate_site_summary_from_metadata(&first_site);
+        let primary_site_id = primary_site.id.clone();
+        let site_editor = SiteEditorForm::from_site(&primary_site);
 
         Self {
-            mode_selected: false,
-            ui_hidden: false,
-            panel_visible: true,
-            charts_window_open: false,
-            auto_rotate: false,
-            telemetry_visible: true,
-            telemetry_expanded: true,
-            active_tab: PanelTab::SitesAndCompare,
-            viewport_left_fraction: 0.30,
-            authenticated: false,
-            researcher_username: None,
-            login_username_input: "equipo_analog".to_string(),
-            login_password_input: String::new(),
-            status_message: "Select Public Demo Mode or log in as Researcher to begin.".to_string(),
-            error_message: None,
-            primary_site_id: first_site.id.clone(),
+            catalog,
+            active_weights,
+            ranked_scores: recalc.results,
+            primary_site_id,
             comparison_site_id: None,
             vertical_exaggeration: 1.5,
             show_checkerboard_uv: true,
-            active_weights,
-            ranked_scores: recalc.results,
-            loaded_primary_triangles: first_site.triangle_count,
-            loaded_primary_bounding_radius: 1415.0,
-            loaded_comparison_triangles: first_site.triangle_count,
-            loaded_comparison_bounding_radius: 1415.0,
-            loaded_primary_summary: primary_summary,
+            mode_selected: false,
+            authenticated: false,
+            researcher_username: None,
+            login_username: "researcher".to_string(),
+            login_password: String::new(),
+            show_login_modal: false,
+            show_left_panel: true,
+            hide_all_ui: false,
+            show_similarity_charts_window: false,
+            show_planetary_telemetry: true,
+            viewport_left_fraction: 0.28,
+            active_tab: PanelTab::SitesAndCompare,
+            status_message:
+                "Select Guest Public Demo Mode or log in with Researcher credentials to begin."
+                    .to_string(),
+            error_message: None,
+            loaded_primary_triangles: 2048,
+            loaded_comparison_triangles: 0,
+            loaded_primary_bounding_radius: 1414.2,
+            loaded_comparison_bounding_radius: 1414.2,
+            loaded_primary_summary: SiteMeshSummary::default(),
             loaded_comparison_summary: None,
-            site_editor: SiteEditorForm::from_site(&first_site),
+            site_editor,
             upload_form: TerrainUploadForm::default(),
             last_analysis_report: None,
-            catalog,
-            body_filter: BodyFilter::All,
-            pending_reload_primary: true,
-            pending_reload_comparison: false,
+            style_configured: false,
         }
     }
 }
 
 impl ViewerAppState {
-    /// Returns the currently selected primary [`SiteMetadata`].
+    pub fn apply_catalog(&mut self, catalog: Catalog) {
+        self.active_weights = catalog.default_weights.clone();
+        let recalc = recalculate_catalog(&catalog, &self.active_weights);
+        self.ranked_scores = recalc.results;
+
+        let primary_exists = catalog.sites.iter().any(|s| s.id == self.primary_site_id);
+        if !primary_exists {
+            if let Some(first) = catalog.sites.first() {
+                self.primary_site_id = first.id.clone();
+                self.site_editor = SiteEditorForm::from_site(first);
+            } else {
+                self.primary_site_id.clear();
+            }
+        } else if let Some(curr) = catalog.sites.iter().find(|s| s.id == self.primary_site_id) {
+            self.site_editor = SiteEditorForm::from_site(curr);
+        }
+
+        if let Some(comp_id) = &self.comparison_site_id
+            && !catalog.sites.iter().any(|s| &s.id == comp_id)
+        {
+            self.comparison_site_id = None;
+        }
+
+        self.catalog = catalog;
+    }
+
     pub fn primary_site(&self) -> Option<&SiteMetadata> {
         self.catalog
             .sites
@@ -691,2642 +366,2371 @@ impl ViewerAppState {
             .or_else(|| self.catalog.sites.first())
     }
 
-    /// Returns the currently selected comparison [`SiteMetadata`], if any.
     pub fn comparison_site(&self) -> Option<&SiteMetadata> {
-        let comp_id = self.comparison_site_id.as_deref()?;
-        self.catalog.sites.iter().find(|s| s.id == comp_id)
+        let id = self.comparison_site_id.as_ref()?;
+        self.catalog.sites.iter().find(|s| &s.id == id)
     }
 
-    /// Automatically finds the closest analog site in `catalog.sites` to `primary`,
-    /// prioritizing sites on a different planetary body (`Earth ↔ Moon` or `Earth ↔ Mars`).
-    pub fn find_best_comparison_site(&self) -> Option<SiteMetadata> {
-        let primary = self.primary_site()?;
-        let feature_dist = |cand: &SiteMetadata| -> f64 {
-            let keys = [
-                "elevation_relief",
-                "geomorphology_match",
-                "roughness_similarity",
-                "slope_safety",
-            ];
-            let mut sum_sq = 0.0_f64;
-            for k in keys {
-                let a = primary.feature_scores.get(k).copied().unwrap_or(0.5);
-                let b = cand.feature_scores.get(k).copied().unwrap_or(0.5);
-                let d = a - b;
-                sum_sq += d * d;
-            }
-            (sum_sq / (keys.len() as f64)).sqrt()
-        };
-
-        let best_cross_body = self
-            .catalog
-            .sites
-            .iter()
-            .filter(|s| s.id != primary.id && s.body != primary.body)
-            .min_by(|a, b| {
-                feature_dist(a)
-                    .partial_cmp(&feature_dist(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .cloned();
-
-        if best_cross_body.is_some() {
-            return best_cross_body;
+    /// Finds the best cross-body analog partner (e.g., Earth <-> Moon/Mars) or falls back to
+    /// the currently selected `comparison_site` so similarity breakdown is always available.
+    pub fn best_analog_partner(&self) -> Option<&SiteMetadata> {
+        if let Some(comp) = self.comparison_site() {
+            return Some(comp);
         }
-
+        let primary = self.primary_site()?;
         self.catalog
             .sites
             .iter()
-            .filter(|s| s.id != primary.id)
-            .min_by(|a, b| {
-                feature_dist(a)
-                    .partial_cmp(&feature_dist(b))
-                    .unwrap_or(std::cmp::Ordering::Equal)
+            .filter(|s| s.id != primary.id && s.body != primary.body)
+            .max_by(|a, b| {
+                let sa = self.compute_site_pair_similarity(primary, a);
+                let sb = self.compute_site_pair_similarity(primary, b);
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
             })
-            .cloned()
+            .or_else(|| self.catalog.sites.iter().find(|s| s.id != primary.id))
     }
 
-    /// Returns `(target_site, is_split_screen_active)` for the Planetary Analog Similarity Breakdown card.
-    pub fn resolved_similarity_target(&self) -> Option<(SiteMetadata, bool)> {
-        if let Some(comp) = self.comparison_site().cloned() {
-            return Some((comp, true));
+    pub fn compute_site_pair_similarity(&self, a: &SiteMetadata, b: &SiteMetadata) -> f64 {
+        let norm_w = normalize_weights(&self.active_weights);
+        let keys = [
+            "elevation_relief",
+            "geomorphology_match",
+            "roughness_similarity",
+            "slope_safety",
+        ];
+        let mut weighted_sim = 0.0;
+        let mut w_sum = 0.0;
+        for k in keys {
+            let va = a.feature_scores.get(k).copied().unwrap_or(0.5);
+            let vb = b.feature_scores.get(k).copied().unwrap_or(0.5);
+            let w = norm_w.get(k).copied().unwrap_or(0.25);
+            let sim = (1.0 - (va - vb).abs()).clamp(0.0, 1.0);
+            weighted_sim += w * sim;
+            w_sum += w;
         }
-        if let Some(auto_site) = self.find_best_comparison_site() {
-            return Some((auto_site, false));
-        }
-        self.primary_site().cloned().map(|s| (s, false))
-    }
-
-    /// Returns the [`SiteMeshSummary`] for any target site (using live mesh stats if loaded).
-    pub fn summary_for_site(&self, site: &SiteMetadata) -> SiteMeshSummary {
-        if site.id == self.primary_site_id {
-            return self.loaded_primary_summary;
-        }
-        if self.comparison_site_id.as_deref() == Some(site.id.as_str())
-            && let Some(summary) = self.loaded_comparison_summary
-        {
-            return summary;
-        }
-        estimate_site_summary_from_metadata(site)
-    }
-
-    /// Computes a normalized `[0.0, 1.0]` topological complexity index from a [`SiteMeshSummary`]
-    /// for visual plotting in the 5-axis comparison chart.
-    fn normalized_topology_index(summary: &SiteMeshSummary) -> f64 {
-        let total_b0 = summary.persistent_basins_b0 + summary.persistent_peaks_b0;
-        let b0_norm = ((1.0 + total_b0 as f64).ln() / 6.5).clamp(0.08, 0.98);
-        let chi_factor = (1.0 / (1.0 + (summary.euler_characteristic - 1).unsigned_abs() as f64 * 0.1))
-            .clamp(0.2, 1.0);
-        (0.75 * b0_norm + 0.25 * chi_factor).clamp(0.05, 1.0)
-    }
-
-    /// Computes the quantitative [`PairwiseSimilarityBreakdown`] between `primary` and `compare`.
-    pub fn compute_pairwise_similarity(
-        &self,
-        primary: &SiteMetadata,
-        compare: &SiteMetadata,
-    ) -> PairwiseSimilarityBreakdown {
-        let get_f = |s: &SiteMetadata, k: &str| -> f64 {
-            s.feature_scores
-                .get(k)
-                .copied()
-                .unwrap_or(0.5)
-                .clamp(0.0, 1.0)
-        };
-
-        let primary_relief_score = get_f(primary, "elevation_relief");
-        let compare_relief_score = get_f(compare, "elevation_relief");
-        let elevation_relief_sim =
-            (1.0 - (primary_relief_score - compare_relief_score).abs()).clamp(0.0, 1.0);
-
-        let primary_geom_score = get_f(primary, "geomorphology_match");
-        let compare_geom_score = get_f(compare, "geomorphology_match");
-        let geomorphology_sim =
-            (1.0 - (primary_geom_score - compare_geom_score).abs()).clamp(0.0, 1.0);
-
-        let primary_rough_score = get_f(primary, "roughness_similarity");
-        let compare_rough_score = get_f(compare, "roughness_similarity");
-        let roughness_sim =
-            (1.0 - (primary_rough_score - compare_rough_score).abs()).clamp(0.0, 1.0);
-
-        let primary_slope_score = get_f(primary, "slope_safety");
-        let compare_slope_score = get_f(compare, "slope_safety");
-        let slope_safety_sim =
-            (1.0 - (primary_slope_score - compare_slope_score).abs()).clamp(0.0, 1.0);
-
-        let w_er = self
-            .active_weights
-            .get("elevation_relief")
-            .copied()
-            .unwrap_or(0.20)
-            .max(0.0);
-        let w_gm = self
-            .active_weights
-            .get("geomorphology_match")
-            .copied()
-            .unwrap_or(0.20)
-            .max(0.0);
-        let w_rs = self
-            .active_weights
-            .get("roughness_similarity")
-            .copied()
-            .unwrap_or(0.25)
-            .max(0.0);
-        let w_ss = self
-            .active_weights
-            .get("slope_safety")
-            .copied()
-            .unwrap_or(0.35)
-            .max(0.0);
-        let w_sum = w_er + w_gm + w_rs + w_ss;
-
-        let weighted_feature_sim = if w_sum > 1e-9 {
-            (w_er * elevation_relief_sim
-                + w_gm * geomorphology_sim
-                + w_rs * roughness_sim
-                + w_ss * slope_safety_sim)
-                / w_sum
+        if w_sum > 0.0 {
+            (weighted_sim / w_sum).clamp(0.0, 1.0)
         } else {
-            0.25 * (elevation_relief_sim + geomorphology_sim + roughness_sim + slope_safety_sim)
-        };
+            0.0
+        }
+    }
 
-        let primary_summary = self.summary_for_site(primary);
-        let compare_summary = self.summary_for_site(compare);
+    pub fn build_pairwise_similarity(&self) -> Option<PairwiseAnalogSimilarity> {
+        let primary = self.primary_site()?;
+        let partner = self.best_analog_partner()?;
 
-        let primary_topo_score = Self::normalized_topology_index(&primary_summary);
-        let compare_topo_score = Self::normalized_topology_index(&compare_summary);
+        let ordered_dims = [
+            ("elevation_relief", "Elevation Relief"),
+            ("geomorphology_match", "Geomorphology (HI)"),
+            ("roughness_similarity", "Roughness (TRI)"),
+            ("slope_safety", "Slope Safety"),
+        ];
 
-        let delta_basins_b0 = primary_summary
-            .persistent_basins_b0
-            .abs_diff(compare_summary.persistent_basins_b0);
-        let delta_peaks_b0 = primary_summary
-            .persistent_peaks_b0
-            .abs_diff(compare_summary.persistent_peaks_b0);
+        let mut dimensions = Vec::with_capacity(ordered_dims.len());
+        for (key, label) in ordered_dims {
+            let va = primary.feature_scores.get(key).copied().unwrap_or(0.5);
+            let vb = partner.feature_scores.get(key).copied().unwrap_or(0.5);
+            let sim_pct = ((1.0 - (va - vb).abs()).clamp(0.0, 1.0)) * 100.0;
+            dimensions.push((label.to_string(), va, vb, sim_pct));
+        }
+
+        let overall_similarity_pct = self.compute_site_pair_similarity(primary, partner) * 100.0;
+
+        let prim_sum = self.loaded_primary_summary;
+        let comp_sum = self
+            .loaded_comparison_summary
+            .unwrap_or_else(|| estimate_site_summary_from_metadata(partner));
+        let delta_b0_basins = Some(
+            (prim_sum.persistent_basins_b0 as i64 - comp_sum.persistent_basins_b0 as i64).abs(),
+        );
         let delta_euler_chi =
-            (primary_summary.euler_characteristic - compare_summary.euler_characteristic).abs();
+            Some((prim_sum.euler_characteristic - comp_sum.euler_characteristic).abs());
 
-        let b1_ln = (1.0 + primary_summary.persistent_basins_b0 as f64).ln();
-        let b2_ln = (1.0 + compare_summary.persistent_basins_b0 as f64).ln();
-        let p1_ln = (1.0 + primary_summary.persistent_peaks_b0 as f64).ln();
-        let p2_ln = (1.0 + compare_summary.persistent_peaks_b0 as f64).ln();
-        let b0_diff = (b1_ln - b2_ln).abs() + 0.7 * (p1_ln - p2_ln).abs();
-        let chi_penalty = (delta_euler_chi as f64) * 0.08;
-        let topology_sim = (1.0 / (1.0 + 0.18 * b0_diff + chi_penalty)).clamp(0.0, 1.0);
-
-        let global_similarity_pct =
-            ((0.82 * weighted_feature_sim + 0.18 * topology_sim) * 100.0).clamp(0.0, 100.0);
-
-        PairwiseSimilarityBreakdown {
-            global_similarity_pct,
-            elevation_relief_sim,
-            primary_relief_score,
-            compare_relief_score,
-            geomorphology_sim,
-            primary_geom_score,
-            compare_geom_score,
-            roughness_sim,
-            primary_rough_score,
-            compare_rough_score,
-            slope_safety_sim,
-            primary_slope_score,
-            compare_slope_score,
-            topology_sim,
-            primary_topo_score,
-            compare_topo_score,
-            primary_summary,
-            compare_summary,
-            delta_basins_b0,
-            delta_peaks_b0,
+        Some(PairwiseAnalogSimilarity {
+            primary_name: primary.name.clone(),
+            primary_body: primary.body.clone(),
+            primary_elev: primary.elevation_range_m,
+            compare_id: partner.id.clone(),
+            compare_name: partner.name.clone(),
+            compare_body: partner.body.clone(),
+            compare_elev: partner.elevation_range_m,
+            overall_similarity_pct,
+            dimensions,
+            delta_b0_basins,
             delta_euler_chi,
-        }
-    }
-
-    /// Replaces the catalog, synchronizes weights if empty, and updates rankings.
-    pub fn apply_catalog(&mut self, catalog: Catalog) {
-        if !catalog.default_weights.is_empty() {
-            self.active_weights = catalog.default_weights.clone();
-        }
-        let recalc = recalculate_catalog(&catalog, &self.active_weights);
-        self.ranked_scores = recalc.results;
-
-        let primary_exists = catalog.sites.iter().any(|s| s.id == self.primary_site_id);
-        if !primary_exists
-            && let Some(first) = catalog.sites.first()
-        {
-            self.primary_site_id = first.id.clone();
-            self.site_editor = SiteEditorForm::from_site(first);
-            self.loaded_primary_summary = estimate_site_summary_from_metadata(first);
-        } else if let Some(current) = catalog.sites.iter().find(|s| s.id == self.primary_site_id) {
-            self.site_editor = SiteEditorForm::from_site(current);
-            self.loaded_primary_summary = estimate_site_summary_from_metadata(current);
-        }
-
-        self.catalog = catalog;
-        self.pending_reload_primary = true;
-    }
-
-    /// Selects a new primary site and triggers asynchronous mesh + texture loading.
-    pub fn select_primary_site(&mut self, site_id: &str, net: &NetBridge) {
-        if let Some(site) = self.catalog.sites.iter().find(|s| s.id == site_id).cloned() {
-            self.primary_site_id = site.id.clone();
-            self.site_editor = SiteEditorForm::from_site(&site);
-            self.loaded_primary_summary = estimate_site_summary_from_metadata(&site);
-            self.pending_reload_primary = true;
-            net.fetch_site_assets(TerrainSlot::Primary, &site);
-        }
-    }
-
-    /// Cycles the primary site forward (`step = 1`) or backward (`step = -1`) via `ArrowDown` / `ArrowUp`.
-    pub fn cycle_primary_site(&mut self, step: isize, net: &NetBridge) {
-        let mut pool: Vec<String> = self
-            .catalog
-            .sites
-            .iter()
-            .filter(|s| self.body_filter.matches(s.body))
-            .map(|s| s.id.clone())
-            .collect();
-        if pool.is_empty() {
-            pool = self.catalog.sites.iter().map(|s| s.id.clone()).collect();
-        }
-        if pool.is_empty() {
-            return;
-        }
-        let cur_idx = pool
-            .iter()
-            .position(|id| *id == self.primary_site_id)
-            .unwrap_or(0);
-        let len = pool.len() as isize;
-        let next_idx = (cur_idx as isize + step).rem_euclid(len) as usize;
-        let next_id = pool[next_idx].clone();
-        self.select_primary_site(&next_id, net);
-        if let Some(site) = self.primary_site() {
-            self.status_message = format!(
-                "Switched Primary Site to '{}' [{}] (ArrowUp/ArrowDown).",
-                site.name,
-                site.body.as_str().to_uppercase()
-            );
-        }
-    }
-
-    /// Toggles synchronized side-by-side 3D Split-Screen comparison (`C` shortcut).
-    pub fn toggle_split_screen_comparison(&mut self, net: &NetBridge) {
-        if self.comparison_site_id.is_some() {
-            self.comparison_site_id = None;
-            self.loaded_comparison_summary = None;
-            self.pending_reload_comparison = true;
-            self.status_message =
-                "Exited Split-Screen (Single 3D View). Press [C] to compare again.".to_string();
-        } else {
-            let target = self
-                .find_best_comparison_site()
-                .or_else(|| self.primary_site().cloned());
-            if let Some(comp) = target {
-                self.comparison_site_id = Some(comp.id.clone());
-                self.loaded_comparison_summary = Some(estimate_site_summary_from_metadata(&comp));
-                self.pending_reload_comparison = true;
-                self.status_message = format!(
-                    "Split-Screen active: comparing '{}' vs '{}' [{}]. Orbit/Zoom are synchronized!",
-                    self.primary_site()
-                        .map(|s| s.name.as_str())
-                        .unwrap_or("Primary"),
-                    comp.name,
-                    comp.body.as_str().to_uppercase()
-                );
-                net.fetch_site_assets(TerrainSlot::Comparison, &comp);
-            }
-        }
-    }
-}
-
-/// Draws the custom `egui::Painter` Similarity Charts:
-/// 1. Global Analog Similarity (`0–100%`) horizontal bar chart across all loaded sites.
-/// 2. 5-Axis Scientific & Topological grouped vertical bar chart (`Primary` vs `Compared`).
-fn render_similarity_charts_painter(ui: &mut egui::Ui, app_state: &ViewerAppState) {
-    let Some(primary) = app_state.primary_site().cloned() else {
-        return;
-    };
-    let Some((target, _)) = app_state.resolved_similarity_target() else {
-        return;
-    };
-    let pair_sim = app_state.compute_pairwise_similarity(&primary, &target);
-
-    let avail_w = ui.available_width().clamp(260.0, 560.0);
-
-    // =========================================================================
-    // CHART 1: Global Analog Similarity Ranking Across Loaded Catalog Sites
-    // =========================================================================
-    ui.strong(format!(
-        "1. Global Similarity Ranking vs. '{}' [{}] (0–100%)",
-        primary.name,
-        primary.body.as_str().to_uppercase()
-    ));
-    ui.label(
-        egui::RichText::new(
-            "Bars colored by planetary body (Earth=Emerald, Moon=Cyan, Mars=Amber); cross-body pairs highlighted:",
-        )
-        .small()
-        .color(egui::Color32::from_gray(175)),
-    );
-
-    let mut site_sims: Vec<(SiteMetadata, f64)> = app_state
-        .catalog
-        .sites
-        .iter()
-        .map(|s| {
-            let pct = if s.id == primary.id {
-                100.0
-            } else {
-                app_state
-                    .compute_pairwise_similarity(&primary, s)
-                    .global_similarity_pct
-            };
-            (s.clone(), pct)
         })
-        .collect();
-    site_sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-    let row_h = 26.0_f32;
-    let header_h = 20.0_f32;
-    let chart1_h = header_h + (site_sims.len().max(1) as f32) * row_h + 10.0;
-    let (rect1, _) = ui.allocate_exact_size(egui::vec2(avail_w, chart1_h), egui::Sense::hover());
-    let painter1 = ui.painter_at(rect1);
-
-    painter1.rect_filled(
-        rect1,
-        egui::Rounding::same(6.0),
-        egui::Color32::from_rgba_unmultiplied(10, 16, 24, 240),
-    );
-    painter1.rect_stroke(
-        rect1,
-        egui::Rounding::same(6.0),
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 65, 88)),
-    );
-
-    let label_col_w = (avail_w * 0.42).clamp(105.0, 195.0);
-    let bar_left = rect1.left() + label_col_w;
-    let bar_right = rect1.right() - 52.0;
-    let bar_max_w = (bar_right - bar_left).max(60.0);
-
-    // Vertical grid lines at 0%, 25%, 50%, 75%, 100%
-    for step in [0_u32, 25, 50, 75, 100] {
-        let frac = (step as f32) / 100.0;
-        let gx = bar_left + frac * bar_max_w;
-        painter1.line_segment(
-            [
-                egui::pos2(gx, rect1.top() + header_h - 2.0),
-                egui::pos2(gx, rect1.bottom() - 4.0),
-            ],
-            egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(70, 90, 115, 90),
-            ),
-        );
-        painter1.text(
-            egui::pos2(gx, rect1.top() + 3.0),
-            egui::Align2::CENTER_TOP,
-            format!("{step}%"),
-            egui::FontId::monospace(10.0),
-            egui::Color32::from_gray(155),
-        );
-    }
-
-    for (idx, (site, pct)) in site_sims.iter().enumerate() {
-        let y_top = rect1.top() + header_h + (idx as f32) * row_h;
-        let y_mid = y_top + row_h * 0.5;
-        let is_cross_body = site.body != primary.body;
-        let is_target = site.id == target.id && site.id != primary.id;
-
-        if is_target {
-            painter1.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(rect1.left() + 3.0, y_top + 1.0),
-                    egui::pos2(rect1.right() - 3.0, y_top + row_h - 1.0),
-                ),
-                egui::Rounding::same(4.0),
-                egui::Color32::from_rgba_unmultiplied(0, 180, 160, 35),
-            );
-        }
-
-        let tag = if site.id == primary.id {
-            format!("[{}] {} (Ref)", site.body.as_str().to_uppercase(), site.name)
-        } else if is_cross_body {
-            format!(
-                "[{}↔{}] {}",
-                primary.body.as_str().to_uppercase().chars().next().unwrap_or('P'),
-                site.body.as_str().to_uppercase().chars().next().unwrap_or('C'),
-                site.name
-            )
-        } else {
-            format!("[{}] {}", site.body.as_str().to_uppercase(), site.name)
-        };
-
-        let short_tag = if tag.chars().count() > 22 {
-            let s: String = tag.chars().take(21).collect();
-            format!("{s}…")
-        } else {
-            tag
-        };
-
-        painter1.text(
-            egui::pos2(rect1.left() + 6.0, y_mid),
-            egui::Align2::LEFT_CENTER,
-            short_tag,
-            egui::FontId::proportional(11.5),
-            body_accent_color(site.body),
-        );
-
-        let frac = (*pct / 100.0).clamp(0.0, 1.0) as f32;
-        let bw = (frac * bar_max_w).max(2.0);
-        let bar_rect = egui::Rect::from_min_max(
-            egui::pos2(bar_left, y_top + 5.0),
-            egui::pos2(bar_left + bw, y_top + row_h - 5.0),
-        );
-        painter1.rect_filled(bar_rect, egui::Rounding::same(3.0), body_accent_color(site.body));
-
-        painter1.text(
-            egui::pos2(bar_left + bw + 5.0, y_mid),
-            egui::Align2::LEFT_CENTER,
-            format!("{pct:.1}%"),
-            egui::FontId::monospace(11.0),
-            egui::Color32::WHITE,
-        );
-    }
-
-    ui.add_space(8.0);
-
-    // =========================================================================
-    // CHART 2: 5-Axis Scientific & Topological Grouped Bar Chart (Primary vs Compared)
-    // =========================================================================
-    ui.strong(format!(
-        "2. Scientific Axis Comparison: '{}' [{}] vs. '{}' [{}]",
-        primary.name,
-        primary.body.as_str().to_uppercase(),
-        target.name,
-        target.body.as_str().to_uppercase()
-    ));
-
-    let p_col = body_accent_color(primary.body);
-    let c_col = if target.body != primary.body {
-        body_accent_color(target.body)
-    } else {
-        egui::Color32::from_rgb(245, 175, 65)
-    };
-
-    ui.horizontal_wrapped(|ui| {
-        ui.colored_label(
-            p_col,
-            egui::RichText::new(format!(
-                "■ Primary: {} [{}]",
-                primary.name,
-                primary.body.as_str().to_uppercase()
-            ))
-            .small()
-            .strong(),
-        );
-        ui.colored_label(
-            c_col,
-            egui::RichText::new(format!(
-                "■ Compare: {} [{}]",
-                target.name,
-                target.body.as_str().to_uppercase()
-            ))
-            .small()
-            .strong(),
-        );
-        ui.colored_label(
-            egui::Color32::from_rgb(130, 240, 195),
-            egui::RichText::new("● Top Label = Axis Match %").small(),
-        );
-    });
-
-    let chart2_h = 175.0_f32;
-    let (rect2, _) = ui.allocate_exact_size(egui::vec2(avail_w, chart2_h), egui::Sense::hover());
-    let painter2 = ui.painter_at(rect2);
-
-    painter2.rect_filled(
-        rect2,
-        egui::Rounding::same(6.0),
-        egui::Color32::from_rgba_unmultiplied(10, 16, 24, 240),
-    );
-    painter2.rect_stroke(
-        rect2,
-        egui::Rounding::same(6.0),
-        egui::Stroke::new(1.0, egui::Color32::from_rgb(45, 65, 88)),
-    );
-
-    let plot_left = rect2.left() + 34.0;
-    let plot_right = rect2.right() - 10.0;
-    let plot_top = rect2.top() + 24.0;
-    let plot_bottom = rect2.bottom() - 28.0;
-    let plot_w = (plot_right - plot_left).max(120.0);
-    let plot_h = (plot_bottom - plot_top).max(60.0);
-
-    // Horizontal grid lines at 0%, 50%, 100%
-    for step in [0_u32, 25, 50, 75, 100] {
-        let frac = (step as f32) / 100.0;
-        let gy = plot_bottom - frac * plot_h;
-        painter2.line_segment(
-            [egui::pos2(plot_left, gy), egui::pos2(plot_right, gy)],
-            egui::Stroke::new(
-                1.0,
-                egui::Color32::from_rgba_unmultiplied(70, 90, 115, 80),
-            ),
-        );
-        if step % 50 == 0 {
-            painter2.text(
-                egui::pos2(plot_left - 4.0, gy),
-                egui::Align2::RIGHT_CENTER,
-                format!("{step}%"),
-                egui::FontId::monospace(9.5),
-                egui::Color32::from_gray(150),
-            );
-        }
-    }
-
-    let axes = [
-        (
-            "Relief",
-            pair_sim.primary_relief_score,
-            pair_sim.compare_relief_score,
-            pair_sim.elevation_relief_sim,
-        ),
-        (
-            "Geomorph",
-            pair_sim.primary_geom_score,
-            pair_sim.compare_geom_score,
-            pair_sim.geomorphology_sim,
-        ),
-        (
-            "Roughness",
-            pair_sim.primary_rough_score,
-            pair_sim.compare_rough_score,
-            pair_sim.roughness_sim,
-        ),
-        (
-            "Slope",
-            pair_sim.primary_slope_score,
-            pair_sim.compare_slope_score,
-            pair_sim.slope_safety_sim,
-        ),
-        (
-            "0D TDA",
-            pair_sim.primary_topo_score,
-            pair_sim.compare_topo_score,
-            pair_sim.topology_sim,
-        ),
-    ];
-
-    let group_w = plot_w / (axes.len() as f32);
-    let bar_w = (group_w * 0.28).clamp(8.0, 24.0);
-
-    for (i, (axis_label, val_p, val_c, sim_axis)) in axes.iter().enumerate() {
-        let gx_center = plot_left + (i as f32 + 0.5) * group_w;
-
-        let hp = (val_p.clamp(0.0, 1.0) as f32) * plot_h;
-        let hc = (val_c.clamp(0.0, 1.0) as f32) * plot_h;
-
-        let rect_p = egui::Rect::from_min_max(
-            egui::pos2(gx_center - bar_w - 1.5, plot_bottom - hp.max(2.0)),
-            egui::pos2(gx_center - 1.5, plot_bottom),
-        );
-        let rect_c = egui::Rect::from_min_max(
-            egui::pos2(gx_center + 1.5, plot_bottom - hc.max(2.0)),
-            egui::pos2(gx_center + bar_w + 1.5, plot_bottom),
-        );
-
-        painter2.rect_filled(rect_p, egui::Rounding::same(2.0), p_col);
-        painter2.rect_filled(rect_c, egui::Rounding::same(2.0), c_col);
-
-        // Value percentages above each bar
-        painter2.text(
-            egui::pos2(rect_p.center().x, rect_p.top() - 2.0),
-            egui::Align2::CENTER_BOTTOM,
-            format!("{:.0}%", val_p * 100.0),
-            egui::FontId::monospace(9.0),
-            p_col,
-        );
-        painter2.text(
-            egui::pos2(rect_c.center().x, rect_c.top() - 2.0),
-            egui::Align2::CENTER_BOTTOM,
-            format!("{:.0}%", val_c * 100.0),
-            egui::FontId::monospace(9.0),
-            c_col,
-        );
-
-        // Axis Match % badge at top of column
-        painter2.text(
-            egui::pos2(gx_center, rect2.top() + 5.0),
-            egui::Align2::CENTER_TOP,
-            format!("≈{:.0}%", sim_axis * 100.0),
-            egui::FontId::monospace(10.0),
-            egui::Color32::from_rgb(120, 240, 190),
-        );
-
-        // Axis name below baseline
-        painter2.text(
-            egui::pos2(gx_center, plot_bottom + 6.0),
-            egui::Align2::CENTER_TOP,
-            *axis_label,
-            egui::FontId::proportional(11.0),
-            egui::Color32::from_gray(205),
-        );
     }
 }
 
-/// Renders the highlighted **"Planetary Analog Similarity Breakdown (Earth ↔ Moon/Mars)"** card.
-fn render_similarity_breakdown_card(
-    ui: &mut egui::Ui,
-    app_state: &mut ViewerAppState,
-    net: &NetBridge,
-) {
-    let Some(primary) = app_state.primary_site().cloned() else {
-        return;
-    };
-    let Some((target, is_split_active)) = app_state.resolved_similarity_target() else {
-        return;
-    };
+/// Applies explicit font sizes, high-contrast colors (`#F1F5F9` / `#CBD5E1`), button padding,
+/// item spacing, and line wrapping on 14" laptop displays.
+fn configure_legible_style(ctx: &egui::Context) {
+    ctx.style_mut(|style| {
+        use egui::{FontFamily, FontId, TextStyle};
+        style.text_styles.insert(
+            TextStyle::Heading,
+            FontId::new(17.5, FontFamily::Proportional),
+        );
+        style
+            .text_styles
+            .insert(TextStyle::Body, FontId::new(13.5, FontFamily::Proportional));
+        style.text_styles.insert(
+            TextStyle::Button,
+            FontId::new(13.5, FontFamily::Proportional),
+        );
+        style.text_styles.insert(
+            TextStyle::Monospace,
+            FontId::new(13.0, FontFamily::Monospace),
+        );
+        style.text_styles.insert(
+            TextStyle::Small,
+            FontId::new(12.0, FontFamily::Proportional),
+        );
 
-    let sim = app_state.compute_pairwise_similarity(&primary, &target);
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.wrap_mode = Some(egui::TextWrapMode::Wrap);
 
-    egui::Frame::group(ui.style())
-        .fill(egui::Color32::from_rgba_unmultiplied(18, 28, 40, 245))
-        .stroke(egui::Stroke::new(
-            1.5,
-            if is_split_active {
-                egui::Color32::from_rgb(0, 220, 180)
-            } else {
-                egui::Color32::from_rgb(0, 185, 220)
-            },
-        ))
-        .inner_margin(egui::Margin::same(8.0))
-        .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.colored_label(
-                    egui::Color32::from_rgb(0, 225, 235),
-                    egui::RichText::new(
-                        "Planetary Analog Similarity Breakdown (Earth ↔ Moon/Mars)",
-                    )
-                    .strong(),
-                );
-                if is_split_active {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(80, 240, 165),
-                        egui::RichText::new("[SPLIT-SCREEN ON]").small().strong(),
-                    );
-                } else {
-                    ui.colored_label(
-                        egui::Color32::from_gray(175),
-                        egui::RichText::new("[AUTO-MATCHED ANALOG]").small(),
-                    );
-                }
-            });
-
-            ui.horizontal_wrapped(|ui| {
-                ui.colored_label(
-                    body_accent_color(primary.body),
-                    egui::RichText::new(format!(
-                        "{} [{}]",
-                        primary.name,
-                        primary.body.as_str().to_uppercase()
-                    ))
-                    .strong()
-                    .small(),
-                );
-                ui.label(egui::RichText::new("↔").strong());
-                ui.colored_label(
-                    body_accent_color(target.body),
-                    egui::RichText::new(format!(
-                        "{} [{}]",
-                        target.name,
-                        target.body.as_str().to_uppercase()
-                    ))
-                    .strong()
-                    .small(),
-                );
-            });
-
-            ui.add_space(4.0);
-
-            let global_frac = (sim.global_similarity_pct / 100.0).clamp(0.0, 1.0) as f32;
-            let global_color = if sim.global_similarity_pct >= 75.0 {
-                egui::Color32::from_rgb(35, 205, 145)
-            } else if sim.global_similarity_pct >= 50.0 {
-                egui::Color32::from_rgb(0, 185, 225)
-            } else {
-                egui::Color32::from_rgb(235, 145, 50)
-            };
-            ui.add(
-                egui::ProgressBar::new(global_frac)
-                    .fill(global_color)
-                    .text(
-                        egui::RichText::new(format!(
-                            "Global Analog Similarity: {:.1}%",
-                            sim.global_similarity_pct
-                        ))
-                        .strong()
-                        .color(egui::Color32::WHITE),
-                    ),
-            );
-
-            ui.add_space(4.0);
-
-            let dz_p = (sim.primary_summary.max_elevation_m - sim.primary_summary.min_elevation_m)
-                .abs();
-            let dz_c = (sim.compare_summary.max_elevation_m - sim.compare_summary.min_elevation_m)
-                .abs();
-
-            let dimensions = [
-                (
-                    "Elevation Relief",
-                    sim.elevation_relief_sim,
-                    format!(
-                        "{:.0}% ({:.2} vs {:.2} | Δz: {:.0}m vs {:.0}m)",
-                        sim.elevation_relief_sim * 100.0,
-                        sim.primary_relief_score,
-                        sim.compare_relief_score,
-                        dz_p,
-                        dz_c
-                    ),
-                ),
-                (
-                    "Geomorphology Match",
-                    sim.geomorphology_sim,
-                    format!(
-                        "{:.0}% ({:.2} vs {:.2})",
-                        sim.geomorphology_sim * 100.0,
-                        sim.primary_geom_score,
-                        sim.compare_geom_score
-                    ),
-                ),
-                (
-                    "Roughness Similarity",
-                    sim.roughness_sim,
-                    format!(
-                        "{:.0}% ({:.2} vs {:.2})",
-                        sim.roughness_sim * 100.0,
-                        sim.primary_rough_score,
-                        sim.compare_rough_score
-                    ),
-                ),
-                (
-                    "Slope Safety",
-                    sim.slope_safety_sim,
-                    format!(
-                        "{:.0}% ({:.2} vs {:.2})",
-                        sim.slope_safety_sim * 100.0,
-                        sim.primary_slope_score,
-                        sim.compare_slope_score
-                    ),
-                ),
-                (
-                    "Topology (0D PH & χ)",
-                    sim.topology_sim,
-                    format!(
-                        "{:.0}% (Δβ₀ basins={}, Δχ={})",
-                        sim.topology_sim * 100.0,
-                        sim.delta_basins_b0,
-                        sim.delta_euler_chi
-                    ),
-                ),
-            ];
-
-            let bar_w = (ui.available_width() - 135.0).clamp(120.0, 340.0);
-            egui::Grid::new("similarity_dimensions_grid")
-                .num_columns(2)
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    for (label, frac, bar_text) in dimensions {
-                        ui.label(egui::RichText::new(label).small());
-                        ui.add(
-                            egui::ProgressBar::new(frac as f32)
-                                .desired_width(bar_w)
-                                .fill(egui::Color32::from_rgb(30, 145, 195))
-                                .text(egui::RichText::new(bar_text).small()),
-                        );
-                        ui.end_row();
-                    }
-                });
-
-            ui.add_space(4.0);
-
-            ui.group(|ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Topological Invariant Difference (0D Persistent Homology Δβ₀ & Euler χ):",
-                    )
-                    .small()
-                    .strong(),
-                );
-                ui.label(
-                    egui::RichText::new(format!(
-                        "β₀ Basins: {} vs {} (Δβ₀ = {}) | β₀ Peaks: {} vs {} (Δβ₀ = {})",
-                        sim.primary_summary.persistent_basins_b0,
-                        sim.compare_summary.persistent_basins_b0,
-                        sim.delta_basins_b0,
-                        sim.primary_summary.persistent_peaks_b0,
-                        sim.compare_summary.persistent_peaks_b0,
-                        sim.delta_peaks_b0,
-                    ))
-                    .monospace()
-                    .small(),
-                );
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Euler χ = V-E+F: χ₁ = {} vs χ₂ = {} (Δχ = {})",
-                        sim.primary_summary.euler_characteristic,
-                        sim.compare_summary.euler_characteristic,
-                        sim.delta_euler_chi,
-                    ))
-                    .monospace()
-                    .small(),
-                );
-            });
-
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                if is_split_active {
-                    if ui
-                        .button("[C] Exit 3D Split-Screen (Single View)")
-                        .clicked()
-                    {
-                        app_state.toggle_split_screen_comparison(net);
-                    }
-                } else {
-                    let btn = egui::Button::new(
-                        egui::RichText::new(format!(
-                            "[C] Launch Synchronized 3D Split-Screen ({} ↔ {})",
-                            primary.name, target.name
-                        ))
-                        .strong()
-                        .color(egui::Color32::from_rgb(10, 25, 30)),
-                    )
-                    .fill(egui::Color32::from_rgb(0, 215, 185));
-                    if ui.add(btn).clicked() {
-                        app_state.comparison_site_id = Some(target.id.clone());
-                        app_state.loaded_comparison_summary =
-                            Some(estimate_site_summary_from_metadata(&target));
-                        app_state.pending_reload_comparison = true;
-                        app_state.status_message = format!(
-                            "Split-Screen active: '{}' [{}] ↔ '{}' [{}].",
-                            primary.name,
-                            primary.body.as_str().to_uppercase(),
-                            target.name,
-                            target.body.as_str().to_uppercase()
-                        );
-                        net.fetch_site_assets(TerrainSlot::Comparison, &target);
-                    }
-                }
-
-                if ui
-                    .button(if app_state.charts_window_open {
-                        "Hide Floating Charts"
-                    } else {
-                        "Open Floating Charts [Charts]"
-                    })
-                    .clicked()
-                {
-                    app_state.charts_window_open = !app_state.charts_window_open;
-                }
-            });
-
-            ui.add_space(4.0);
-            egui::CollapsingHeader::new(
-                egui::RichText::new("Visual Similarity Charts (egui::Painter Bars)")
-                    .strong()
-                    .color(egui::Color32::from_rgb(110, 230, 200)),
-            )
-            .default_open(true)
-            .show(ui, |ui| {
-                render_similarity_charts_painter(ui, app_state);
-            });
-        });
-}
-
-/// Renders the Mathematical, Differential-Geometric & Topological Report (TDA) panel.
-fn render_tda_report_panel(ui: &mut egui::Ui, report: &TerrainAnalysisReport) {
-    egui::CollapsingHeader::new(
-        egui::RichText::new("Mathematical & Topological Analysis Report (TDA)")
-            .strong()
-            .color(egui::Color32::from_rgb(120, 240, 170)),
-    )
-    .default_open(true)
-    .show(ui, |ui| {
-        ui.group(|ui| {
-            ui.colored_label(
-                egui::Color32::from_rgb(0, 220, 230),
-                format!(
-                    "Proposed Planetary Analog: {} (Score: {:.4})",
-                    report.proposal.proposed_body.as_str().to_uppercase(),
-                    report.proposal.analog_score
-                ),
-            );
-            ui.monospace(format!(
-                "Closest Reference : {} ({})",
-                report.proposal.closest_site_name, report.proposal.closest_site_id
-            ));
-            ui.monospace(format!(
-                "Feature Similarity: {:.1}%",
-                report.proposal.similarity_score * 100.0
-            ));
-            ui.add_space(2.0);
-            ui.label(egui::RichText::new(&report.proposal.justification).small());
-        });
-
-        ui.group(|ui| {
-            ui.strong("Differential Geometry & Morphometry (∇z, TRI, HI)");
-            let m = &report.morphometry;
-            ui.monospace(format!(
-                "Elevation z (m)   : [{:.2}, {:.2}] (Δz = {:.2} m)",
-                m.min_elevation_m, m.max_elevation_m, m.elevation_range_m
-            ));
-            ui.monospace(format!(
-                "Mean / Std z (m)  : {:.2} ± {:.2} m",
-                m.mean_elevation_m, m.std_elevation_m
-            ));
-            ui.monospace(format!(
-                "Slope |∇z| (deg)  : mean={:.2}° | std={:.2}° | P90={:.2}°",
-                m.slope_mean_deg, m.slope_std_deg, m.slope_p90_deg
-            ));
-            ui.monospace(format!(
-                "Roughness TRI/RMS : TRI={:.3} m | Laplacian RMS={:.3} m",
-                m.tri_mean_m, m.roughness_rms_m
-            ));
-            ui.monospace(format!(
-                "Hypsometric Int HI: {:.4} | Tortuosity A3D/A2D: {:.5}",
-                m.hypsometric_integral, m.surface_to_planar_ratio
-            ));
-        });
-
-        ui.group(|ui| {
-            ui.strong("Topological Data Analysis (0D Persistent Homology & χ)");
-            let t = &report.topology;
-            let orig_tris = t.original_triangle_count.max(t.face_count);
-            let simp_tris = t.simplified_triangle_count.max(t.face_count);
-            ui.monospace(format!(
-                "Mesh Triangles    : {orig_tris} original -> {simp_tris} simplified (<= 50,000)"
-            ));
-            ui.monospace(format!(
-                "β₀ Sublevel Basins: {} craters/depressions",
-                t.persistent_basins_b0
-            ));
-            ui.monospace(format!(
-                "β₀ Superlevel Peak: {} peaks/domes",
-                t.persistent_peaks_b0
-            ));
-            ui.monospace(format!(
-                "Persistence (m)   : max={:.2} m | mean={:.2} m (τ={:.2} m)",
-                t.max_persistence_m, t.mean_persistence_m, t.persistence_threshold_m
-            ));
-            ui.monospace(format!(
-                "Simplicial Mesh   : V={} | E={} | F={}",
-                t.vertex_count, t.edge_count, t.face_count
-            ));
-            ui.monospace(format!(
-                "Euler χ = V-E+F   : {} | Components (β₀)={} | Genus≈{}",
-                t.euler_characteristic, t.connected_components, t.estimated_genus
-            ));
-            ui.monospace(format!(
-                "Boundary Edges    : {} | 2-Manifold: {}",
-                t.boundary_edges,
-                if t.is_manifold_with_boundary {
-                    "Yes"
-                } else {
-                    "No"
-                }
-            ));
-        });
+        style.visuals.override_text_color = Some(COLOR_TEXT_PRIMARY);
+        style.visuals.panel_fill = COLOR_PANEL_BG;
+        style.visuals.window_fill = COLOR_PANEL_BG;
+        style.visuals.extreme_bg_color = egui::Color32::from_rgb(9, 13, 22);
+        style.visuals.widgets.noninteractive.bg_fill = COLOR_CARD_BG;
+        style.visuals.widgets.noninteractive.fg_stroke =
+            egui::Stroke::new(1.0, COLOR_TEXT_PRIMARY);
+        style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, COLOR_BORDER);
+        style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(30, 41, 59);
+        style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, COLOR_TEXT_PRIMARY);
+        style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(51, 65, 85);
+        style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
+        style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(37, 99, 235);
+        style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
     });
 }
 
-/// Renders the startup mode selection modal, persistent top-left quick toolbar,
-/// resizable auto-wrapping left side panel (`ScrollArea::both()`), top-right live
-/// Planetary Telemetry HUD, floating Similarity Charts window, and Split-Screen 3D overlays.
+/// Returns the current Unix timestamp in seconds (with subsecond precision) on both WASM and native.
+fn current_unix_timestamp_secs() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now() / 1000.0
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(1_775_000_000.0)
+    }
+}
+
+/// Formats seconds of day (`0..86400`) as `HH:MM:SS`.
+fn format_hms(seconds_of_day: f64) -> String {
+    let total = seconds_of_day.rem_euclid(86_400.0) as u64;
+    let hh = total / 3600;
+    let mm = (total % 3600) / 60;
+    let ss = total % 60;
+    format!("{hh:02}:{mm:02}:{ss:02}")
+}
+
+/// Main `bevy_egui` rendering system.
 pub fn viewer_ui_system(
     mut contexts: EguiContexts,
     mut app_state: ResMut<ViewerAppState>,
     net: Res<NetBridge>,
-    mut cam_query: Query<(&mut OrbitCamera, &mut Projection)>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut camera_query: Query<(&mut OrbitCamera, &mut Projection)>,
 ) {
     let ctx = contexts.ctx_mut();
-
-    // Keep planetary telemetry clocks ticking smoothly even when pointer is idle
-    ctx.request_repaint_after(std::time::Duration::from_millis(500));
-
-    // Apply clean dark scientific theme
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = egui::Color32::from_rgba_unmultiplied(15, 20, 28, 242);
-    ctx.set_visuals(visuals);
-
-    // 0. Global Keyboard Navigation (when no text input field is focused)
-    if app_state.mode_selected && !ctx.wants_keyboard_input() {
-        let mut toggle_hide_ui = false;
-        let mut toggle_auto_rotate = false;
-        let mut cycle_up = false;
-        let mut cycle_down = false;
-        let mut toggle_split = false;
-        let mut zoom_in_step = false;
-        let mut zoom_out_step = false;
-        let mut tab_select: Option<PanelTab> = None;
-
-        ctx.input(|i| {
-            if i.key_pressed(egui::Key::H) {
-                toggle_hide_ui = true;
-            }
-            if i.key_pressed(egui::Key::A) {
-                toggle_auto_rotate = true;
-            }
-            if i.key_pressed(egui::Key::ArrowUp) {
-                cycle_up = true;
-            }
-            if i.key_pressed(egui::Key::ArrowDown) {
-                cycle_down = true;
-            }
-            if i.key_pressed(egui::Key::C) {
-                toggle_split = true;
-            }
-            if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
-                zoom_in_step = true;
-            }
-            if i.key_pressed(egui::Key::Minus) {
-                zoom_out_step = true;
-            }
-            if i.key_pressed(egui::Key::Num1) {
-                tab_select = Some(PanelTab::SitesAndCompare);
-            } else if i.key_pressed(egui::Key::Num2) {
-                tab_select = Some(PanelTab::View3dAndCamera);
-            } else if i.key_pressed(egui::Key::Num3) {
-                tab_select = Some(PanelTab::WeightsAndTda);
-            } else if i.key_pressed(egui::Key::Num4) {
-                tab_select = Some(PanelTab::ResearcherUpload);
-            }
-            for ev in &i.events {
-                if let egui::Event::Text(text) = ev {
-                    if text == "+" || text == "=" {
-                        zoom_in_step = true;
-                    } else if text == "-" || text == "_" {
-                        zoom_out_step = true;
-                    }
-                }
-            }
-        });
-
-        if toggle_hide_ui {
-            app_state.ui_hidden = !app_state.ui_hidden;
-        }
-        if toggle_auto_rotate {
-            app_state.auto_rotate = !app_state.auto_rotate;
-            app_state.status_message = if app_state.auto_rotate {
-                "Auto-Rotate enabled (Key A). Drag with mouse/touchpad to pause momentarily."
-                    .to_string()
-            } else {
-                "Auto-Rotate disabled (Key A).".to_string()
-            };
-        }
-        if let Some(tab) = tab_select {
-            app_state.active_tab = tab;
-            app_state.panel_visible = true;
-            app_state.ui_hidden = false;
-        }
-        if cycle_up {
-            app_state.cycle_primary_site(-1, &net);
-        } else if cycle_down {
-            app_state.cycle_primary_site(1, &net);
-        }
-        if toggle_split {
-            app_state.toggle_split_screen_comparison(&net);
-        }
-        if zoom_in_step {
-            for (mut cam, _) in &mut cam_query {
-                cam.zoom_by_factor(0.86);
-            }
-        } else if zoom_out_step {
-            for (mut cam, _) in &mut cam_query {
-                cam.zoom_by_factor(1.16);
-            }
-        }
+    if !app_state.style_configured {
+        configure_legible_style(ctx);
+        app_state.style_configured = true;
     }
 
-    // Sync `auto_rotate` flag into `OrbitCamera`
-    for (mut cam, _) in &mut cam_query {
-        cam.auto_rotate = app_state.auto_rotate;
-    }
-
-    // 1. Startup Mode Selector Modal (Enter Public Demo Mode vs Researcher Login)
+    // -------------------------------------------------------------------------
+    // Startup Access Gate: Homogeneous Full-Screen Entry before 3D Workspace
+    // -------------------------------------------------------------------------
     if !app_state.mode_selected {
-        egui::Window::new("Space-App-X86 — Terrestrial Analogs 3D Platform")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .fixed_size(egui::Vec2::new(430.0, 355.0))
+        render_access_gate_screen(ctx, &mut app_state, &net);
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // Keyboard Shortcuts (disabled while typing inside any text input field)
+    // -------------------------------------------------------------------------
+    let wants_kb = ctx.wants_keyboard_input();
+    if !wants_kb {
+        // [H] Toggle Left Panel visibility (or restore UI if hidden)
+        if keys.just_pressed(KeyCode::KeyH) {
+            if app_state.hide_all_ui {
+                app_state.hide_all_ui = false;
+                app_state.show_left_panel = true;
+            } else {
+                app_state.show_left_panel = !app_state.show_left_panel;
+            }
+        }
+
+        // [A] Toggle Auto-Rotate orbital animation
+        if keys.just_pressed(KeyCode::KeyA) {
+            for (mut cam, _) in &mut camera_query {
+                cam.auto_rotate = !cam.auto_rotate;
+            }
+        }
+
+        // [R] Reset / Center 3D Camera on origin
+        if keys.just_pressed(KeyCode::KeyR) {
+            let r = app_state.loaded_primary_bounding_radius;
+            for (mut cam, mut proj) in &mut camera_query {
+                cam.frame_terrain(Vec3::ZERO, r);
+                cam.apply_perspective_clip_planes(&mut proj);
+            }
+        }
+
+        // [C] Toggle Split-Screen Comparison with best cross-body analog
+        if keys.just_pressed(KeyCode::KeyC) {
+            if app_state.comparison_site_id.is_some() {
+                app_state.comparison_site_id = None;
+            } else if let Some(partner) = app_state.best_analog_partner().cloned() {
+                app_state.comparison_site_id = Some(partner.id.clone());
+                net.fetch_site_assets(TerrainSlot::Comparison, &partner);
+            }
+        }
+
+        // [Up] / [Down] Cycle through catalog sites
+        let site_count = app_state.catalog.sites.len();
+        if site_count > 1 {
+            let current_idx = app_state
+                .catalog
+                .sites
+                .iter()
+                .position(|s| s.id == app_state.primary_site_id)
+                .unwrap_or(0);
+
+            if keys.just_pressed(KeyCode::ArrowDown) {
+                let next_idx = (current_idx + 1) % site_count;
+                let next_site = app_state.catalog.sites[next_idx].clone();
+                app_state.primary_site_id = next_site.id.clone();
+                app_state.site_editor = SiteEditorForm::from_site(&next_site);
+                net.fetch_site_assets(TerrainSlot::Primary, &next_site);
+            } else if keys.just_pressed(KeyCode::ArrowUp) {
+                let prev_idx = (current_idx + site_count - 1) % site_count;
+                let prev_site = app_state.catalog.sites[prev_idx].clone();
+                app_state.primary_site_id = prev_site.id.clone();
+                app_state.site_editor = SiteEditorForm::from_site(&prev_site);
+                net.fetch_site_assets(TerrainSlot::Primary, &prev_site);
+            }
+        }
+    }
+
+    let is_auto_rotating = camera_query
+        .get_single()
+        .map(|(c, _)| c.auto_rotate)
+        .unwrap_or(false);
+
+    // -------------------------------------------------------------------------
+    // Top Status & Session Bar (hidden only when `hide_all_ui` is active)
+    // -------------------------------------------------------------------------
+    if !app_state.hide_all_ui {
+        egui::TopBottomPanel::top("top_status_bar")
+            .frame(
+                egui::Frame::none()
+                    .fill(COLOR_CARD_BG)
+                    .inner_margin(egui::Margin::symmetric(12.0, 7.0))
+                    .stroke(egui::Stroke::new(1.0, COLOR_BORDER)),
+            )
             .show(ctx, |ui| {
-                ui.heading("Welcome to Space-App-X86");
-                ui.label(
-                    "Explore Lunar, Martian, and Earth terrestrial analog sites in 3D (.stl & .tif DEMs with planar DemExtent UV mapping and TDA scoring).",
-                );
-                ui.add_space(8.0);
-
-                ui.group(|ui| {
-                    ui.heading("1. Judges & Visitors (No Password Required)");
-                    ui.label(
-                        "Inspect 3D terrain meshes, compare Earth ↔ Moon/Mars analogs in Split-Screen, and test custom weights immediately.",
-                    );
-                    ui.add_space(6.0);
-                    let demo_btn = egui::Button::new(
-                        egui::RichText::new("Enter Public Demo Mode")
-                            .strong()
-                            .size(16.0)
-                            .color(egui::Color32::from_rgb(10, 25, 30)),
-                    )
-                    .fill(egui::Color32::from_rgb(0, 210, 220))
-                    .min_size(egui::Vec2::new(395.0, 36.0));
-
-                    if ui.add(demo_btn).clicked() {
-                        app_state.mode_selected = true;
-                        app_state.error_message = None;
-                        app_state.status_message =
-                            "Entering Public Demo Mode (fetching /api/demo & /api/catalog)..."
-                                .to_string();
-                        net.fetch_demo_mode();
-                    }
-                });
-
-                ui.add_space(8.0);
-
-                ui.group(|ui| {
-                    ui.heading("2. Researcher Login (Argon2id Session)");
-                    ui.label(
-                        "Authenticate (default user: equipo_analog) to upload & analyze .stl/.tif/.png terrains, persist weights, and register sites.",
-                    );
-                    ui.add_space(4.0);
-                    let mut submit_login = false;
-                    egui::Grid::new("startup_login_grid")
-                        .num_columns(2)
-                        .spacing([8.0, 6.0])
-                        .show(ui, |ui| {
-                            ui.label("Username:");
-                            ui.text_edit_singleline(&mut app_state.login_username_input);
-                            ui.end_row();
-
-                            ui.label("Password:");
-                            let pass_resp = ui.add(
-                                egui::TextEdit::singleline(&mut app_state.login_password_input)
-                                    .password(true),
-                            );
-                            if pass_resp.lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                            {
-                                submit_login = true;
-                            }
-                            ui.end_row();
-                        });
-
-                    ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    let toggle_label = if app_state.show_left_panel {
+                        "[H] Hide Panel"
+                    } else {
+                        "[H] Show Panel"
+                    };
                     if ui
-                        .add_sized(
-                            [395.0, 30.0],
-                            egui::Button::new("Log In as Researcher (POST /api/login)"),
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new(toggle_label)
+                                    .strong()
+                                    .color(egui::Color32::from_rgb(125, 211, 252)),
+                            )
+                            .fill(egui::Color32::from_rgb(30, 41, 59)),
+                        )
+                        .on_hover_text("Collapse or expand the left panel (Shortcut: H)")
+                        .clicked()
+                    {
+                        app_state.show_left_panel = !app_state.show_left_panel;
+                    }
+
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Space-App-X86")
+                            .strong()
+                            .color(COLOR_TEXT_PRIMARY),
+                    );
+                    ui.separator();
+
+                    if app_state.authenticated {
+                        let user = app_state
+                            .researcher_username
+                            .as_deref()
+                            .unwrap_or("researcher");
+                        ui.label(
+                            egui::RichText::new(format!("[Researcher: {user}]"))
+                                .color(egui::Color32::from_rgb(74, 222, 128))
+                                .strong(),
+                        );
+                        if ui.button("Log Out").clicked() {
+                            net.logout();
+                            app_state.authenticated = false;
+                            app_state.researcher_username = None;
+                            app_state.mode_selected = false;
+                            app_state.status_message =
+                                "Logged out. Returned to Space-App-X86 Access Gate.".to_string();
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("[Guest: Public Demo Mode]")
+                                .color(egui::Color32::from_rgb(96, 165, 250))
+                                .strong(),
+                        );
+                        if ui.button("Researcher Login").clicked() {
+                            app_state.show_login_modal = true;
+                        }
+                        if ui
+                            .button("Access Gate")
+                            .on_hover_text("Return to the startup Access Gate screen")
+                            .clicked()
+                        {
+                            app_state.mode_selected = false;
+                        }
+                    }
+
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(
+                            "Keys: [H] Panel | [A] Auto-Rotate | [C] Split | [R] Center | [Up/Down] Site | [+/-] Zoom",
+                        )
+                        .small()
+                        .color(COLOR_TEXT_SECONDARY),
+                    );
+                });
+            });
+    }
+
+    // -------------------------------------------------------------------------
+    // Resizable, Non-Clipping Left Explorer Panel (5 Homogeneous Tabs)
+    // -------------------------------------------------------------------------
+    if app_state.show_left_panel && !app_state.hide_all_ui {
+        let panel_resp = egui::SidePanel::left("left_control_panel")
+            .resizable(true)
+            .default_width(405.0)
+            .width_range(340.0..=680.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(COLOR_PANEL_BG)
+                    .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                    .stroke(egui::Stroke::new(1.0, COLOR_BORDER)),
+            )
+            .show(ctx, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+
+                if let Some(err) = app_state.error_message.clone() {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(69, 10, 10))
+                        .inner_margin(egui::Margin::same(8.0))
+                        .rounding(egui::Rounding::same(5.0))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgb(248, 113, 113),
+                        ))
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(254, 202, 202),
+                                    format!("Error: {err}"),
+                                );
+                                if ui.small_button("Dismiss").clicked() {
+                                    app_state.error_message = None;
+                                }
+                            });
+                        });
+                    ui.add_space(6.0);
+                }
+
+                // 5 Standardized Homogeneous Navigation Tabs (2 rows for zero horizontal clipping)
+                egui::Frame::none()
+                    .fill(COLOR_CARD_BG)
+                    .inner_margin(egui::Margin::same(6.0))
+                    .rounding(egui::Rounding::same(6.0))
+                    .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+                    .show(ui, |ui| {
+                        ui.columns(3, |cols| {
+                            let t1 = cols[0].add_sized(
+                                [cols[0].available_width(), 28.0],
+                                egui::SelectableLabel::new(
+                                    app_state.active_tab == PanelTab::SitesAndCompare,
+                                    "1. Sites & Compare",
+                                ),
+                            );
+                            if t1.clicked() {
+                                app_state.active_tab = PanelTab::SitesAndCompare;
+                            }
+
+                            let t2 = cols[1].add_sized(
+                                [cols[1].available_width(), 28.0],
+                                egui::SelectableLabel::new(
+                                    app_state.active_tab == PanelTab::ViewAndCamera,
+                                    "2. 3D & Camera",
+                                ),
+                            );
+                            if t2.clicked() {
+                                app_state.active_tab = PanelTab::ViewAndCamera;
+                            }
+
+                            let t3 = cols[2].add_sized(
+                                [cols[2].available_width(), 28.0],
+                                egui::SelectableLabel::new(
+                                    app_state.active_tab == PanelTab::ChartsAndMath,
+                                    "3. Charts & Math",
+                                ),
+                            );
+                            if t3.clicked() {
+                                app_state.active_tab = PanelTab::ChartsAndMath;
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.columns(2, |cols| {
+                            let t4 = cols[0].add_sized(
+                                [cols[0].available_width(), 28.0],
+                                egui::SelectableLabel::new(
+                                    app_state.active_tab == PanelTab::SettlementGuide,
+                                    "4. Settlement Guide",
+                                ),
+                            );
+                            if t4.clicked() {
+                                app_state.active_tab = PanelTab::SettlementGuide;
+                            }
+
+                            let t5 = cols[1].add_sized(
+                                [cols[1].available_width(), 28.0],
+                                egui::SelectableLabel::new(
+                                    app_state.active_tab == PanelTab::UploadAndReset,
+                                    "5. Upload & Reset",
+                                ),
+                            );
+                            if t5.clicked() {
+                                app_state.active_tab = PanelTab::UploadAndReset;
+                            }
+                        });
+                    });
+
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(&app_state.status_message)
+                        .small()
+                        .color(COLOR_TEXT_SECONDARY),
+                );
+                ui.separator();
+
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        match app_state.active_tab {
+                            PanelTab::SitesAndCompare => {
+                                render_tab_sites_and_compare(ui, &mut app_state, &net);
+                            }
+                            PanelTab::ViewAndCamera => {
+                                render_tab_view_and_camera(
+                                    ui,
+                                    &mut app_state,
+                                    &mut camera_query,
+                                );
+                            }
+                            PanelTab::ChartsAndMath => {
+                                render_tab_charts_and_math(ui, &mut app_state, &net);
+                            }
+                            PanelTab::SettlementGuide => {
+                                render_tab_settlement_guide(ui);
+                            }
+                            PanelTab::UploadAndReset => {
+                                render_tab_upload_and_reset(ui, &mut app_state, &net);
+                            }
+                        }
+                    });
+            });
+
+        let screen_w = ctx.screen_rect().width().max(1.0);
+        app_state.viewport_left_fraction =
+            (panel_resp.response.rect.width() / screen_w).clamp(0.0, 0.70);
+    } else {
+        app_state.viewport_left_fraction = 0.0;
+    }
+
+    // -------------------------------------------------------------------------
+    // Persistent Top-Left Floating Quick-Action Toolbar (Always Accessible)
+    // -------------------------------------------------------------------------
+    let screen_rect = ctx.screen_rect();
+    let left_offset = if app_state.show_left_panel && !app_state.hide_all_ui {
+        (screen_rect.width() * app_state.viewport_left_fraction + 14.0)
+            .min(screen_rect.width() - 280.0)
+    } else {
+        14.0
+    };
+    let top_offset = if app_state.hide_all_ui { 14.0 } else { 46.0 };
+
+    egui::Window::new("quick_floating_toolbar")
+        .title_bar(false)
+        .resizable(false)
+        .fixed_pos(egui::pos2(left_offset.max(10.0), top_offset))
+        .frame(
+            egui::Frame::window(&ctx.style())
+                .fill(egui::Color32::from_rgba_unmultiplied(15, 23, 42, 238))
+                .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+                .rounding(egui::Rounding::same(6.0))
+                .inner_margin(egui::Margin::symmetric(8.0, 6.0)),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if app_state.hide_all_ui {
+                    if ui
+                        .button(
+                            egui::RichText::new("[H] Show UI")
+                                .strong()
+                                .color(egui::Color32::from_rgb(125, 211, 252)),
                         )
                         .clicked()
                     {
-                        submit_login = true;
+                        app_state.hide_all_ui = false;
+                        app_state.show_left_panel = true;
                     }
+                    return;
+                }
 
-                    if submit_login {
-                        app_state.error_message = None;
-                        let user = app_state.login_username_input.trim().to_string();
-                        let pass = app_state.login_password_input.clone();
-                        app_state.login_password_input.clear();
-                        app_state.status_message = format!(
-                            "Authenticating researcher '{}' via Argon2id (POST /api/login)...",
-                            user
-                        );
-                        net.login(user, pass);
+                let panel_btn = if app_state.show_left_panel {
+                    "[< Panel]"
+                } else {
+                    "[> Panel]"
+                };
+                if ui
+                    .button(egui::RichText::new(panel_btn).strong())
+                    .on_hover_text("Show or hide the left explorer panel (Key: H)")
+                    .clicked()
+                {
+                    app_state.show_left_panel = !app_state.show_left_panel;
+                }
+
+                let charts_label = if app_state.show_similarity_charts_window {
+                    "[Charts: ON]"
+                } else {
+                    "[Charts]"
+                };
+                if ui
+                    .button(
+                        egui::RichText::new(charts_label).color(
+                            if app_state.show_similarity_charts_window {
+                                egui::Color32::from_rgb(125, 211, 252)
+                            } else {
+                                COLOR_TEXT_PRIMARY
+                            },
+                        ),
+                    )
+                    .on_hover_text("Toggle floating Similarity & Math Breakdown window")
+                    .clicked()
+                {
+                    app_state.show_similarity_charts_window =
+                        !app_state.show_similarity_charts_window;
+                }
+
+                let rot_label = if is_auto_rotating {
+                    "[Rotate: ON]"
+                } else {
+                    "[Rotate: OFF]"
+                };
+                if ui
+                    .button(egui::RichText::new(rot_label).color(if is_auto_rotating {
+                        egui::Color32::from_rgb(74, 222, 128)
+                    } else {
+                        COLOR_TEXT_PRIMARY
+                    }))
+                    .on_hover_text("Toggle smooth orbital Auto-Rotate (Key: A)")
+                    .clicked()
+                {
+                    for (mut cam, _) in &mut camera_query {
+                        cam.auto_rotate = !cam.auto_rotate;
                     }
-                });
+                }
 
-                if let Some(err) = &app_state.error_message {
-                    ui.add_space(6.0);
-                    ui.colored_label(egui::Color32::from_rgb(255, 110, 110), err);
+                let split_on = app_state.comparison_site_id.is_some();
+                let split_label = if split_on {
+                    "[Split: ON]"
+                } else {
+                    "[Split: OFF]"
+                };
+                if ui
+                    .button(egui::RichText::new(split_label).color(if split_on {
+                        egui::Color32::from_rgb(250, 204, 21)
+                    } else {
+                        COLOR_TEXT_PRIMARY
+                    }))
+                    .on_hover_text("Toggle synchronized Split-Screen 3D comparison (Key: C)")
+                    .clicked()
+                {
+                    if split_on {
+                        app_state.comparison_site_id = None;
+                    } else if let Some(partner) = app_state.best_analog_partner().cloned() {
+                        app_state.comparison_site_id = Some(partner.id.clone());
+                        net.fetch_site_assets(TerrainSlot::Comparison, &partner);
+                    }
+                }
+
+                let telem_label = if app_state.show_planetary_telemetry {
+                    "[Telemetry: ON]"
+                } else {
+                    "[Telemetry: OFF]"
+                };
+                if ui
+                    .button(egui::RichText::new(telem_label).color(
+                        if app_state.show_planetary_telemetry {
+                            egui::Color32::from_rgb(56, 189, 248)
+                        } else {
+                            COLOR_TEXT_PRIMARY
+                        },
+                    ))
+                    .on_hover_text("Show or hide real-time Planetary Telemetry HUD")
+                    .clicked()
+                {
+                    app_state.show_planetary_telemetry = !app_state.show_planetary_telemetry;
+                }
+
+                if ui
+                    .button("[Center 3D]")
+                    .on_hover_text("Reset 3D camera to terrain center (Key: R)")
+                    .clicked()
+                {
+                    let r = app_state.loaded_primary_bounding_radius;
+                    for (mut cam, mut proj) in &mut camera_query {
+                        cam.frame_terrain(Vec3::ZERO, r);
+                        cam.apply_perspective_clip_planes(&mut proj);
+                    }
+                }
+
+                if ui
+                    .small_button("[Full 3D]")
+                    .on_hover_text("Hide all panels for clean full-screen 3D view (Key: H)")
+                    .clicked()
+                {
+                    app_state.hide_all_ui = true;
+                }
+            });
+        });
+
+    // -------------------------------------------------------------------------
+    // Live Planetary Telemetry HUD Card (Top-Right of 3D Viewport)
+    // -------------------------------------------------------------------------
+    if app_state.show_planetary_telemetry && !app_state.hide_all_ui {
+        render_planetary_telemetry_hud(ctx, &mut app_state);
+    }
+
+    // -------------------------------------------------------------------------
+    // Floating Similarity Charts & Mathematical Foundation Window
+    // -------------------------------------------------------------------------
+    if app_state.show_similarity_charts_window && !app_state.hide_all_ui {
+        let mut open = app_state.show_similarity_charts_window;
+        egui::Window::new("Planetary Analog Similarity Charts & Mathematical Foundation")
+            .open(&mut open)
+            .resizable(true)
+            .default_width(510.0)
+            .default_pos(egui::pos2(left_offset.max(16.0), top_offset + 44.0))
+            .show(ctx, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                render_similarity_charts_and_math(ui, &app_state);
+            });
+        app_state.show_similarity_charts_window = open;
+    }
+
+    // -------------------------------------------------------------------------
+    // Split-Screen 3D Viewport Overlay Badges (Left = Primary, Right = Compare)
+    // -------------------------------------------------------------------------
+    if !app_state.hide_all_ui
+        && let Some(comp_site) = app_state.comparison_site().cloned()
+        && let Some(prim_site) = app_state.primary_site().cloned()
+    {
+        let usable_left = screen_rect.width() * app_state.viewport_left_fraction;
+        let usable_w = (screen_rect.width() - usable_left).max(200.0);
+        let left_x = usable_left + usable_w * 0.22 - 135.0;
+        let right_x = usable_left + usable_w * 0.72 - 135.0;
+        let badge_y = screen_rect.height() - 86.0;
+
+        egui::Window::new("split_left_badge")
+            .title_bar(false)
+            .resizable(false)
+            .fixed_pos(egui::pos2(left_x.max(usable_left + 8.0), badge_y))
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(egui::Color32::from_rgba_unmultiplied(15, 23, 42, 230))
+                    .stroke(egui::Stroke::new(
+                        1.5,
+                        egui::Color32::from_rgb(56, 189, 248),
+                    )),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "LEFT [{}]: {}",
+                        prim_site.body.as_str().to_uppercase(),
+                        prim_site.name
+                    ))
+                    .strong()
+                    .color(egui::Color32::from_rgb(125, 211, 252)),
+                );
+                if let Some([min_z, max_z]) = prim_site.elevation_range_m {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Elev: {min_z:.1} m .. {max_z:.1} m | {} tris",
+                            app_state.loaded_primary_triangles
+                        ))
+                        .small()
+                        .color(COLOR_TEXT_SECONDARY),
+                    );
+                }
+            });
+
+        egui::Window::new("split_right_badge")
+            .title_bar(false)
+            .resizable(false)
+            .fixed_pos(egui::pos2(right_x.max(usable_left + 180.0), badge_y))
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(egui::Color32::from_rgba_unmultiplied(15, 23, 42, 230))
+                    .stroke(egui::Stroke::new(
+                        1.5,
+                        egui::Color32::from_rgb(250, 204, 21),
+                    )),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "RIGHT [{}]: {}",
+                        comp_site.body.as_str().to_uppercase(),
+                        comp_site.name
+                    ))
+                    .strong()
+                    .color(egui::Color32::from_rgb(253, 224, 71)),
+                );
+                if let Some([min_z, max_z]) = comp_site.elevation_range_m {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Elev: {min_z:.1} m .. {max_z:.1} m | {} tris",
+                            app_state.loaded_comparison_triangles
+                        ))
+                        .small()
+                        .color(COLOR_TEXT_SECONDARY),
+                    );
                 }
             });
     }
 
-    // 2. If `[H] Hide UI` is active, show only a tiny unobtrusive restore pill in the top-left corner
-    if app_state.ui_hidden {
-        app_state.viewport_left_fraction = 0.0;
-        egui::Area::new(egui::Id::new("restore_ui_pill"))
-            .fixed_pos(egui::pos2(10.0, 10.0))
-            .order(egui::Order::Foreground)
+    // -------------------------------------------------------------------------
+    // Researcher Login Modal (when opened from Guest Demo Mode)
+    // -------------------------------------------------------------------------
+    if app_state.show_login_modal {
+        egui::Window::new("Researcher Authentication (Argon2id)")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                let btn = egui::Button::new(
-                    egui::RichText::new("[H] Show UI")
+                ui.set_width(370.0);
+                ui.label(
+                    "Authenticate with Researcher credentials to unlock 512 MiB binary terrain uploads (.stl, .tif/.tiff, .png), 0D Persistent Homology TDA, canonical weight persistence, and Workspace Reset.",
+                );
+                ui.add_space(8.0);
+
+                egui::Grid::new("modal_login_grid")
+                    .num_columns(2)
+                    .spacing([10.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Username:");
+                        ui.text_edit_singleline(&mut app_state.login_username);
+                        ui.end_row();
+
+                        ui.label("Password:");
+                        let pass_resp = ui.add(
+                            egui::TextEdit::singleline(&mut app_state.login_password)
+                                .password(true),
+                        );
+                        if pass_resp.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        {
+                            net.login(
+                                app_state.login_username.clone(),
+                                app_state.login_password.clone(),
+                            );
+                            app_state.login_password.clear();
+                            app_state.show_login_modal = false;
+                        }
+                        ui.end_row();
+                    });
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Log in as Researcher")
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(egui::Color32::from_rgb(37, 99, 235)),
+                        )
+                        .clicked()
+                    {
+                        net.login(
+                            app_state.login_username.clone(),
+                            app_state.login_password.clone(),
+                        );
+                        app_state.login_password.clear();
+                        app_state.show_login_modal = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        app_state.show_login_modal = false;
+                    }
+                });
+            });
+    }
+}
+
+/// Renders the homogeneous full-screen startup **Space-App-X86 Access Gate** before entering
+/// Guest Public Demo Mode or logging in as an authenticated Researcher.
+fn render_access_gate_screen(
+    ctx: &egui::Context,
+    app_state: &mut ViewerAppState,
+    net: &NetBridge,
+) {
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(10, 15, 26))
+                .inner_margin(egui::Margin::same(24.0)),
+        )
+        .show(ctx, |ui| {
+            let avail_h = ui.available_height();
+            let top_pad = ((avail_h - 460.0) * 0.45).max(16.0);
+            ui.add_space(top_pad);
+
+            ui.vertical_centered(|ui| {
+                egui::Frame::none()
+                    .fill(COLOR_CARD_BG)
+                    .stroke(egui::Stroke::new(
+                        1.5,
+                        egui::Color32::from_rgb(56, 189, 248),
+                    ))
+                    .rounding(egui::Rounding::same(10.0))
+                    .inner_margin(egui::Margin::symmetric(28.0, 24.0))
+                    .show(ui, |ui| {
+                        ui.set_max_width(560.0);
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+
+                        ui.heading(
+                            egui::RichText::new(
+                                "Space-App-X86 Access Gate — Planetary Analogs 3D Platform",
+                            )
+                            .color(egui::Color32::from_rgb(125, 211, 252))
+                            .strong(),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "3D Morphometric & Topological Data Analysis (0D Persistent Homology b0 & Euler Characteristic chi) for Lunar South Pole (Artemis) and Martian Landing & Habitat Site Selection.",
+                            )
+                            .color(COLOR_TEXT_SECONDARY),
+                        );
+
+                        if let Some(err) = app_state.error_message.clone() {
+                            ui.add_space(8.0);
+                            egui::Frame::none()
+                                .fill(egui::Color32::from_rgb(69, 10, 10))
+                                .inner_margin(egui::Margin::same(8.0))
+                                .rounding(egui::Rounding::same(5.0))
+                                .stroke(egui::Stroke::new(
+                                    1.0,
+                                    egui::Color32::from_rgb(248, 113, 113),
+                                ))
+                                .show(ui, |ui| {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(254, 202, 202),
+                                        format!("Authentication Error: {err}"),
+                                    );
+                                });
+                        }
+
+                        ui.add_space(14.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+
+                        // Option 1: Researcher Authentication Form
+                        ui.label(
+                            egui::RichText::new("Option 1 — Authenticated Researcher Workspace")
+                                .strong()
+                                .color(egui::Color32::from_rgb(74, 222, 128)),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "Unlocks 512 MiB raw binary terrain uploads (.stl, .tif/.tiff, .png), automated 50k mesh simplification, 0D Persistent Homology TDA, canonical weight saving, and Workspace Reset.",
+                            )
+                            .small()
+                            .color(COLOR_TEXT_SECONDARY),
+                        );
+                        ui.add_space(6.0);
+
+                        egui::Grid::new("access_gate_login_grid")
+                            .num_columns(2)
+                            .spacing([12.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("Username:").color(COLOR_TEXT_PRIMARY),
+                                );
+                                ui.add_sized(
+                                    [320.0, 28.0],
+                                    egui::TextEdit::singleline(&mut app_state.login_username),
+                                );
+                                ui.end_row();
+
+                                ui.label(
+                                    egui::RichText::new("Password:").color(COLOR_TEXT_PRIMARY),
+                                );
+                                let pass_resp = ui.add_sized(
+                                    [320.0, 28.0],
+                                    egui::TextEdit::singleline(&mut app_state.login_password)
+                                        .password(true),
+                                );
+                                if pass_resp.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                {
+                                    app_state.error_message = None;
+                                    net.login(
+                                        app_state.login_username.clone(),
+                                        app_state.login_password.clone(),
+                                    );
+                                    app_state.login_password.clear();
+                                }
+                                ui.end_row();
+                            });
+
+                        ui.add_space(8.0);
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 34.0],
+                                egui::Button::new(
+                                    egui::RichText::new("Log in as Researcher (Argon2id)")
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(37, 99, 235)),
+                            )
+                            .clicked()
+                        {
+                            app_state.error_message = None;
+                            net.login(
+                                app_state.login_username.clone(),
+                                app_state.login_password.clone(),
+                            );
+                            app_state.login_password.clear();
+                        }
+
+                        ui.add_space(14.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+
+                        // Option 2: Guest Public Demo Mode
+                        ui.label(
+                            egui::RichText::new("Option 2 — Guest / Judge Public Demo Mode")
+                                .strong()
+                                .color(egui::Color32::from_rgb(125, 211, 252)),
+                        );
+                        ui.label(
+                            egui::RichText::new(
+                                "Passwordless access to 3D planetary terrains, planar UV checkerboard verification, synchronized Split-Screen comparison, live Planetary Telemetry HUD, and custom weight simulations.",
+                            )
+                            .small()
+                            .color(COLOR_TEXT_SECONDARY),
+                        );
+                        ui.add_space(8.0);
+
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 36.0],
+                                egui::Button::new(
+                                    egui::RichText::new("Enter as Guest (Public Demo Mode)")
+                                        .strong()
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(22, 163, 74)),
+                            )
+                            .clicked()
+                        {
+                            app_state.mode_selected = true;
+                            app_state.error_message = None;
+                            net.fetch_demo_mode();
+                        }
+                    });
+            });
+        });
+}
+
+/// Renders the top-right real-time Planetary Telemetry HUD card (`MOON`, `MARS`, or `EARTH`).
+fn render_planetary_telemetry_hud(ctx: &egui::Context, app_state: &mut ViewerAppState) {
+    let Some(site) = app_state.primary_site().cloned() else {
+        return;
+    };
+
+    let unix_secs = current_unix_timestamp_secs();
+    let [lat_deg, lon_deg] = site.center_lat_lon.unwrap_or(match site.body {
+        Body::Moon => [-89.5, 0.0],
+        Body::Mars => [18.38, 77.58],
+        Body::Earth => [19.47, -155.58],
+    });
+    let elev_range = site.elevation_range_m.unwrap_or([-45.0, 120.0]);
+    let relief_m = (elev_range[1] - elev_range[0]).max(0.0);
+
+    let screen_rect = ctx.screen_rect();
+    egui::Window::new("planetary_telemetry_hud")
+        .title_bar(false)
+        .resizable(false)
+        .fixed_pos(egui::pos2((screen_rect.width() - 340.0).max(20.0), 46.0))
+        .frame(
+            egui::Frame::window(&ctx.style())
+                .fill(egui::Color32::from_rgba_unmultiplied(11, 18, 31, 238))
+                .stroke(egui::Stroke::new(
+                    1.2,
+                    egui::Color32::from_rgb(56, 189, 248),
+                ))
+                .rounding(egui::Rounding::same(8.0))
+                .inner_margin(egui::Margin::symmetric(12.0, 10.0)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(316.0);
+            ui.horizontal(|ui| {
+                let badge_color = match site.body {
+                    Body::Moon => egui::Color32::from_rgb(148, 163, 184),
+                    Body::Mars => egui::Color32::from_rgb(248, 113, 113),
+                    Body::Earth => egui::Color32::from_rgb(56, 189, 248),
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "[*] {} LIVE TELEMETRY HUD",
+                        site.body.as_str().to_uppercase()
+                    ))
+                    .strong()
+                    .color(badge_color),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("x")
+                        .on_hover_text("Hide Telemetry HUD")
+                        .clicked()
+                    {
+                        app_state.show_planetary_telemetry = false;
+                    }
+                });
+            });
+
+            ui.label(
+                egui::RichText::new(&site.name)
+                    .small()
+                    .strong()
+                    .color(COLOR_TEXT_PRIMARY),
+            );
+            ui.separator();
+
+            match site.body {
+                Body::Moon => {
+                    let synodic_period_s = 29.530588853 * 86_400.0;
+                    let ref_new_moon_s = 947_182_440.0;
+                    let phase = ((unix_secs - ref_new_moon_s) / synodic_period_s
+                        + lon_deg / 360.0)
+                        .rem_euclid(1.0);
+                    let lst_secs = phase * 86_400.0;
+                    let sun_elev_factor =
+                        (phase * std::f64::consts::TAU - std::f64::consts::FRAC_PI_2).sin();
+                    let illum_pct = ((sun_elev_factor + 1.0) * 50.0).clamp(0.0, 100.0);
+
+                    let is_polar = lat_deg.abs() >= 80.0;
+                    let temp_range_str = if is_polar {
+                        let rim_k = 110.0 + 115.0 * (illum_pct / 100.0);
+                        format!("~40 K (-233 C PSR) .. {rim_k:.0} K (Rim)")
+                    } else {
+                        let curr_k = 100.0 + 290.0 * (illum_pct / 100.0);
+                        format!("100 K .. 390 K (Now ~{curr_k:.0} K)")
+                    };
+
+                    egui::Grid::new("moon_telem_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("Lunar Solar Time (LST):")
+                                    .small()
+                                    .color(COLOR_TEXT_SECONDARY),
+                            );
+                            ui.monospace(format!("{} LST", format_hms(lst_secs)));
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new("Solar Illumination:")
+                                    .small()
+                                    .color(COLOR_TEXT_SECONDARY),
+                            );
+                            ui.monospace(format!("{illum_pct:.1}% (Synodic 29.53 d)"));
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new("Surface Thermal:")
+                                    .small()
+                                    .color(COLOR_TEXT_SECONDARY),
+                            );
+                            ui.monospace(temp_range_str);
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new("Gravity & Pressure:")
+                                    .small()
+                                    .color(COLOR_TEXT_SECONDARY),
+                            );
+                            ui.monospace("1.62 m/s^2 (0.165 g) | ~3e-15 bar");
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new("Site Lat/Lon & Relief:")
+                                    .small()
+                                    .color(COLOR_TEXT_SECONDARY),
+                            );
+                            ui.monospace(format!(
+                                "{lat_deg:.2} deg, {lon_deg:.2} deg | dz {relief_m:.0} m"
+                            ));
+                            ui.end_row();
+                        });
+                }
+                Body::Mars => {
+                    let jd_ut = 2_440_587.5 + (unix_secs / 86_400.0);
+                    let jd_tt = jd_ut + 69.184 / 86_400.0;
+                    let msd = (jd_tt - 2_451_549.5) / 1.0274912517 + 44_796.0 - 0.0009626;
+                    let sol_number = msd.floor() as i64;
+                    let mtc_hours = (msd.rem_euclid(1.0)) * 24.0;
+                    let lmst_hours = (mtc_hours + lon_deg / 15.0).rem_euclid(24.0);
+                    let lmst_secs = lmst_hours * 3600.0;
+
+                    let diurnal_wave =
+                        ((lmst_hours - 14.5) / 24.0 * std::f64::consts::TAU).cos();
+                    let temp_c = -63.0 + 42.0 * diurnal_wave;
+                    let temp_k = temp_c + 273.15;
+
+                    egui::Grid::new("mars_telem_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("Mars Sol & LMST:")
+                                    .small()
+                                    .color(COLOR_TEXT_SECONDARY),
+                            );
+                            ui.monospace(format!("Sol {sol_number} | {}", format_hms(lmst_secs)));
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new("Coordinated Mars Time:")
+                                    .small()
+                                    .color(COLOR_TEXT_SECONDARY),
+                            );
+                            ui.monospace(format!("{} MTC", format_hms(mtc_hours * 3600.0)));
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new("Surface Thermal:")
+                                    .small()
+                                    .color(COLOR_TEXT_SECONDARY),
+                            );
+                            ui.monospace(format!("{temp_c:.1} C ({temp_k:.0} K) [-125..+20 C]"));
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new("CO2 Atmos & Gravity:")
+                                    .small()
+                                    .color(COLOR_TEXT_SECONDARY),
+                            );
+                            ui.monospace("6.1 mbar (95% CO2) | 3.72 m/s^2");
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new("Site Lat/Lon & Relief:")
+                                    .small()
+                                    .color(COLOR_TEXT_SECONDARY),
+                            );
+                            ui.monospace(format!(
+                                "{lat_deg:.2} deg, {lon_deg:.2} deg | dz {relief_m:.0} m"
+                            ));
+                            ui.end_row();
+                        });
+                }
+                Body::Earth => {
+                    let utc_secs = unix_secs.rem_euclid(86_400.0);
+                    let lst_secs = (utc_secs + (lon_deg / 15.0) * 3600.0).rem_euclid(86_400.0);
+                    let lst_hours = lst_secs / 3600.0;
+                    let diurnal_wave =
+                        (((lst_hours - 14.0) / 24.0 * std::f64::consts::TAU).cos()) as f32;
+                    let mean_elev_km = ((elev_range[0] + elev_range[1]) * 0.5 / 1000.0).max(0.0);
+                    let temp_c = 18.0_f32 - 6.5_f32 * mean_elev_km + 7.5_f32 * diurnal_wave;
+                    let pressure_hpa =
+                        1013.25_f32 * (1.0 - 0.0065 * mean_elev_km * 1000.0 / 288.15).powf(5.255);
+
+                    egui::Grid::new("earth_telem_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new("UTC / Local Solar Time:")
+                                    .small()
+                                    .color(COLOR_TEXT_SECONDARY),
+                            );
+                            ui.monospace(format!(
+                                "{} UTC | {} LST",
+                                format_hms(utc_secs),
+                                format_hms(lst_secs)
+                            ));
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new("Analog Field Thermal:")
+                                    .small()
+                                    .color(COLOR_TEXT_SECONDARY),
+                            );
+                            ui.monospace(format!(
+                                "{temp_c:.1} C ({:.0} K)",
+                                temp_c + 273.15
+                            ));
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new("Barometric & Gravity:")
+                                    .small()
+                                    .color(COLOR_TEXT_SECONDARY),
+                            );
+                            ui.monospace(format!("{pressure_hpa:.0} hPa | 9.81 m/s^2 (1.00 g)"));
+                            ui.end_row();
+
+                            ui.label(
+                                egui::RichText::new("Site Lat/Lon & Relief:")
+                                    .small()
+                                    .color(COLOR_TEXT_SECONDARY),
+                            );
+                            ui.monospace(format!(
+                                "{lat_deg:.2} deg, {lon_deg:.2} deg | dz {relief_m:.0} m"
+                            ));
+                            ui.end_row();
+                        });
+                }
+            }
+        });
+}
+
+/// Tab 1: Primary site selector, Side-by-Side Comparison selector, and Analog Similarity Card.
+fn render_tab_sites_and_compare(
+    ui: &mut egui::Ui,
+    app_state: &mut ViewerAppState,
+    net: &NetBridge,
+) {
+    ui.heading("1. Terrain Catalog & Split Comparison");
+    ui.add_space(4.0);
+
+    if app_state.catalog.sites.is_empty() {
+        egui::Frame::none()
+            .fill(COLOR_CARD_BG)
+            .inner_margin(egui::Margin::same(12.0))
+            .rounding(egui::Rounding::same(6.0))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgb(250, 204, 21),
+            ))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Workspace Catalog is Currently Empty (0 Maps Loaded)")
                         .strong()
-                        .color(egui::Color32::from_rgb(10, 25, 30)),
-                )
-                .fill(egui::Color32::from_rgb(0, 210, 220));
-                if ui.add(btn).clicked() {
-                    app_state.ui_hidden = false;
+                        .color(egui::Color32::from_rgb(253, 224, 71)),
+                );
+                ui.label(
+                    "Open Tab '5. Upload & Reset' to upload your own .stl / .tif / .png planetary maps or click 'Restore Reference Demo Site'.",
+                );
+                ui.add_space(6.0);
+                if ui.button("Go to 5. Upload & Reset").clicked() {
+                    app_state.active_tab = PanelTab::UploadAndReset;
                 }
             });
         return;
     }
 
-    // 3. Persistent Top-Left Quick Toolbar (always visible unless `[H] Hide UI` is pressed)
-    egui::TopBottomPanel::top("persistent_top_left_toolbar")
-        .frame(
-            egui::Frame::none()
-                .fill(egui::Color32::from_rgba_unmultiplied(12, 18, 26, 246))
-                .inner_margin(egui::Margin::symmetric(10.0, 5.0))
-                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(35, 55, 78))),
-        )
-        .show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                // [Panel] button
-                let panel_btn = egui::Button::new(
-                    egui::RichText::new(if app_state.panel_visible {
-                        "[Panel: ON]"
-                    } else {
-                        "[Panel: OFF]"
-                    })
-                    .strong()
-                    .color(if app_state.panel_visible {
-                        egui::Color32::from_rgb(10, 25, 30)
-                    } else {
-                        egui::Color32::WHITE
-                    }),
-                )
-                .fill(if app_state.panel_visible {
-                    egui::Color32::from_rgb(0, 210, 220)
-                } else {
-                    egui::Color32::from_rgb(40, 54, 72)
-                });
-                if ui
-                    .add(panel_btn)
-                    .on_hover_text("Show or collapse the left control panel")
-                    .clicked()
-                {
-                    app_state.panel_visible = !app_state.panel_visible;
-                }
+    let current_primary_id = app_state.primary_site_id.clone();
+    let sites_snapshot = app_state.catalog.sites.clone();
 
-                // [Charts] button
-                let charts_btn = egui::Button::new(
-                    egui::RichText::new(if app_state.charts_window_open {
-                        "[Charts: ON]"
-                    } else {
-                        "[Charts]"
-                    })
-                    .strong(),
-                )
-                .fill(if app_state.charts_window_open {
-                    egui::Color32::from_rgb(30, 150, 185)
-                } else {
-                    egui::Color32::from_rgb(40, 54, 72)
-                });
-                if ui
-                    .add(charts_btn)
-                    .on_hover_text("Open/close floating Planetary Analog Similarity Charts window")
-                    .clicked()
-                {
-                    app_state.charts_window_open = !app_state.charts_window_open;
-                }
-
-                // [Rotate: ON/OFF] button (Key A)
-                let rot_btn = egui::Button::new(
-                    egui::RichText::new(if app_state.auto_rotate {
-                        "[Rotate: ON]"
-                    } else {
-                        "[Rotate: OFF]"
-                    })
-                    .strong(),
-                )
-                .fill(if app_state.auto_rotate {
-                    egui::Color32::from_rgb(35, 160, 120)
-                } else {
-                    egui::Color32::from_rgb(40, 54, 72)
-                });
-                if ui
-                    .add(rot_btn)
-                    .on_hover_text("Toggle automatic 3D orbital rotation (Shortcut: A)")
-                    .clicked()
-                {
-                    app_state.auto_rotate = !app_state.auto_rotate;
-                }
-
-                // [Split: ON/OFF] button (Key C)
-                let split_on = app_state.comparison_site_id.is_some();
-                let split_btn = egui::Button::new(
-                    egui::RichText::new(if split_on {
-                        "[Split: ON]"
-                    } else {
-                        "[Split: OFF]"
-                    })
-                    .strong(),
-                )
-                .fill(if split_on {
-                    egui::Color32::from_rgb(25, 145, 115)
-                } else {
-                    egui::Color32::from_rgb(40, 54, 72)
-                });
-                if ui
-                    .add(split_btn)
-                    .on_hover_text("Toggle synchronized 3D Split-Screen comparison (Shortcut: C)")
-                    .clicked()
-                {
-                    app_state.toggle_split_screen_comparison(&net);
-                }
-
-                // [Telemetry: ON/OFF] button
-                let telem_btn = egui::Button::new(
-                    egui::RichText::new(if app_state.telemetry_visible {
-                        "[Telemetry: ON]"
-                    } else {
-                        "[Telemetry: OFF]"
-                    })
-                    .strong(),
-                )
-                .fill(if app_state.telemetry_visible {
-                    egui::Color32::from_rgb(35, 120, 165)
-                } else {
-                    egui::Color32::from_rgb(40, 54, 72)
-                });
-                if ui
-                    .add(telem_btn)
-                    .on_hover_text("Show/hide the top-right live Planetary Telemetry HUD card")
-                    .clicked()
-                {
-                    app_state.telemetry_visible = !app_state.telemetry_visible;
-                }
-
-                // Quick navigation & [H] Hide UI
-                if ui
-                    .button("↑")
-                    .on_hover_text("Previous site (ArrowUp)")
-                    .clicked()
-                {
-                    app_state.cycle_primary_site(-1, &net);
-                }
-                if ui
-                    .button("↓")
-                    .on_hover_text("Next site (ArrowDown)")
-                    .clicked()
-                {
-                    app_state.cycle_primary_site(1, &net);
-                }
-                if ui
-                    .button("[R] Reset Cam")
-                    .on_hover_text("Center & fit 3D camera (Shortcut: R)")
-                    .clicked()
-                {
-                    let br = app_state.loaded_primary_bounding_radius.max(10.0);
-                    for (mut cam, mut proj) in &mut cam_query {
-                        cam.frame_terrain(Vec3::ZERO, br);
-                        cam.apply_perspective_clip_planes(&mut proj);
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Primary Site:").strong());
+        egui::ComboBox::from_id_source("primary_site_combo")
+            .selected_text(&current_primary_id)
+            .width(230.0)
+            .show_ui(ui, |ui| {
+                for site in &sites_snapshot {
+                    let label = format!(
+                        "{} ({} - {})",
+                        site.id,
+                        site.name,
+                        site.body.as_str().to_uppercase()
+                    );
+                    if ui
+                        .selectable_label(app_state.primary_site_id == site.id, label)
+                        .clicked()
+                    {
+                        app_state.primary_site_id = site.id.clone();
+                        app_state.site_editor = SiteEditorForm::from_site(site);
+                        net.fetch_site_assets(TerrainSlot::Primary, site);
                     }
                 }
+            });
+    });
+
+    // Keyboard-friendly Previous / Next site buttons
+    if sites_snapshot.len() > 1 {
+        ui.horizontal_wrapped(|ui| {
+            let curr_idx = sites_snapshot
+                .iter()
+                .position(|s| s.id == app_state.primary_site_id)
+                .unwrap_or(0);
+            if ui
+                .button("< Prev Site [Up]")
+                .on_hover_text("Select previous site in catalog (ArrowUp)")
+                .clicked()
+            {
+                let prev = &sites_snapshot[(curr_idx + sites_snapshot.len() - 1) % sites_snapshot.len()];
+                app_state.primary_site_id = prev.id.clone();
+                app_state.site_editor = SiteEditorForm::from_site(prev);
+                net.fetch_site_assets(TerrainSlot::Primary, prev);
+            }
+            if ui
+                .button("Next Site [Down] >")
+                .on_hover_text("Select next site in catalog (ArrowDown)")
+                .clicked()
+            {
+                let next = &sites_snapshot[(curr_idx + 1) % sites_snapshot.len()];
+                app_state.primary_site_id = next.id.clone();
+                app_state.site_editor = SiteEditorForm::from_site(next);
+                net.fetch_site_assets(TerrainSlot::Primary, next);
+            }
+        });
+    }
+
+    ui.add_space(4.0);
+
+    let comp_text = app_state
+        .comparison_site_id
+        .clone()
+        .unwrap_or_else(|| "None (Single View)".to_string());
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("Compare With:").strong());
+        egui::ComboBox::from_id_source("comparison_site_combo")
+            .selected_text(comp_text)
+            .width(230.0)
+            .show_ui(ui, |ui| {
                 if ui
-                    .button("[H] Hide UI")
-                    .on_hover_text("Hide all panels for a clean fullscreen 3D view (Shortcut: H)")
+                    .selectable_label(
+                        app_state.comparison_site_id.is_none(),
+                        "None (Single View)",
+                    )
                     .clicked()
                 {
-                    app_state.ui_hidden = true;
+                    app_state.comparison_site_id = None;
+                }
+                for site in &sites_snapshot {
+                    let label = format!(
+                        "{} ({} - {})",
+                        site.id,
+                        site.name,
+                        site.body.as_str().to_uppercase()
+                    );
+                    let is_selected =
+                        app_state.comparison_site_id.as_deref() == Some(site.id.as_str());
+                    if ui.selectable_label(is_selected, label).clicked() {
+                        app_state.comparison_site_id = Some(site.id.clone());
+                        net.fetch_site_assets(TerrainSlot::Comparison, site);
+                    }
+                }
+            });
+    });
+
+    if let Some(site) = app_state.primary_site().cloned() {
+        ui.add_space(6.0);
+        egui::Frame::none()
+            .fill(COLOR_CARD_BG)
+            .inner_margin(egui::Margin::same(10.0))
+            .rounding(egui::Rounding::same(6.0))
+            .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} [{}]",
+                        site.name,
+                        site.body.as_str().to_uppercase()
+                    ))
+                    .strong()
+                    .color(egui::Color32::from_rgb(125, 211, 252)),
+                );
+                ui.label(
+                    egui::RichText::new(&site.description)
+                        .small()
+                        .color(COLOR_TEXT_SECONDARY),
+                );
+                ui.add_space(4.0);
+                let s = &app_state.loaded_primary_summary;
+                let relief_dz = (s.max_elevation_m - s.min_elevation_m).max(0.0);
+                ui.monospace(format!(
+                    "Extent: {:.1}m x {:.1}m | Relief dz: {:.1}m | b0 basins: {} | chi: {} | {} tris",
+                    site.dem_extent.width(),
+                    site.dem_extent.height(),
+                    relief_dz,
+                    s.persistent_basins_b0,
+                    s.euler_characteristic,
+                    app_state.loaded_primary_triangles
+                ));
+            });
+    }
+
+    // -------------------------------------------------------------------------
+    // Highlighted Card: Planetary Analog Similarity Breakdown (Earth <-> Moon/Mars)
+    // -------------------------------------------------------------------------
+    if let Some(sim) = app_state.build_pairwise_similarity() {
+        ui.add_space(8.0);
+        egui::Frame::none()
+            .fill(COLOR_CARD_BG)
+            .inner_margin(egui::Margin::same(10.0))
+            .rounding(egui::Rounding::same(6.0))
+            .stroke(egui::Stroke::new(
+                1.5,
+                egui::Color32::from_rgb(56, 189, 248),
+            ))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Planetary Analog Similarity Breakdown (Earth <-> Moon/Mars)",
+                    )
+                    .strong()
+                    .color(egui::Color32::from_rgb(125, 211, 252)),
+                );
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} [{}]  <->  {} [{}]",
+                        sim.primary_name,
+                        sim.primary_body.as_str().to_uppercase(),
+                        sim.compare_name,
+                        sim.compare_body.as_str().to_uppercase()
+                    ))
+                    .small()
+                    .strong()
+                    .color(COLOR_TEXT_PRIMARY),
+                );
+
+                ui.add_space(4.0);
+                let overall_frac = (sim.overall_similarity_pct / 100.0).clamp(0.0, 1.0) as f32;
+                ui.add(
+                    egui::ProgressBar::new(overall_frac)
+                        .text(format!(
+                            "Global Morphometric & TDA Similarity: {:.1}%",
+                            sim.overall_similarity_pct
+                        ))
+                        .fill(egui::Color32::from_rgb(37, 99, 235)),
+                );
+
+                ui.add_space(6.0);
+                for (dim_label, va, vb, sim_pct) in &sim.dimensions {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(dim_label).small().strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.monospace(format!(
+                                "{sim_pct:.0}% ({va:.2} vs {vb:.2})"
+                            ));
+                        });
+                    });
+                    ui.add(
+                        egui::ProgressBar::new((*sim_pct / 100.0) as f32)
+                            .desired_height(6.0)
+                            .fill(egui::Color32::from_rgb(16, 185, 129)),
+                    );
+                }
+
+                if sim.delta_b0_basins.is_some() || sim.delta_euler_chi.is_some() {
+                    ui.add_space(4.0);
+                    ui.monospace(format!(
+                        "TDA Invariants: b0 basins = {} | Euler chi = {}",
+                        sim.delta_b0_basins
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "n/a".to_string()),
+                        sim.delta_euler_chi
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "n/a".to_string()),
+                    ));
+                }
+
+                ui.add_space(6.0);
+                let split_active =
+                    app_state.comparison_site_id.as_deref() == Some(sim.compare_id.as_str());
+                ui.horizontal_wrapped(|ui| {
+                    if split_active {
+                        if ui.button("Exit Split-Screen [C]").clicked() {
+                            app_state.comparison_site_id = None;
+                        }
+                    } else if ui
+                        .button(
+                            egui::RichText::new(format!(
+                                "Split-Screen 3D Compare with '{}' [C]",
+                                sim.compare_name
+                            ))
+                            .strong()
+                            .color(egui::Color32::from_rgb(253, 224, 71)),
+                        )
+                        .clicked()
+                    {
+                        if let Some(partner) = app_state
+                            .catalog
+                            .sites
+                            .iter()
+                            .find(|s| s.id == sim.compare_id)
+                            .cloned()
+                        {
+                            app_state.comparison_site_id = Some(partner.id.clone());
+                            net.fetch_site_assets(TerrainSlot::Comparison, &partner);
+                        }
+                    }
+
+                    if ui.button("Open Charts & Math").clicked() {
+                        app_state.active_tab = PanelTab::ChartsAndMath;
+                    }
+                });
+            });
+    }
+}
+
+/// Tab 2: 3D Vertical Exaggeration, Planar UV Checkerboard test, and Mouse/Keyboard Camera controls.
+fn render_tab_view_and_camera(
+    ui: &mut egui::Ui,
+    app_state: &mut ViewerAppState,
+    camera_query: &mut Query<(&mut OrbitCamera, &mut Projection)>,
+) {
+    ui.heading("2. 3D Terrain & Camera Controls");
+    ui.add_space(4.0);
+
+    ui.label("Vertical Exaggeration (scales Bevy +Y up axis only):");
+    ui.add(
+        egui::Slider::new(&mut app_state.vertical_exaggeration, 0.25..=10.0)
+            .text("Y-scale")
+            .step_by(0.05),
+    );
+
+    ui.add_space(4.0);
+    ui.checkbox(
+        &mut app_state.show_checkerboard_uv,
+        "Checkerboard UV Alignment Test (NW = u:0,v:0 | SE = u:1,v:1)",
+    );
+
+    ui.add_space(6.0);
+    if let Ok((mut cam, mut proj)) = camera_query.get_single_mut() {
+        ui.checkbox(
+            &mut cam.auto_rotate,
+            "Auto-Rotate Terrain Orbit [Shortcut: A] (pauses while dragging)",
+        );
+        ui.add(
+            egui::Slider::new(&mut cam.auto_rotate_speed, 0.05..=1.2)
+                .text("Orbit Speed (rad/s)"),
+        );
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("No-Mouse / Touchpad Camera Controls:").strong());
+
+        let step_angle = 0.22_f32;
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("< Orbit Left").clicked() {
+                cam.target_yaw += step_angle;
+            }
+            if ui.button("Orbit Right >").clicked() {
+                cam.target_yaw -= step_angle;
+            }
+            if ui.button("^ Tilt Up").clicked() {
+                cam.target_pitch = (cam.target_pitch + 0.14).clamp(0.05, 1.52);
+            }
+            if ui.button("v Tilt Down").clicked() {
+                cam.target_pitch = (cam.target_pitch - 0.14).clamp(0.05, 1.52);
+            }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("[+] Zoom In").clicked() {
+                let min_r = cam.min_radius;
+                let max_r = cam.max_radius;
+                cam.target_radius = (cam.target_radius * 0.80).clamp(min_r, max_r);
+            }
+            if ui.button("[-] Zoom Out").clicked() {
+                let min_r = cam.min_radius;
+                let max_r = cam.max_radius;
+                cam.target_radius = (cam.target_radius * 1.25).clamp(min_r, max_r);
+            }
+            if ui.button("[R] Reset & Center 3D Camera").clicked() {
+                cam.frame_terrain(Vec3::ZERO, app_state.loaded_primary_bounding_radius);
+                cam.apply_perspective_clip_planes(&mut proj);
+            }
+        });
+    }
+
+    ui.add_space(8.0);
+    egui::Frame::none()
+        .fill(COLOR_CARD_BG)
+        .inner_margin(egui::Margin::same(10.0))
+        .rounding(egui::Rounding::same(6.0))
+        .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Coordinate System & UV Laws (AGENTS.md Section 2)")
+                    .strong()
+                    .color(egui::Color32::from_rgb(125, 211, 252)),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "- Blender / JMARS Z-up STL centered in f64 to (0,0,0) and mapped to Bevy Y-up: X_bevy = X_stl, Y_bevy = Z_stl (Up), Z_bevy = -Y_stl (South).\n\
+                     - Planar UVs from centered DemExtent: u = (X - min_x)/(max_x - min_x), v = (max_y - Y)/(max_y - min_y).\n\
+                     - Mouse / Touchpad: Left-drag = Orbit | Right-drag or Shift+Left-drag = Pan | Scroll = Zoom.",
+                )
+                .small()
+                .color(COLOR_TEXT_SECONDARY),
+            );
+        });
+}
+
+/// Tab 3: Similarity Charts, Collapsible Mathematical Foundation, and Interactive Weights.
+fn render_tab_charts_and_math(
+    ui: &mut egui::Ui,
+    app_state: &mut ViewerAppState,
+    net: &NetBridge,
+) {
+    ui.heading("3. Similarity Charts, Math & Weights");
+    ui.add_space(4.0);
+
+    render_similarity_charts_and_math(ui, app_state);
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label(
+        egui::RichText::new("Interactive Morphometric Feature Weights [0.0 .. 1.0]:").strong(),
+    );
+
+    let weight_keys: Vec<String> = app_state.active_weights.keys().cloned().collect();
+    let mut weights_changed = false;
+
+    for key in weight_keys {
+        if let Some(val) = app_state.active_weights.get_mut(&key) {
+            let resp = ui.add(
+                egui::Slider::new(val, 0.0..=1.0)
+                    .text(&key)
+                    .step_by(0.01),
+            );
+            if resp.changed() {
+                weights_changed = true;
+            }
+        }
+    }
+
+    if weights_changed {
+        let recalc = recalculate_catalog(&app_state.catalog, &app_state.active_weights);
+        app_state.ranked_scores = recalc.results;
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        if ui.button("Sync Server (/api/recalculate)").clicked() {
+            net.recalculate_scores(app_state.active_weights.clone());
+        }
+        if ui.button("Reset Default Weights").clicked() {
+            app_state.active_weights = app_state.catalog.default_weights.clone();
+            let recalc = recalculate_catalog(&app_state.catalog, &app_state.active_weights);
+            app_state.ranked_scores = recalc.results;
+        }
+        if app_state.authenticated
+            && ui
+                .button(
+                    egui::RichText::new("Save Canonical (PUT /api/weights)")
+                        .color(egui::Color32::from_rgb(74, 222, 128)),
+                )
+                .clicked()
+        {
+            net.save_canonical_weights(app_state.active_weights.clone());
+        }
+    });
+}
+
+/// Draws custom `egui::Painter` multi-bar charts, overall catalog analog ranking bars, and the
+/// collapsible **"Mathematical Foundation & TDA Equations"** reference card.
+fn render_similarity_charts_and_math(ui: &mut egui::Ui, app_state: &ViewerAppState) {
+    if let Some(sim) = app_state.build_pairwise_similarity() {
+        egui::Frame::none()
+            .fill(COLOR_CARD_BG)
+            .inner_margin(egui::Margin::same(10.0))
+            .rounding(egui::Rounding::same(6.0))
+            .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Pairwise Feature Chart: {} [{}] vs {} [{}] ({:.1}% Match)",
+                        sim.primary_name,
+                        sim.primary_body.as_str().to_uppercase(),
+                        sim.compare_name,
+                        sim.compare_body.as_str().to_uppercase(),
+                        sim.overall_similarity_pct
+                    ))
+                    .strong()
+                    .color(egui::Color32::from_rgb(125, 211, 252)),
+                );
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(56, 189, 248),
+                        format!("[#] Primary: {}", sim.primary_name),
+                    );
+                    ui.colored_label(
+                        egui::Color32::from_rgb(250, 204, 21),
+                        format!("[#] Partner: {}", sim.compare_name),
+                    );
+                    ui.colored_label(
+                        egui::Color32::from_rgb(16, 185, 129),
+                        "[#] Dimension Similarity (%)",
+                    );
+                });
+
+                ui.add_space(4.0);
+
+                let chart_w = ui.available_width().max(260.0);
+                let row_h = 40.0;
+                let chart_h = row_h * (sim.dimensions.len() as f32) + 12.0;
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(chart_w, chart_h), egui::Sense::hover());
+                let painter = ui.painter_at(rect);
+
+                painter.rect_filled(
+                    rect,
+                    egui::Rounding::same(4.0),
+                    egui::Color32::from_rgb(9, 14, 24),
+                );
+
+                let label_col_w = 132.0_f32.min(chart_w * 0.40);
+                let bar_area_w = (chart_w - label_col_w - 64.0).max(80.0);
+
+                for i in 0..=4 {
+                    let frac = i as f32 * 0.25;
+                    let gx = rect.min.x + label_col_w + bar_area_w * frac;
+                    painter.line_segment(
+                        [egui::pos2(gx, rect.min.y + 4.0), egui::pos2(gx, rect.max.y - 4.0)],
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(30, 41, 59)),
+                    );
+                }
+
+                for (idx, (label, va, vb, sim_pct)) in sim.dimensions.iter().enumerate() {
+                    let y0 = rect.min.y + 6.0 + (idx as f32) * row_h;
+                    painter.text(
+                        egui::pos2(rect.min.x + 6.0, y0 + 10.0),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        egui::FontId::proportional(12.0),
+                        COLOR_TEXT_PRIMARY,
+                    );
+
+                    let bx = rect.min.x + label_col_w;
+                    let w_a = (*va as f32).clamp(0.0, 1.0) * bar_area_w;
+                    let w_b = (*vb as f32).clamp(0.0, 1.0) * bar_area_w;
+                    let w_sim = ((*sim_pct / 100.0) as f32).clamp(0.0, 1.0) * bar_area_w;
+
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(egui::pos2(bx, y0 + 2.0), egui::vec2(w_a, 8.0)),
+                        egui::Rounding::same(2.0),
+                        egui::Color32::from_rgb(56, 189, 248),
+                    );
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(egui::pos2(bx, y0 + 12.0), egui::vec2(w_b, 8.0)),
+                        egui::Rounding::same(2.0),
+                        egui::Color32::from_rgb(250, 204, 21),
+                    );
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(bx, y0 + 22.0),
+                            egui::vec2(w_sim, 8.0),
+                        ),
+                        egui::Rounding::same(2.0),
+                        egui::Color32::from_rgb(16, 185, 129),
+                    );
+
+                    painter.text(
+                        egui::pos2(bx + bar_area_w + 6.0, y0 + 16.0),
+                        egui::Align2::LEFT_CENTER,
+                        format!("{sim_pct:.0}%"),
+                        egui::FontId::monospace(12.0),
+                        egui::Color32::from_rgb(167, 243, 208),
+                    );
+                }
+            });
+    }
+
+    // Overall Catalog Ranking Chart
+    ui.add_space(6.0);
+    egui::Frame::none()
+        .fill(COLOR_CARD_BG)
+        .inner_margin(egui::Margin::same(10.0))
+        .rounding(egui::Rounding::same(6.0))
+        .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Catalog Analog Score Ranking (0% .. 100%)")
+                    .strong()
+                    .color(COLOR_TEXT_PRIMARY),
+            );
+            for (rank, scored) in app_state.ranked_scores.iter().enumerate() {
+                let pct = (scored.score * 100.0).clamp(0.0, 100.0);
+                let is_prim = scored.site_id == app_state.primary_site_id;
+                let bar_color = if is_prim {
+                    egui::Color32::from_rgb(56, 189, 248)
+                } else {
+                    egui::Color32::from_rgb(71, 85, 105)
+                };
+                ui.add(
+                    egui::ProgressBar::new((pct / 100.0) as f32)
+                        .text(format!(
+                            "#{}: {} [{}] — {:.1}% (canonical {:.1}%)",
+                            rank + 1,
+                            scored.name,
+                            scored.body.as_str().to_uppercase(),
+                            pct,
+                            scored.canonical_score * 100.0
+                        ))
+                        .fill(bar_color),
+                );
+            }
+        });
+
+    // Collapsible Mathematical Foundation & TDA Equations Card
+    ui.add_space(6.0);
+    egui::CollapsingHeader::new(
+        egui::RichText::new("Mathematical Foundation & TDA Equations")
+            .strong()
+            .color(egui::Color32::from_rgb(125, 211, 252)),
+    )
+    .default_open(true)
+    .show(ui, |ui| {
+        egui::Frame::none()
+            .fill(COLOR_CARD_BG)
+            .inner_margin(egui::Margin::same(10.0))
+            .rounding(egui::Rounding::same(6.0))
+            .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("1. Weighted Morphometric Similarity (S_analog):")
+                        .strong()
+                        .color(egui::Color32::from_rgb(74, 222, 128)),
+                );
+                ui.monospace("S_analog(A, B) = sum_i w_i * (1 - |f_{i,A} - f_{i,B}|)");
+                ui.label(
+                    egui::RichText::new(
+                        "where sum_i w_i = 1 and each feature f_i in [0, 1] is normalized from meter-projected DEMs:\n\
+                         * Elevation Relief: dz = z_max - z_min (vertical dynamic range in meters).\n\
+                         * Hypsometric Integral (Geomorphology Match): HI = (z_mean - z_min) / (z_max - z_min), measuring highland vs basin mass distribution.\n\
+                         * Terrain Ruggedness Index (Roughness Similarity): TRI = sqrt((1/8) * sum_{n=1..8} (z_n - z_0)^2) over 3x3 local neighborhood cells.\n\
+                         * Slope Safety: theta = arctan(sqrt((dz/dx)^2 + (dz/dy)^2)), rewarding low-gradient landing pads.",
+                    )
+                    .small()
+                    .color(COLOR_TEXT_SECONDARY),
+                );
+
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "2. 0D Persistent Homology (beta_0) & Euler Characteristic (chi):",
+                    )
+                    .strong()
+                    .color(egui::Color32::from_rgb(250, 204, 21)),
+                );
+                ui.monospace("chi = V - E + F   |   Persistence p_k = |d_k - b_k| > tau");
+                ui.label(
+                    egui::RichText::new(
+                        "* Sublevel (-z) and superlevel (+z) filtration via Union-Find (Elder Rule) tracks connected component birth-death pairs (b_k, d_k) to count persistent basins (b0 depressions/craters) and peaks invariant to rigid rotations.\n\
+                         * Simplicial Euler characteristic chi = V - E + F (vertices - edges + faces) captures global genus and multi-scale roughness, penalizing normalized topological discrepancies Delta_b0 and Delta_chi.",
+                    )
+                    .small()
+                    .color(COLOR_TEXT_SECONDARY),
+                );
+            });
+    });
+}
+
+/// Tab 4: Lunar & Martian Settlement Engineering Guide (5 critical habitat needs & how Space-App-X86 solves them).
+fn render_tab_settlement_guide(ui: &mut egui::Ui) {
+    ui.heading("4. Lunar & Martian Settlement Engineering Guide");
+    ui.label(
+        egui::RichText::new(
+            "How Space-App-X86's 3D morphometry, TDA invariants, and real-time telemetry solve the 5 core engineering requirements for human habitats on the Moon (Artemis South Pole) and Mars:",
+        )
+        .small()
+        .color(COLOR_TEXT_SECONDARY),
+    );
+    ui.add_space(6.0);
+
+    let items = [
+        (
+            "1. Landing & Habitat Slope Stability (theta < 5 deg - 15 deg)",
+            "Challenge: Lunar and Martian landers risk dynamic rollover on slopes exceeding 10-15 deg, and pressurized habitat modules require stable, low-gradient foundations (< 5 deg).",
+            "Solved by: Slope Safety & meter-projected DEM gradient analysis (theta = arctan(||grad(z)||)), ranking flat landing ellipses and highlighting steep crater wall hazards in 3D.",
+        ),
+        (
+            "2. Solar Power & Cryogenic Volatile Access (Lunar South Pole)",
+            "Challenge: Equatorial lunar nights last 354 hours (~100 K), whereas South Pole crater rims ('peaks of eternal light') receive >80% sunlight right next to ~40 K Permanently Shadowed Regions (PSRs) rich in water ice.",
+            "Solved by: Elevation Relief (dz), Hypsometric Integral (HI), and the live Planetary Telemetry HUD (tracking Lunar Solar Time, synodic illumination %, and surface thermal range).",
+        ),
+        (
+            "3. Rover Trafficability & Crew EVA Mobility",
+            "Challenge: High boulder density and sharp decameter-scale ejecta ridges cause wheel slip, chassis high-centering, and elevated metabolic/battery energy consumption during EVAs.",
+            "Solved by: Terrain Ruggedness Index (TRI = sqrt(1/8 * sum(z_n - z_0)^2)) & Roughness Similarity, quantifying local root-mean-square elevation steps across the entire site.",
+        ),
+        (
+            "4. Natural Radiation & Micrometeorite Shielding",
+            "Challenge: Outside Earth's magnetosphere, Galactic Cosmic Rays (GCR), Solar Particle Events (SPE), and secondary regolith ejecta require subterranean lava tubes, pit craters, or enclosed basin berms.",
+            "Solved by: 0D Persistent Homology (beta_0 sublevel filtration via Union-Find Elder Rule) & Euler Characteristic (chi = V - E + F), automatically counting persistent closed basins and depressions for natural regolith shielding.",
+        ),
+        (
+            "5. Pre-Flight Terrestrial Analog Validation (Earth <-> Moon/Mars)",
+            "Challenge: Every habitat deployment mechanism, ISRU drill, and autonomous rover navigation stack must be field-tested on Earth in terrains that match target extraterrestrial geomorphology.",
+            "Solved by: Cross-Body Analog Similarity Ranking (S_analog) & synchronized Split-Screen 3D Comparison, pairing terrestrial volcanic/impact sites directly with Lunar and Martian targets.",
+        ),
+    ];
+
+    for (title, challenge, solution) in items {
+        egui::Frame::none()
+            .fill(COLOR_CARD_BG)
+            .inner_margin(egui::Margin::same(10.0))
+            .rounding(egui::Rounding::same(6.0))
+            .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(title)
+                        .strong()
+                        .color(egui::Color32::from_rgb(125, 211, 252)),
+                );
+                ui.label(
+                    egui::RichText::new(challenge)
+                        .small()
+                        .color(COLOR_TEXT_SECONDARY),
+                );
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(solution)
+                        .small()
+                        .strong()
+                        .color(egui::Color32::from_rgb(74, 222, 128)),
+                );
+            });
+        ui.add_space(6.0);
+    }
+}
+
+/// Tab 5: Researcher 512 MiB Binary Terrain Upload, TDA Report, and Workspace Reset / Demo Restore.
+fn render_tab_upload_and_reset(
+    ui: &mut egui::Ui,
+    app_state: &mut ViewerAppState,
+    net: &NetBridge,
+) {
+    ui.heading("5. Researcher Upload, TDA & Workspace Reset");
+    ui.add_space(4.0);
+
+    if !app_state.authenticated {
+        egui::Frame::none()
+            .fill(COLOR_CARD_BG)
+            .inner_margin(egui::Margin::same(12.0))
+            .rounding(egui::Rounding::same(6.0))
+            .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("Researcher Authentication Required")
+                        .strong()
+                        .color(egui::Color32::from_rgb(250, 204, 21)),
+                );
+                ui.label(
+                    "Log in with Researcher credentials to upload 50-100+ MiB .stl/.tif/.png files via binary multipart/form-data, run 0D Persistent Homology TDA, or clear/reset preloaded catalog maps.",
+                );
+                ui.add_space(6.0);
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Open Researcher Login")
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(37, 99, 235)),
+                    )
+                    .clicked()
+                {
+                    app_state.show_login_modal = true;
+                }
+            });
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // Section A: Workspace Catalog Reset (Clear Preloaded Maps / Restore Demo)
+    // -------------------------------------------------------------------------
+    egui::Frame::none()
+        .fill(COLOR_CARD_BG)
+        .inner_margin(egui::Margin::same(10.0))
+        .rounding(egui::Rounding::same(6.0))
+        .stroke(egui::Stroke::new(
+            1.2,
+            egui::Color32::from_rgb(248, 113, 113),
+        ))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("Workspace Catalog Management (POST /api/sites/reset)")
+                    .strong()
+                    .color(egui::Color32::from_rgb(252, 165, 165)),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Clear all preloaded maps from data/processed/catalog.json so only your newly uploaded terrains are displayed, or restore the synthetic UV reference site (test_site).",
+                )
+                .small()
+                .color(COLOR_TEXT_SECONDARY),
+            );
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Reset Workspace (Clear All Preloaded Maps)")
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(185, 28, 28)),
+                    )
+                    .on_hover_text(
+                        "Empties catalog.json on the server so only your newly uploaded maps appear",
+                    )
+                    .clicked()
+                {
+                    net.reset_catalog(false);
+                }
+
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Restore Reference Demo Site")
+                                .strong()
+                                .color(COLOR_TEXT_PRIMARY),
+                        )
+                        .fill(egui::Color32::from_rgb(30, 41, 59)),
+                    )
+                    .on_hover_text("Restores the synthetic test_site in catalog.json")
+                    .clicked()
+                {
+                    net.reset_catalog(true);
                 }
             });
         });
 
-    // 4. Resizable Left Side Panel (`default_width(390.0)`, `width_range(320.0..=680.0)`, `ScrollArea::both()`)
-    if app_state.panel_visible {
-        egui::SidePanel::left("analog_control_panel")
-            .resizable(true)
-            .default_width(390.0)
-            .width_range(320.0..=680.0)
-            .show(ctx, |ui| {
-                // Session & Mode Header
-                ui.horizontal_wrapped(|ui| {
-                    if app_state.authenticated {
-                        let user = app_state
-                            .researcher_username
-                            .as_deref()
-                            .unwrap_or("equipo_analog");
-                        ui.colored_label(
-                            egui::Color32::from_rgb(80, 230, 150),
-                            egui::RichText::new(format!("Researcher ({user})"))
-                                .small()
-                                .strong(),
-                        );
-                        if ui.small_button("Log Out").clicked() {
-                            net.logout();
-                        }
-                    } else {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(0, 210, 220),
-                            egui::RichText::new("Public Demo Mode").small().strong(),
-                        );
-                        if ui.small_button("Researcher Login").clicked() {
-                            app_state.active_tab = PanelTab::ResearcherUpload;
-                        }
-                    }
+    ui.add_space(8.0);
 
-                    if ui.small_button("Reload Catalog").clicked() {
-                        net.fetch_demo_mode();
-                    }
-                    ui.label(
-                        egui::RichText::new("Keys: A=Rotate | C=Split | ↑/↓=Site | +/-=Zoom | H=UI")
-                            .small()
-                            .color(egui::Color32::from_gray(145)),
-                    );
-                });
+    // -------------------------------------------------------------------------
+    // Section B: Binary Multipart Terrain Upload & Automated TDA
+    // -------------------------------------------------------------------------
+    egui::Frame::none()
+        .fill(COLOR_CARD_BG)
+        .inner_margin(egui::Margin::same(10.0))
+        .rounding(egui::Rounding::same(6.0))
+        .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Upload 3D Mesh (.stl), DEM (.tif/.tiff) & Texture (.png) [Max 512 MiB]",
+                )
+                .strong()
+                .color(egui::Color32::from_rgb(74, 222, 128)),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Raw binary multipart/form-data (zero Base64). Meshes >50,000 triangles are automatically decimated via 3D vertex clustering and centered to (0,0,0) in f64.",
+                )
+                .small()
+                .color(COLOR_TEXT_SECONDARY),
+            );
+            ui.add_space(6.0);
 
-                ui.label(
-                    egui::RichText::new(&app_state.status_message)
-                        .small()
-                        .color(egui::Color32::from_gray(190)),
-                );
-
-                if let Some(err) = app_state.error_message.clone() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(egui::Color32::from_rgb(255, 105, 105), &err);
-                        if ui.small_button("Dismiss").clicked() {
-                            app_state.error_message = None;
-                        }
-                    });
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Select .STL").clicked() {
+                    open_browser_file_dialog(".stl");
                 }
+                if ui.button("Select .TIF/.TIFF").clicked() {
+                    open_browser_file_dialog(".tif,.tiff");
+                }
+                if ui.button("Select .PNG").clicked() {
+                    open_browser_file_dialog(".png");
+                }
+                if ui.button("Select Any (.stl,.tif,.png)").clicked() {
+                    open_browser_file_dialog(".stl,.tif,.tiff,.png");
+                }
+            });
 
-                ui.separator();
+            egui::Grid::new("upload_files_status_grid")
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("3D Mesh (.stl):");
+                    if let (Some(name), Some(bytes)) = (
+                        app_state.upload_form.stl_file_name.clone(),
+                        app_state.upload_form.stl_bytes.as_ref(),
+                    ) {
+                        let size_str = TerrainUploadForm::format_mib(bytes.len());
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(74, 222, 128),
+                                format!("{name} ({size_str})"),
+                            );
+                            if ui.small_button("x").clicked() {
+                                app_state.upload_form.stl_file_name = None;
+                                app_state.upload_form.stl_bytes = None;
+                            }
+                        });
+                    } else {
+                        ui.label(
+                            egui::RichText::new("None selected").color(COLOR_TEXT_SECONDARY),
+                        );
+                    }
+                    ui.end_row();
 
-                // Compact 4-Tab Selector Bar
-                ui.horizontal_wrapped(|ui| {
-                    ui.selectable_value(
-                        &mut app_state.active_tab,
-                        PanelTab::SitesAndCompare,
-                        "1. Sites & Compare",
-                    );
-                    ui.selectable_value(
-                        &mut app_state.active_tab,
-                        PanelTab::View3dAndCamera,
-                        "2. 3D & Camera",
-                    );
-                    ui.selectable_value(
-                        &mut app_state.active_tab,
-                        PanelTab::WeightsAndTda,
-                        "3. Weights & TDA",
-                    );
-                    ui.selectable_value(
-                        &mut app_state.active_tab,
-                        PanelTab::ResearcherUpload,
-                        "4. Researcher Upload",
-                    );
+                    ui.label("Elevation (.tif):");
+                    if let (Some(name), Some(bytes)) = (
+                        app_state.upload_form.tif_file_name.clone(),
+                        app_state.upload_form.tif_bytes.as_ref(),
+                    ) {
+                        let size_str = TerrainUploadForm::format_mib(bytes.len());
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(74, 222, 128),
+                                format!("{name} ({size_str})"),
+                            );
+                            if ui.small_button("x").clicked() {
+                                app_state.upload_form.tif_file_name = None;
+                                app_state.upload_form.tif_bytes = None;
+                            }
+                        });
+                    } else {
+                        ui.label(
+                            egui::RichText::new("None selected").color(COLOR_TEXT_SECONDARY),
+                        );
+                    }
+                    ui.end_row();
+
+                    ui.label("Texture (.png):");
+                    if let (Some(name), Some(bytes)) = (
+                        app_state.upload_form.png_file_name.clone(),
+                        app_state.upload_form.png_bytes.as_ref(),
+                    ) {
+                        let size_str = TerrainUploadForm::format_mib(bytes.len());
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(74, 222, 128),
+                                format!("{name} ({size_str})"),
+                            );
+                            if ui.small_button("x").clicked() {
+                                app_state.upload_form.png_file_name = None;
+                                app_state.upload_form.png_bytes = None;
+                            }
+                        });
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Auto-generate hypsometric PNG")
+                                .color(COLOR_TEXT_SECONDARY),
+                        );
+                    }
+                    ui.end_row();
                 });
 
-                ui.separator();
+            let total_bytes = app_state.upload_form.total_payload_bytes();
+            if total_bytes > 0 {
+                ui.monospace(format!(
+                    "Total binary multipart payload: {}",
+                    TerrainUploadForm::format_mib(total_bytes)
+                ));
+            }
 
-                // Both-axis ScrollArea so no content or button is ever clipped horizontally or vertically
-                egui::ScrollArea::both()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| match app_state.active_tab {
-                        // =========================================================================
-                        // TAB 1: SITES & COMPARE + SIMILARITY BREAKDOWN + CHARTS
-                        // =========================================================================
-                        PanelTab::SitesAndCompare => {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Filter Body:");
-                                ui.selectable_value(
-                                    &mut app_state.body_filter,
-                                    BodyFilter::All,
-                                    "All",
-                                );
-                                ui.selectable_value(
-                                    &mut app_state.body_filter,
-                                    BodyFilter::Moon,
-                                    "Moon",
-                                );
-                                ui.selectable_value(
-                                    &mut app_state.body_filter,
-                                    BodyFilter::Mars,
-                                    "Mars",
-                                );
-                                ui.selectable_value(
-                                    &mut app_state.body_filter,
-                                    BodyFilter::Earth,
-                                    "Earth",
-                                );
-                            });
+            ui.add_space(6.0);
+            egui::Grid::new("upload_meta_grid")
+                .num_columns(2)
+                .spacing([8.0, 5.0])
+                .show(ui, |ui| {
+                    ui.label("Site Name:");
+                    ui.text_edit_singleline(&mut app_state.upload_form.site_name);
+                    ui.end_row();
 
-                            let filtered_sites: Vec<(String, String, Body)> = app_state
-                                .catalog
-                                .sites
-                                .iter()
-                                .filter(|s| app_state.body_filter.matches(s.body))
-                                .map(|s| (s.id.clone(), s.name.clone(), s.body))
-                                .collect();
+                    ui.label("Site ID:");
+                    ui.text_edit_singleline(&mut app_state.upload_form.site_id);
+                    ui.end_row();
 
-                            let combo_w = (ui.available_width() - 140.0).clamp(150.0, 320.0);
-                            let current_primary_label = app_state.primary_site_id.clone();
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Primary Site:");
-                                egui::ComboBox::from_id_source("primary_site_combo")
-                                    .selected_text(current_primary_label)
-                                    .width(combo_w)
-                                    .show_ui(ui, |ui| {
-                                        for (id, name, body) in &filtered_sites {
-                                            let label = format!(
-                                                "[{}] {} ({})",
-                                                body.as_str().to_uppercase(),
-                                                name,
-                                                id
-                                            );
-                                            if ui
-                                                .selectable_label(
-                                                    app_state.primary_site_id == *id,
-                                                    label,
-                                                )
-                                                .clicked()
-                                                && app_state.primary_site_id != *id
-                                            {
-                                                let id_clone = id.clone();
-                                                app_state.select_primary_site(&id_clone, &net);
-                                            }
-                                        }
-                                    });
-                                if ui
-                                    .small_button("↑")
-                                    .on_hover_text("Previous site (ArrowUp)")
-                                    .clicked()
-                                {
-                                    app_state.cycle_primary_site(-1, &net);
-                                }
-                                if ui
-                                    .small_button("↓")
-                                    .on_hover_text("Next site (ArrowDown)")
-                                    .clicked()
-                                {
-                                    app_state.cycle_primary_site(1, &net);
-                                }
-                            });
-
-                            let all_sites: Vec<SiteMetadata> = app_state.catalog.sites.clone();
-                            let current_comp_label = app_state
-                                .comparison_site_id
-                                .clone()
-                                .unwrap_or_else(|| "None (Single View)".to_string());
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Compare With:");
-                                egui::ComboBox::from_id_source("comparison_site_combo")
-                                    .selected_text(current_comp_label)
-                                    .width(combo_w)
-                                    .show_ui(ui, |ui| {
-                                        if ui
-                                            .selectable_label(
-                                                app_state.comparison_site_id.is_none(),
-                                                "None (Single View)",
-                                            )
-                                            .clicked()
-                                        {
-                                            app_state.comparison_site_id = None;
-                                            app_state.loaded_comparison_summary = None;
-                                            app_state.pending_reload_comparison = true;
-                                        }
-                                        for s in &all_sites {
-                                            let label = format!(
-                                                "[{}] {} ({})",
-                                                s.body.as_str().to_uppercase(),
-                                                s.name,
-                                                s.id
-                                            );
-                                            let selected =
-                                                app_state.comparison_site_id.as_deref()
-                                                    == Some(s.id.as_str());
-                                            if ui.selectable_label(selected, label).clicked() {
-                                                app_state.comparison_site_id =
-                                                    Some(s.id.clone());
-                                                app_state.loaded_comparison_summary = Some(
-                                                    estimate_site_summary_from_metadata(s),
-                                                );
-                                                net.fetch_site_assets(
-                                                    TerrainSlot::Comparison,
-                                                    s,
-                                                );
-                                                app_state.pending_reload_comparison = true;
-                                            }
-                                        }
-                                    });
-                                if ui
-                                    .small_button("[C] Split")
-                                    .on_hover_text("Toggle 3D Split-Screen (Shortcut: C)")
-                                    .clicked()
-                                {
-                                    app_state.toggle_split_screen_comparison(&net);
-                                }
-                            });
-
-                            ui.add_space(4.0);
-                            render_similarity_breakdown_card(ui, &mut app_state, &net);
-
-                            if let Some(site) = app_state.primary_site().cloned() {
-                                ui.add_space(4.0);
-                                egui::CollapsingHeader::new(format!(
-                                    "Primary Site Details: {} [{}]",
-                                    site.name,
-                                    site.body.as_str().to_uppercase()
-                                ))
-                                .default_open(false)
-                                .show(ui, |ui| {
-                                    if !site.description.is_empty() {
-                                        ui.label(egui::RichText::new(&site.description).small());
-                                    }
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "DemExtent (m): X=[{:.1}, {:.1}], Y=[{:.1}, {:.1}]",
-                                            site.dem_extent.min_x,
-                                            site.dem_extent.max_x,
-                                            site.dem_extent.min_y,
-                                            site.dem_extent.max_y
-                                        ))
-                                        .monospace()
-                                        .small(),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "Format: {:?} | Triangles: {} / 50,000 | Mesh: {}",
-                                            site.resolved_mesh_format(),
-                                            app_state.loaded_primary_triangles,
-                                            site.mesh_path
-                                        ))
-                                        .monospace()
-                                        .small(),
-                                    );
-                                });
-                            }
-                        }
-
-                        // =========================================================================
-                        // TAB 2: 3D TERRAIN, AUTO-ROTATE, UV CHECKERBOARD & CAMERA SHORTCUTS
-                        // =========================================================================
-                        PanelTab::View3dAndCamera => {
-                            ui.heading("3D Terrain & Camera Controls");
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label("Vertical Exaggeration (Y-up):");
-                                ui.add(
-                                    egui::Slider::new(
-                                        &mut app_state.vertical_exaggeration,
-                                        0.2..=8.0,
-                                    )
-                                    .suffix("x"),
-                                );
-                            });
-
-                            ui.checkbox(
-                                &mut app_state.auto_rotate,
-                                "Auto-Rotate 3D Camera (Shortcut: A — pauses automatically while dragging)",
+                    ui.label("Origin Body:");
+                    egui::ComboBox::from_id_source("upload_source_body_combo")
+                        .selected_text(app_state.upload_form.source_body.as_str().to_uppercase())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut app_state.upload_form.source_body,
+                                Body::Earth,
+                                "EARTH (Terrestrial Analog)",
                             );
-
-                            ui.checkbox(
-                                &mut app_state.show_checkerboard_uv,
-                                "Checkerboard UV Verification (NW=Cyan u=0,v=0 | SE=Amber u=1,v=1)",
+                            ui.selectable_value(
+                                &mut app_state.upload_form.source_body,
+                                Body::Moon,
+                                "MOON (Lunar Terrain)",
                             );
-
-                            ui.checkbox(
-                                &mut app_state.telemetry_visible,
-                                "Show Live Planetary Telemetry HUD Card (Top-Right)",
+                            ui.selectable_value(
+                                &mut app_state.upload_form.source_body,
+                                Body::Mars,
+                                "MARS (Martian Terrain)",
                             );
+                        });
+                    ui.end_row();
 
-                            ui.add_space(4.0);
-                            ui.horizontal_wrapped(|ui| {
-                                if ui.button("[R] Reset 3D Camera").clicked() {
-                                    let br = app_state.loaded_primary_bounding_radius.max(10.0);
-                                    for (mut cam, mut proj) in &mut cam_query {
-                                        cam.frame_terrain(Vec3::ZERO, br);
-                                        cam.apply_perspective_clip_planes(&mut proj);
-                                    }
-                                }
-                                if ui.button("[+] Zoom In").clicked() {
-                                    for (mut cam, _) in &mut cam_query {
-                                        cam.zoom_by_factor(0.82);
-                                    }
-                                }
-                                if ui.button("[-] Zoom Out").clicked() {
-                                    for (mut cam, _) in &mut cam_query {
-                                        cam.zoom_by_factor(1.22);
-                                    }
-                                }
-                                if ui.button("Re-fetch Mesh & PNG").clicked()
-                                    && let Some(site) = app_state.primary_site().cloned()
-                                {
-                                    net.fetch_site_assets(TerrainSlot::Primary, &site);
-                                }
-                            });
+                    ui.label("DEM Cell Size (m):");
+                    ui.add(
+                        egui::DragValue::new(&mut app_state.upload_form.horizontal_scale_m)
+                            .speed(0.5)
+                            .range(0.01..=10_000.0),
+                    );
+                    ui.end_row();
 
-                            ui.add_space(6.0);
-                            ui.group(|ui| {
-                                ui.strong("Keyboard & 14\" Laptop Touchpad Controls");
-                                egui::Grid::new("keyboard_shortcuts_grid")
-                                    .striped(true)
-                                    .num_columns(2)
-                                    .spacing([12.0, 4.0])
-                                    .show(ui, |ui| {
-                                        ui.monospace("[A]");
-                                        ui.label("Toggle orbital Auto-Rotate (pauses on drag)");
-                                        ui.end_row();
+                    ui.label("Notes:");
+                    ui.text_edit_singleline(&mut app_state.upload_form.description);
+                    ui.end_row();
+                });
 
-                                        ui.monospace("[C]");
-                                        ui.label(
-                                            "Toggle synchronized 3D Split-Screen (Primary ↔ Compare)",
-                                        );
-                                        ui.end_row();
-
-                                        ui.monospace("[ArrowUp] / [ArrowDown]");
-                                        ui.label("Cycle Primary Site up / down in catalog");
-                                        ui.end_row();
-
-                                        ui.monospace("[+] / [-]");
-                                        ui.label("Smooth 3D camera Zoom In / Zoom Out");
-                                        ui.end_row();
-
-                                        ui.monospace("[R]");
-                                        ui.label(
-                                            "Center & fit 3D camera to terrain bounding sphere",
-                                        );
-                                        ui.end_row();
-
-                                        ui.monospace("[H]");
-                                        ui.label("Hide / Show all UI overlays (Fullscreen 3D)");
-                                        ui.end_row();
-
-                                        ui.monospace("[1] [2] [3] [4]");
-                                        ui.label("Switch directly between panel tabs");
-                                        ui.end_row();
-
-                                        ui.monospace("Left-Drag");
-                                        ui.label("Orbit 3D camera (synchronized in Split View)");
-                                        ui.end_row();
-
-                                        ui.monospace("Right-Drag / Shift+Drag");
-                                        ui.label("Pan 3D camera across terrain");
-                                        ui.end_row();
-
-                                        ui.monospace("Scroll / 2-Finger Touchpad");
-                                        ui.label("Zoom 3D camera in / out");
-                                        ui.end_row();
-                                    });
-                            });
-                        }
-
-                        // =========================================================================
-                        // TAB 3: SCIENTIFIC WEIGHTS, RANKED SCORES & SIMILARITY CHARTS
-                        // =========================================================================
-                        PanelTab::WeightsAndTda => {
-                            ui.heading("Scientific Feature Weights");
-                            ui.label(
-                                egui::RichText::new(
-                                    "Adjust weights to recalculate weighted sums over pre-normalized [0.0, 1.0] features:",
-                                )
-                                .small(),
-                            );
-
-                            let weight_keys: Vec<String> =
-                                app_state.active_weights.keys().cloned().collect();
-                            let mut weights_changed = false;
-                            for key in weight_keys {
-                                if let Some(val) = app_state.active_weights.get_mut(&key) {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(format!("{key}:"));
-                                        if ui
-                                            .add(egui::Slider::new(val, 0.0..=1.0).step_by(0.01))
-                                            .changed()
-                                        {
-                                            weights_changed = true;
-                                        }
-                                    });
-                                }
-                            }
-
-                            if weights_changed {
-                                let local_recalc = recalculate_catalog(
-                                    &app_state.catalog,
-                                    &app_state.active_weights,
-                                );
-                                app_state.ranked_scores = local_recalc.results;
-                                net.recalculate_scores(app_state.active_weights.clone());
-                            }
-
-                            ui.horizontal_wrapped(|ui| {
-                                if ui.button("Recalculate via Server").clicked() {
-                                    let local_recalc = recalculate_catalog(
-                                        &app_state.catalog,
-                                        &app_state.active_weights,
-                                    );
-                                    app_state.ranked_scores = local_recalc.results;
-                                    net.recalculate_scores(app_state.active_weights.clone());
-                                }
-                                if ui.button("Reset to Canonical").clicked() {
-                                    app_state.active_weights =
-                                        app_state.catalog.default_weights.clone();
-                                    let local_recalc = recalculate_catalog(
-                                        &app_state.catalog,
-                                        &app_state.active_weights,
-                                    );
-                                    app_state.ranked_scores = local_recalc.results;
-                                }
-                            });
-
-                            ui.separator();
-
-                            ui.heading("Comparative Analog Scores (Click to Load 3D)");
-                            egui::Grid::new("analog_scores_table")
-                                .striped(true)
-                                .num_columns(5)
-                                .spacing([8.0, 5.0])
-                                .show(ui, |ui| {
-                                    ui.strong("#");
-                                    ui.strong("Site");
-                                    ui.strong("Body");
-                                    ui.strong("Live");
-                                    ui.strong("Canonical");
-                                    ui.end_row();
-
-                                    let rows = app_state.ranked_scores.clone();
-                                    for (idx, row) in rows.iter().enumerate() {
-                                        ui.label(format!("{}", idx + 1));
-                                        let is_current =
-                                            app_state.primary_site_id == row.site_id;
-                                        if ui
-                                            .selectable_label(is_current, &row.name)
-                                            .on_hover_text("Click to inspect this site in 3D")
-                                            .clicked()
-                                            && !is_current
-                                        {
-                                            app_state.select_primary_site(&row.site_id, &net);
-                                        }
-                                        ui.colored_label(
-                                            body_accent_color(row.body),
-                                            row.body.as_str().to_uppercase(),
-                                        );
-                                        ui.monospace(format!("{:.4}", row.score));
-                                        ui.monospace(format!("{:.4}", row.canonical_score));
-                                        ui.end_row();
-                                    }
-                                });
-
-                            ui.separator();
-                            render_similarity_breakdown_card(ui, &mut app_state, &net);
-
-                            if let Some(report) = app_state.last_analysis_report.clone() {
-                                ui.add_space(4.0);
-                                render_tda_report_panel(ui, &report);
-                            }
-                        }
-
-                        // =========================================================================
-                        // TAB 4: RESEARCHER LOGIN, BINARY MULTIPART UPLOAD & TDA REPORT
-                        // =========================================================================
-                        PanelTab::ResearcherUpload => {
-                            if !app_state.authenticated {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "Log in as Researcher (Argon2id) to upload & analyze .stl / .tif / .png terrains, run 0D Persistent Homology & Euler topology analysis, or persist weights.",
-                                    )
-                                    .small()
-                                    .color(egui::Color32::from_gray(175)),
-                                );
-
-                                ui.group(|ui| {
-                                    ui.strong("Researcher Login (POST /api/login)");
-                                    let mut inline_login = false;
-                                    egui::Grid::new("inline_login_grid")
-                                        .num_columns(2)
-                                        .spacing([6.0, 4.0])
-                                        .show(ui, |ui| {
-                                            ui.label("Username:");
-                                            ui.text_edit_singleline(
-                                                &mut app_state.login_username_input,
-                                            );
-                                            ui.end_row();
-
-                                            ui.label("Password:");
-                                            let r = ui.add(
-                                                egui::TextEdit::singleline(
-                                                    &mut app_state.login_password_input,
-                                                )
-                                                .password(true),
-                                            );
-                                            if r.lost_focus()
-                                                && ui.input(|i| {
-                                                    i.key_pressed(egui::Key::Enter)
-                                                })
-                                            {
-                                                inline_login = true;
-                                            }
-                                            ui.end_row();
-                                        });
-
-                                    if ui.button("Log In as Researcher").clicked() {
-                                        inline_login = true;
-                                    }
-                                    if inline_login {
-                                        app_state.error_message = None;
-                                        let user =
-                                            app_state.login_username_input.trim().to_string();
-                                        let pass = app_state.login_password_input.clone();
-                                        app_state.login_password_input.clear();
-                                        app_state.status_message = format!(
-                                            "Authenticating researcher '{}' via Argon2id...",
-                                            user
-                                        );
-                                        net.login(user, pass);
-                                    }
-                                });
-                            } else {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(80, 230, 150),
-                                    "Researcher Session Active — Upload, TDA & Write Operations Unlocked",
-                                );
-
-                                egui::CollapsingHeader::new(
-                                    egui::RichText::new(
-                                        "Upload & Analyze Terrain (.stl / .tif / .png)",
-                                    )
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(0, 225, 235)),
-                                )
-                                .default_open(true)
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "Select or drag-and-drop binary .stl (3D mesh), .tif/.tiff (DEM elevation), and/or .png (surface texture). Sent as raw binary multipart/form-data (up to 512 MiB, zero Base64). Meshes > 50,000 triangles are automatically decimated & centered:",
-                                        )
-                                        .small(),
-                                    );
-
-                                    ui.add_space(4.0);
-                                    ui.horizontal_wrapped(|ui| {
-                                        if ui
-                                            .button("Browse .STL / .TIF / .PNG...")
-                                            .on_hover_text(
-                                                "Open browser file picker for .stl, .tif, .tiff, or .png",
-                                            )
-                                            .clicked()
-                                        {
-                                            open_browser_file_dialog(".stl,.tif,.tiff,.png");
-                                        }
-                                        if ui.small_button("+ .STL").clicked() {
-                                            open_browser_file_dialog(".stl");
-                                        }
-                                        if ui.small_button("+ .TIF/.TIFF").clicked() {
-                                            open_browser_file_dialog(".tif,.tiff");
-                                        }
-                                        if ui.small_button("+ .PNG").clicked() {
-                                            open_browser_file_dialog(".png");
-                                        }
-                                        if ui.small_button("Demo Crater .STL").clicked() {
-                                            app_state.upload_form.stage_synthetic_demo_stl();
-                                            app_state.status_message =
-                                                "Staged built-in synthetic crater .STL for TDA analysis."
-                                                    .to_string();
-                                        }
-                                        if ui.small_button("Clear Files").clicked() {
-                                            app_state.upload_form.clear_files();
-                                        }
-                                    });
-
-                                    ui.group(|ui| {
-                                        let stl_status = app_state
-                                            .upload_form
-                                            .stl_filename
-                                            .as_deref()
-                                            .map(|n| {
-                                                let mib = bytes_to_mib(
-                                                    app_state.upload_form.stl_size_bytes,
-                                                );
-                                                let tri_info = match app_state
-                                                    .upload_form
-                                                    .stl_detected_triangles
-                                                {
-                                                    Some(t) if t > MAX_TRIANGLES => {
-                                                        format!(
-                                                            " | {t} tris -> auto-decimates <= {MAX_TRIANGLES}"
-                                                        )
-                                                    }
-                                                    Some(t) => format!(" | {t} tris"),
-                                                    None => String::new(),
-                                                };
-                                                format!("{n} ({mib:.2} MiB{tri_info})")
-                                            })
-                                            .unwrap_or_else(|| {
-                                                "None (0.00 MiB — auto-generated if .tif provided)"
-                                                    .to_string()
-                                            });
-                                        let tiff_status = app_state
-                                            .upload_form
-                                            .tiff_filename
-                                            .as_deref()
-                                            .map(|n| {
-                                                let mib = bytes_to_mib(
-                                                    app_state.upload_form.tiff_size_bytes,
-                                                );
-                                                format!("{n} ({mib:.2} MiB)")
-                                            })
-                                            .unwrap_or_else(|| {
-                                                "None (0.00 MiB — auto-rasterized if .stl provided)"
-                                                    .to_string()
-                                            });
-                                        let png_status = app_state
-                                            .upload_form
-                                            .png_filename
-                                            .as_deref()
-                                            .map(|n| {
-                                                let mib = bytes_to_mib(
-                                                    app_state.upload_form.png_size_bytes,
-                                                );
-                                                format!("{n} ({mib:.2} MiB)")
-                                            })
-                                            .unwrap_or_else(|| {
-                                                "None (0.00 MiB — shaded hypsometric PNG auto-generated)"
-                                                    .to_string()
-                                            });
-
-                                        let total_mib = bytes_to_mib(
-                                            app_state.upload_form.total_staged_bytes(),
-                                        );
-
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "STL Mesh  : {stl_status}"
-                                            ))
-                                            .monospace()
-                                            .small(),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "DEM TIFF  : {tiff_status}"
-                                            ))
-                                            .monospace()
-                                            .small(),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "Albedo PNG: {png_status}"
-                                            ))
-                                            .monospace()
-                                            .small(),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(format!(
-                                                "Total Size: {total_mib:.2} MiB / 512.00 MiB (multipart/form-data)"
-                                            ))
-                                            .monospace()
-                                            .small(),
-                                        );
-                                    });
-
-                                    egui::Grid::new("upload_terrain_meta_grid")
-                                        .num_columns(2)
-                                        .spacing([8.0, 5.0])
-                                        .show(ui, |ui| {
-                                            ui.label("Site Name:");
-                                            ui.text_edit_singleline(
-                                                &mut app_state.upload_form.name,
-                                            );
-                                            ui.end_row();
-
-                                            ui.label("Site ID (optional):");
-                                            ui.text_edit_singleline(
-                                                &mut app_state.upload_form.id,
-                                            );
-                                            ui.end_row();
-
-                                            ui.label("Body Classification:");
-                                            ui.horizontal_wrapped(|ui| {
-                                                ui.selectable_value(
-                                                    &mut app_state.upload_form.body_override,
-                                                    None,
-                                                    "Auto-Propose (TDA)",
-                                                );
-                                                ui.selectable_value(
-                                                    &mut app_state.upload_form.body_override,
-                                                    Some(Body::Earth),
-                                                    "Earth",
-                                                );
-                                                ui.selectable_value(
-                                                    &mut app_state.upload_form.body_override,
-                                                    Some(Body::Moon),
-                                                    "Moon",
-                                                );
-                                                ui.selectable_value(
-                                                    &mut app_state.upload_form.body_override,
-                                                    Some(Body::Mars),
-                                                    "Mars",
-                                                );
-                                            });
-                                            ui.end_row();
-
-                                            ui.label("DemExtent X (m):");
-                                            ui.horizontal_wrapped(|ui| {
-                                                ui.add(
-                                                    egui::DragValue::new(
-                                                        &mut app_state.upload_form.min_x,
-                                                    )
-                                                    .prefix("min: "),
-                                                );
-                                                ui.add(
-                                                    egui::DragValue::new(
-                                                        &mut app_state.upload_form.max_x,
-                                                    )
-                                                    .prefix("max: "),
-                                                );
-                                            });
-                                            ui.end_row();
-
-                                            ui.label("DemExtent Y (m):");
-                                            ui.horizontal_wrapped(|ui| {
-                                                ui.add(
-                                                    egui::DragValue::new(
-                                                        &mut app_state.upload_form.min_y,
-                                                    )
-                                                    .prefix("min: "),
-                                                );
-                                                ui.add(
-                                                    egui::DragValue::new(
-                                                        &mut app_state.upload_form.max_y,
-                                                    )
-                                                    .prefix("max: "),
-                                                );
-                                            });
-                                            ui.end_row();
-                                        });
-
-                                    ui.add_space(6.0);
-                                    let can_analyze = app_state
-                                        .upload_form
-                                        .has_elevation_source()
-                                        && !app_state.upload_form.is_uploading;
-                                    let btn_w = (ui.available_width() - 12.0).clamp(220.0, 420.0);
-                                    let analyze_btn = egui::Button::new(
-                                        egui::RichText::new(
-                                            "Analyze & Propose Analog (POST /api/sites/upload)",
-                                        )
-                                        .strong()
-                                        .color(if can_analyze {
-                                            egui::Color32::from_rgb(10, 25, 30)
-                                        } else {
-                                            egui::Color32::from_gray(140)
-                                        }),
-                                    )
-                                    .fill(if can_analyze {
-                                        egui::Color32::from_rgb(0, 215, 180)
-                                    } else {
-                                        egui::Color32::from_gray(55)
-                                    })
-                                    .min_size(egui::Vec2::new(btn_w, 30.0));
-
-                                    if ui.add_enabled(can_analyze, analyze_btn).clicked() {
-                                        let total_mib = bytes_to_mib(
-                                            app_state.upload_form.total_staged_bytes(),
-                                        );
-                                        let req = app_state.upload_form.to_upload_request();
-                                        app_state.upload_form.is_uploading = true;
-                                        app_state.error_message = None;
-                                        app_state.status_message = format!(
-                                            "Uploading '{}' ({total_mib:.2} MiB binary multipart/form-data) & running TDA...",
-                                            req.site_name
-                                        );
-                                        net.upload_and_analyze_site(req);
-                                    }
-                                });
-
-                                if let Some(report) = app_state.last_analysis_report.clone() {
-                                    ui.add_space(6.0);
-                                    render_tda_report_panel(ui, &report);
-                                }
-
-                                ui.add_space(6.0);
-                                if ui
-                                    .button("Save Canonical Weights (PUT /api/weights)")
-                                    .clicked()
-                                {
-                                    net.save_canonical_weights(app_state.active_weights.clone());
-                                }
-
-                                ui.add_space(4.0);
-                                egui::CollapsingHeader::new(
-                                    "Manual Site Metadata Editor (POST /api/sites)",
-                                )
-                                .default_open(false)
-                                .show(ui, |ui| {
-                                    egui::Grid::new("site_editor_grid")
-                                        .num_columns(2)
-                                        .spacing([8.0, 5.0])
-                                        .show(ui, |ui| {
-                                            ui.label("Site ID:");
-                                            ui.text_edit_singleline(
-                                                &mut app_state.site_editor.id,
-                                            );
-                                            ui.end_row();
-
-                                            ui.label("Display Name:");
-                                            ui.text_edit_singleline(
-                                                &mut app_state.site_editor.name,
-                                            );
-                                            ui.end_row();
-
-                                            ui.label("Body:");
-                                            ui.horizontal_wrapped(|ui| {
-                                                ui.selectable_value(
-                                                    &mut app_state.site_editor.body,
-                                                    Body::Moon,
-                                                    "Moon",
-                                                );
-                                                ui.selectable_value(
-                                                    &mut app_state.site_editor.body,
-                                                    Body::Mars,
-                                                    "Mars",
-                                                );
-                                                ui.selectable_value(
-                                                    &mut app_state.site_editor.body,
-                                                    Body::Earth,
-                                                    "Earth",
-                                                );
-                                            });
-                                            ui.end_row();
-
-                                            ui.label("Description:");
-                                            ui.text_edit_singleline(
-                                                &mut app_state.site_editor.description,
-                                            );
-                                            ui.end_row();
-
-                                            ui.label("Mesh (.stl/.tif):");
-                                            ui.text_edit_singleline(
-                                                &mut app_state.site_editor.mesh_path,
-                                            );
-                                            ui.end_row();
-
-                                            ui.label("Texture (.png):");
-                                            ui.text_edit_singleline(
-                                                &mut app_state.site_editor.texture_path,
-                                            );
-                                            ui.end_row();
-
-                                            ui.label("Triangles (<=50k):");
-                                            ui.add(
-                                                egui::DragValue::new(
-                                                    &mut app_state.site_editor.triangle_count,
-                                                )
-                                                .range(1..=50_000),
-                                            );
-                                            ui.end_row();
-
-                                            ui.label("DemExtent X (m):");
-                                            ui.horizontal_wrapped(|ui| {
-                                                ui.add(
-                                                    egui::DragValue::new(
-                                                        &mut app_state.site_editor.min_x,
-                                                    )
-                                                    .prefix("min: "),
-                                                );
-                                                ui.add(
-                                                    egui::DragValue::new(
-                                                        &mut app_state.site_editor.max_x,
-                                                    )
-                                                    .prefix("max: "),
-                                                );
-                                            });
-                                            ui.end_row();
-
-                                            ui.label("DemExtent Y (m):");
-                                            ui.horizontal_wrapped(|ui| {
-                                                ui.add(
-                                                    egui::DragValue::new(
-                                                        &mut app_state.site_editor.min_y,
-                                                    )
-                                                    .prefix("min: "),
-                                                );
-                                                ui.add(
-                                                    egui::DragValue::new(
-                                                        &mut app_state.site_editor.max_y,
-                                                    )
-                                                    .prefix("max: "),
-                                                );
-                                            });
-                                            ui.end_row();
-                                        });
-
-                                    ui.label("Pre-normalized Feature Scores [0.0, 1.0]:");
-                                    let weight_keys: Vec<String> =
-                                        app_state.active_weights.keys().cloned().collect();
-                                    for k in weight_keys {
-                                        let score_entry = app_state
-                                            .site_editor
-                                            .feature_scores
-                                            .entry(k.clone())
-                                            .or_insert(0.5);
-                                        ui.horizontal_wrapped(|ui| {
-                                            ui.label(format!("  {k}:"));
-                                            ui.add(
-                                                egui::Slider::new(score_entry, 0.0..=1.0)
-                                                    .step_by(0.01),
-                                            );
-                                        });
-                                    }
-
-                                    if ui
-                                        .button("Save Site to Catalog (POST /api/sites)")
-                                        .clicked()
-                                    {
-                                        let meta = app_state.site_editor.into_site_metadata();
-                                        net.save_site(meta);
-                                    }
-                                });
-                            }
-                        }
-                    });
+            ui.add_space(6.0);
+            let can_upload =
+                app_state.upload_form.has_terrain_file() && !app_state.upload_form.is_uploading;
+            ui.add_enabled_ui(can_upload, |ui| {
+                let btn_label = if app_state.upload_form.is_uploading {
+                    "Uploading & Computing TDA..."
+                } else {
+                    "Analyze Terrain & Register in 3D Catalog (POST /api/sites/upload)"
+                };
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 32.0],
+                        egui::Button::new(
+                            egui::RichText::new(btn_label)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(22, 163, 74)),
+                    )
+                    .clicked()
+                {
+                    app_state.upload_form.is_uploading = true;
+                    app_state.status_message = format!(
+                        "Uploading {} via binary multipart/form-data & running TDA...",
+                        TerrainUploadForm::format_mib(total_bytes)
+                    );
+                    let req = app_state.upload_form.to_upload_request();
+                    net.upload_and_analyze_site(req);
+                }
             });
-    }
+        });
 
-    // 5. Measure uncovered 3D viewport rectangle
-    let screen_rect = ctx.screen_rect();
-    let viewport_rect = ctx.available_rect();
-    app_state.viewport_left_fraction = if app_state.panel_visible {
-        (viewport_rect.left() / screen_rect.width().max(1.0)).clamp(0.0, 0.75)
-    } else {
-        0.0
-    };
-
-    // 6. Optional Floating Similarity Charts Window (`[Charts]` button)
-    if app_state.charts_window_open {
-        let mut open = app_state.charts_window_open;
-        egui::Window::new("Planetary Analog Similarity Charts (Earth ↔ Moon/Mars)")
-            .open(&mut open)
-            .resizable(true)
-            .collapsible(true)
-            .default_width(470.0)
-            .default_pos(egui::pos2(
-                (viewport_rect.left() + 18.0).min(screen_rect.right() - 320.0),
-                viewport_rect.top() + 16.0,
+    if let Some(report) = &app_state.last_analysis_report {
+        ui.add_space(8.0);
+        egui::Frame::none()
+            .fill(COLOR_CARD_BG)
+            .inner_margin(egui::Margin::same(10.0))
+            .rounding(egui::Rounding::same(6.0))
+            .stroke(egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgb(56, 189, 248),
             ))
-            .show(ctx, |ui| {
-                egui::ScrollArea::both()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        render_similarity_charts_painter(ui, &app_state);
-                    });
-            });
-        app_state.charts_window_open = open;
-    }
-
-    // 7. Top-Right Live Planetary Telemetry HUD Card (collapsible)
-    if app_state.telemetry_visible
-        && let Some(primary) = app_state.primary_site().cloned()
-    {
-        let telem = compute_planetary_telemetry(&primary, &app_state.loaded_primary_summary);
-        let accent = body_accent_color(telem.body);
-
-        egui::Area::new(egui::Id::new("planetary_telemetry_hud"))
-            .pivot(egui::Align2::RIGHT_TOP)
-            .fixed_pos(egui::pos2(
-                viewport_rect.right() - 12.0,
-                viewport_rect.top() + 10.0,
-            ))
-            .order(egui::Order::Foreground)
-            .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgba_unmultiplied(11, 17, 26, 232))
-                    .stroke(egui::Stroke::new(1.3, accent))
-                    .rounding(egui::Rounding::same(7.0))
-                    .inner_margin(egui::Margin::symmetric(10.0, 7.0))
-                    .show(ui, |ui| {
-                        ui.set_max_width(355.0);
-                        ui.horizontal(|ui| {
-                            if ui
-                                .small_button(if app_state.telemetry_expanded {
-                                    "▼"
-                                } else {
-                                    "▶"
-                                })
-                                .on_hover_text("Collapse/Expand Planetary Telemetry Card")
-                                .clicked()
-                            {
-                                app_state.telemetry_expanded = !app_state.telemetry_expanded;
-                            }
-                            ui.colored_label(
-                                accent,
-                                egui::RichText::new(&telem.header_title).strong().small(),
-                            );
-                            if ui
-                                .small_button("×")
-                                .on_hover_text("Hide Telemetry Card (toggle via [Telemetry])")
-                                .clicked()
-                            {
-                                app_state.telemetry_visible = false;
-                            }
-                        });
-
-                        if app_state.telemetry_expanded {
-                            ui.separator();
-                            egui::Grid::new("planetary_telemetry_grid")
-                                .num_columns(2)
-                                .spacing([8.0, 3.0])
-                                .show(ui, |ui| {
-                                    ui.label(
-                                        egui::RichText::new("Active Site:")
-                                            .small()
-                                            .color(egui::Color32::from_gray(170)),
-                                    );
-                                    ui.colored_label(
-                                        accent,
-                                        egui::RichText::new(format!(
-                                            "{} ({})",
-                                            primary.name, primary.id
-                                        ))
-                                        .small()
-                                        .strong(),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label(
-                                        egui::RichText::new(&telem.clock_label)
-                                            .small()
-                                            .color(egui::Color32::from_gray(170)),
-                                    );
-                                    ui.monospace(egui::RichText::new(&telem.clock_value).small());
-                                    ui.end_row();
-
-                                    ui.label(
-                                        egui::RichText::new(&telem.ephemeris_label)
-                                            .small()
-                                            .color(egui::Color32::from_gray(170)),
-                                    );
-                                    ui.monospace(
-                                        egui::RichText::new(&telem.ephemeris_value).small(),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label(
-                                        egui::RichText::new(&telem.thermal_label)
-                                            .small()
-                                            .color(egui::Color32::from_gray(170)),
-                                    );
-                                    ui.monospace(egui::RichText::new(&telem.thermal_value).small());
-                                    ui.end_row();
-
-                                    ui.label(
-                                        egui::RichText::new(&telem.atmosphere_or_signal_label)
-                                            .small()
-                                            .color(egui::Color32::from_gray(170)),
-                                    );
-                                    ui.monospace(
-                                        egui::RichText::new(&telem.atmosphere_or_signal_value)
-                                            .small(),
-                                    );
-                                    ui.end_row();
-
-                                    ui.label(
-                                        egui::RichText::new("Surface Gravity:")
-                                            .small()
-                                            .color(egui::Color32::from_gray(170)),
-                                    );
-                                    ui.monospace(egui::RichText::new(&telem.gravity_value).small());
-                                    ui.end_row();
-                                });
-                        } else {
-                            ui.monospace(
-                                egui::RichText::new(format!(
-                                    "{} | {}",
-                                    primary.name, telem.clock_value
-                                ))
-                                .small(),
-                            );
-                        }
-                    });
-            });
-    }
-
-    // 8. Synchronized Split-Screen 3D Overlays (when `comparison_site_id.is_some()`)
-    if let (Some(primary), Some(compare)) = (
-        app_state.primary_site().cloned(),
-        app_state.comparison_site().cloned(),
-    ) {
-        let sim = app_state.compute_pairwise_similarity(&primary, &compare);
-        let mid_x = viewport_rect.center().x;
-        let left_center_x = 0.5 * (viewport_rect.left() + mid_x);
-        let right_center_x = 0.5 * (mid_x + viewport_rect.right());
-        let top_y = viewport_rect.top() + 12.0;
-
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Background,
-            egui::Id::new("split_screen_divider"),
-        ));
-        painter.line_segment(
-            [
-                egui::pos2(mid_x, viewport_rect.top()),
-                egui::pos2(mid_x, viewport_rect.bottom()),
-            ],
-            egui::Stroke::new(
-                1.5,
-                egui::Color32::from_rgba_unmultiplied(0, 215, 225, 115),
-            ),
-        );
-
-        // Left Half HUD Label: Primary Terrain
-        egui::Area::new(egui::Id::new("split_left_hud_badge"))
-            .pivot(egui::Align2::CENTER_TOP)
-            .fixed_pos(egui::pos2(left_center_x, top_y))
-            .order(egui::Order::Middle)
-            .interactable(false)
-            .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgba_unmultiplied(12, 18, 28, 220))
-                    .stroke(egui::Stroke::new(1.2, body_accent_color(primary.body)))
-                    .rounding(egui::Rounding::same(6.0))
-                    .inner_margin(egui::Margin::symmetric(10.0, 5.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.colored_label(
-                                body_accent_color(primary.body),
-                                egui::RichText::new(format!(
-                                    "[{}]",
-                                    primary.body.as_str().to_uppercase()
-                                ))
-                                .strong(),
-                            );
-                            ui.strong(&primary.name);
-                        });
-                        ui.monospace(format!(
-                            "Elev: [{:.1} m, {:.1} m] (Δz={:.1} m) | β₀={} basins | χ={}",
-                            sim.primary_summary.min_elevation_m,
-                            sim.primary_summary.max_elevation_m,
-                            (sim.primary_summary.max_elevation_m
-                                - sim.primary_summary.min_elevation_m)
-                                .abs(),
-                            sim.primary_summary.persistent_basins_b0,
-                            sim.primary_summary.euler_characteristic
-                        ));
-                    });
-            });
-
-        // Right Half HUD Label: Comparison Terrain
-        egui::Area::new(egui::Id::new("split_right_hud_badge"))
-            .pivot(egui::Align2::CENTER_TOP)
-            .fixed_pos(egui::pos2(right_center_x, top_y))
-            .order(egui::Order::Middle)
-            .interactable(false)
-            .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgba_unmultiplied(12, 18, 28, 220))
-                    .stroke(egui::Stroke::new(1.2, body_accent_color(compare.body)))
-                    .rounding(egui::Rounding::same(6.0))
-                    .inner_margin(egui::Margin::symmetric(10.0, 5.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.colored_label(
-                                body_accent_color(compare.body),
-                                egui::RichText::new(format!(
-                                    "[{}]",
-                                    compare.body.as_str().to_uppercase()
-                                ))
-                                .strong(),
-                            );
-                            ui.strong(&compare.name);
-                        });
-                        ui.monospace(format!(
-                            "Elev: [{:.1} m, {:.1} m] (Δz={:.1} m) | β₀={} basins | χ={}",
-                            sim.compare_summary.min_elevation_m,
-                            sim.compare_summary.max_elevation_m,
-                            (sim.compare_summary.max_elevation_m
-                                - sim.compare_summary.min_elevation_m)
-                                .abs(),
-                            sim.compare_summary.persistent_basins_b0,
-                            sim.compare_summary.euler_characteristic
-                        ));
-                    });
-            });
-
-        // Center Divider Similarity Pill
-        egui::Area::new(egui::Id::new("split_center_sim_badge"))
-            .pivot(egui::Align2::CENTER_BOTTOM)
-            .fixed_pos(egui::pos2(mid_x, viewport_rect.bottom() - 14.0))
-            .order(egui::Order::Middle)
-            .interactable(false)
-            .show(ctx, |ui| {
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgba_unmultiplied(14, 24, 34, 230))
-                    .stroke(egui::Stroke::new(
-                        1.2,
-                        egui::Color32::from_rgb(0, 215, 190),
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "TDA Proposal: {} Analog ({:.1}% | Closest: {} [{}], {:.1}%)",
+                        report.proposal.proposed_body.as_str().to_uppercase(),
+                        report.proposal.analog_score * 100.0,
+                        report.proposal.closest_site_name,
+                        report.proposal.closest_site_body.as_str().to_uppercase(),
+                        report.proposal.similarity_score * 100.0
                     ))
-                    .rounding(egui::Rounding::same(12.0))
-                    .inner_margin(egui::Margin::symmetric(12.0, 5.0))
-                    .show(ui, |ui| {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(80, 240, 190),
-                            egui::RichText::new(format!(
-                                "Synchronized Split-Screen | Analog Similarity: {:.1}% | Δβ₀={} | Δχ={}",
-                                sim.global_similarity_pct,
-                                sim.delta_basins_b0,
-                                sim.delta_euler_chi
-                            ))
-                            .strong()
-                            .small(),
-                        );
-                    });
+                    .strong()
+                    .color(egui::Color32::from_rgb(125, 211, 252)),
+                );
+                if report.original_triangle_count > report.simplified_triangle_count {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(250, 204, 21),
+                        format!(
+                            "Auto-simplified mesh: {} -> {} triangles (<= 50,000 budget)",
+                            report.original_triangle_count, report.simplified_triangle_count
+                        ),
+                    );
+                }
+                ui.monospace(format!(
+                    "Relief dz: {:.1}m | Slope mean: {:.2} deg | TRI: {:.2}m | HI: {:.3}",
+                    report.morphometry.elevation_range_m,
+                    report.morphometry.slope_mean_deg,
+                    report.morphometry.tri_mean_m,
+                    report.morphometry.hypsometric_integral
+                ));
+                ui.monospace(format!(
+                    "Euler chi: {} | b0 Basins: {} | b0 Peaks: {}",
+                    report.topology.euler_characteristic,
+                    report.topology.persistent_basins_b0,
+                    report.topology.persistent_peaks_b0
+                ));
+                ui.label(
+                    egui::RichText::new(&report.proposal.justification)
+                        .small()
+                        .color(COLOR_TEXT_SECONDARY),
+                );
             });
     }
+
+    ui.add_space(8.0);
+    egui::CollapsingHeader::new("Manual Site Metadata Editor (POST /api/sites)")
+        .default_open(false)
+        .show(ui, |ui| {
+            egui::Grid::new("site_editor_grid")
+                .num_columns(2)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Site ID:");
+                    ui.text_edit_singleline(&mut app_state.site_editor.id);
+                    ui.end_row();
+
+                    ui.label("Name:");
+                    ui.text_edit_singleline(&mut app_state.site_editor.name);
+                    ui.end_row();
+
+                    ui.label("Triangles (<=50k):");
+                    ui.add(
+                        egui::DragValue::new(&mut app_state.site_editor.triangle_count)
+                            .range(1..=50_000),
+                    );
+                    ui.end_row();
+
+                    ui.label("Mesh Path:");
+                    ui.text_edit_singleline(&mut app_state.site_editor.mesh_path);
+                    ui.end_row();
+
+                    ui.label("Texture Path:");
+                    ui.text_edit_singleline(&mut app_state.site_editor.texture_path);
+                    ui.end_row();
+                });
+
+            if ui.button("Save Site Metadata (POST /api/sites)").clicked() {
+                let metadata = app_state.site_editor.to_site_metadata();
+                net.save_site(metadata);
+            }
+        });
 }

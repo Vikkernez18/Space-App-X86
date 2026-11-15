@@ -35,6 +35,8 @@ pub struct OrbitCamera {
     pub max_radius: f32,
     /// When `true`, smoothly orbits the camera around the terrain while idle (`[Rotate]` / key `A`).
     pub auto_rotate: bool,
+    /// Angular speed in radians per second when `auto_rotate` is enabled.
+    pub auto_rotate_speed: f32,
 }
 
 impl Default for OrbitCamera {
@@ -57,6 +59,7 @@ impl Default for OrbitCamera {
             min_radius: (bounding_radius * 0.02).max(1.0),
             max_radius: (bounding_radius * 25.0).max(50_000.0),
             auto_rotate: false,
+            auto_rotate_speed: 0.25,
         }
     }
 }
@@ -177,7 +180,7 @@ pub fn orbit_camera_system(
         }
 
         if cam.auto_rotate && !user_dragging {
-            cam.target_yaw += 0.35 * dt;
+            cam.target_yaw += cam.auto_rotate_speed * dt;
         }
 
         if !keyboard_captured {

@@ -54,6 +54,10 @@ pub enum NetEvent {
     },
     Recalculated(RecalculateResponse),
     CanonicalWeightsSaved(Catalog),
+    CatalogReset {
+        catalog: Catalog,
+        restore_demo: bool,
+    },
     SiteSaved(SiteMetadata),
     SiteUploaded(UploadSiteResponse),
     SiteMeshBytesLoaded {
@@ -506,6 +510,41 @@ impl NetBridge {
                 Self::push_to_queue(
                     &queue,
                     NetEvent::Error(format!("Upload & terrain analysis request failed: {err}")),
+                );
+            }
+        });
+    }
+
+    /// Sends `POST /api/sites/reset` (authenticated researcher only) to clear all preloaded maps
+    /// from `catalog.json` (when `restore_demo == false`) or restore the reference `test_site`
+    /// (when `restore_demo == true`).
+    pub fn reset_catalog(&self, restore_demo: bool) {
+        let payload = serde_json::json!({ "restore_demo": restore_demo });
+        let body = serde_json::to_vec(&payload).unwrap_or_default();
+        let mut req = ehttp::Request::post(self.api_url("api/sites/reset"), body);
+        req.headers.insert("Content-Type", "application/json");
+        self.attach_auth(&mut req);
+
+        let queue = Arc::clone(&self.queue);
+        ehttp::fetch(req, move |result| match result {
+            Ok(resp) if resp.ok => {
+                if let Ok(cat) = serde_json::from_slice::<Catalog>(&resp.bytes) {
+                    Self::push_to_queue(
+                        &queue,
+                        NetEvent::CatalogReset {
+                            catalog: cat,
+                            restore_demo,
+                        },
+                    );
+                }
+            }
+            Ok(resp) => {
+                Self::push_to_queue(&queue, NetEvent::Error(Self::parse_api_error(&resp)));
+            }
+            Err(err) => {
+                Self::push_to_queue(
+                    &queue,
+                    NetEvent::Error(format!("Failed to reset workspace catalog: {err}")),
                 );
             }
         });

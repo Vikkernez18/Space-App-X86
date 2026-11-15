@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use analog_core::{Catalog, WeightsConfig};
+use analog_core::{Body, Catalog, DemExtent, SiteMetadata, WeightsConfig};
 
 use crate::auth::LoginRateLimiter;
 use crate::config::ServerConfig;
@@ -104,5 +104,42 @@ fn load_catalog_or_default(catalog_path: &Path, weights_path: &Path) -> Catalog 
         default_weights,
         sites: Vec::new(),
         generated_by: Some("analog_server (fallback default catalog)".to_string()),
+    }
+}
+
+/// Returns a reference catalog populated with the synthetic `test_site` UV verification terrain.
+pub fn default_synthetic_catalog() -> Catalog {
+    let mut default_weights = BTreeMap::new();
+    default_weights.insert("slope_safety".to_string(), 0.35);
+    default_weights.insert("roughness_similarity".to_string(), 0.25);
+    default_weights.insert("elevation_relief".to_string(), 0.20);
+    default_weights.insert("geomorphology_match".to_string(), 0.20);
+
+    let mut feature_scores = BTreeMap::new();
+    feature_scores.insert("slope_safety".to_string(), 0.85);
+    feature_scores.insert("roughness_similarity".to_string(), 0.90);
+    feature_scores.insert("elevation_relief".to_string(), 0.75);
+    feature_scores.insert("geomorphology_match".to_string(), 0.88);
+
+    Catalog {
+        version: "1.0.0".to_string(),
+        default_weights,
+        sites: vec![SiteMetadata {
+            id: "test_site".to_string(),
+            name: "Synthetic Crater & Ridge UV Verification Site".to_string(),
+            body: Body::Moon,
+            description: "Synthetic lunar crater and ridge terrain in Z-up meter coordinates used to verify DemExtent planar UV alignment against an 8x8 checkerboard texture.".to_string(),
+            center_lat_lon: Some([-89.5, 0.0]),
+            dem_extent: DemExtent::new(-1000.0, 1000.0, -1000.0, 1000.0),
+            elevation_range_m: Some([-45.0, 120.0]),
+            triangle_count: 8192,
+            mesh_path: "test_site/terrain.stl".to_string(),
+            mesh_format: None,
+            texture_path: "test_site/checkerboard.png".to_string(),
+            feature_scores,
+            canonical_score: 0.8485,
+            generated_by: Some("analog_server (default_synthetic_catalog)".to_string()),
+        }],
+        generated_by: Some("analog_server (default_synthetic_catalog)".to_string()),
     }
 }
