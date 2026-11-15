@@ -6,15 +6,20 @@
 //! 2. Homogeneous Startup Access Gate (`Space-App-X86 Access Gate` full-screen central panel
 //!    before entering Guest Demo Mode or logging in as an authenticated Researcher, with clean
 //!    return on `Log Out`).
-//! 3. Clean ASCII-only UI controls (no `□` missing-glyph boxes), full mouse + touchpad +
-//!    keyboard navigation (`H`, `A`, `C`, `R`, `Up`/`Down`, `+`/`-`), and 5 structured tabs:
-//!    - `1. Sites & Compare`
-//!    - `2. 3D & Camera`
-//!    - `3. Charts & Math` (custom `egui::Painter` charts + collapsible Mathematical Foundation)
-//!    - `4. Settlement Guide` (Lunar & Martian habitat engineering guide)
-//!    - `5. Upload & Reset` (512 MiB binary `multipart/form-data` upload, TDA report, and
-//!      Workspace Reset / Restore Reference Demo Site).
-//! 4. Live Planetary Telemetry HUD (`MOON`, `MARS`, `EARTH`) computed from real-time UTC clock.
+//! 3. Clean, progressive startup workspace where the 3D viewport is the protagonist:
+//!    - Floating windows (`Charts` and `Telemetry HUD`) and secondary `CollapsingHeader`s
+//!      start closed (`false`) by default.
+//!    - Quick action buttons (`[Charts]`, `[Rotate]`, `[Split]`, `[Telemetry]`, `[Reset Cam]`)
+//!      are integrated directly into the top `TopBottomPanel` bar.
+//!    - Tab `1. Sites & Compare` shows only essential controls upfront (`All / Moon / Mars / Earth`
+//!      body filter, `Primary Site`, `3D Skin`, and `[C] Compare Split-View`), keeping technical
+//!      metrics inside `CollapsingHeader::new("Detailed Similarity & TDA Breakdown").default_open(false)`.
+//! 4. 100% ASCII-safe mathematical equations in `3. Charts & Math` (zero `□` missing-glyph boxes)
+//!    rendered with `14.0_f32` Monospace typography, `10.5_f32` subscripts via `ui.horizontal`,
+//!    and horizontal fraction bars via `ui.separator()`.
+//! 5. Clean default 3D Surface Skin (`Lunar LOLA Hypsometric` or `Martian MOLA Relief` instead of
+//!    the black-and-white UV checkerboard on startup), with `7. UV Checkerboard Test` available
+//!    as an explicit skin option.
 
 use std::collections::BTreeMap;
 
@@ -43,6 +48,59 @@ const COLOR_CARD_BG: egui::Color32 = egui::Color32::from_rgb(15, 23, 42);
 const COLOR_PANEL_BG: egui::Color32 = egui::Color32::from_rgb(17, 24, 39);
 /// Subtle border stroke color (`#334155`).
 const COLOR_BORDER: egui::Color32 = egui::Color32::from_rgb(51, 65, 85);
+
+/// Returns an ASCII-safe display label for the active 3D surface skin (or Option 7 UV Checkerboard).
+fn skin_option_label(mode: SurfaceSkinMode, checkerboard_uv: bool) -> &'static str {
+    if checkerboard_uv {
+        "7. UV Checkerboard Test"
+    } else {
+        match mode {
+            SurfaceSkinMode::JmarsTexture => "1. JMARS / Albedo Texture",
+            SurfaceSkinMode::LunarLolaHypsometric => "2. Lunar LOLA Hypsometric",
+            SurfaceSkinMode::MartianMolaRelief => "3. Martian MOLA Relief",
+            SurfaceSkinMode::TerrestrialTopoAnalog => "4. Terrestrial Topo Analog",
+            SurfaceSkinMode::LandingSlopeHazard => "5. Landing Slope Hazard (<5 deg / 15 deg)",
+            SurfaceSkinMode::RawClayMesh => "6. Raw Clay Mesh (Untextured)",
+        }
+    }
+}
+
+/// Returns an ASCII-safe short label for compact buttons and top-bar selectors.
+fn skin_option_short_label(mode: SurfaceSkinMode, checkerboard_uv: bool) -> &'static str {
+    if checkerboard_uv {
+        "7. UV Checkerboard"
+    } else {
+        match mode {
+            SurfaceSkinMode::JmarsTexture => "1. JMARS Texture",
+            SurfaceSkinMode::LunarLolaHypsometric => "2. Lunar LOLA",
+            SurfaceSkinMode::MartianMolaRelief => "3. Mars MOLA",
+            SurfaceSkinMode::TerrestrialTopoAnalog => "4. Earth Topo",
+            SurfaceSkinMode::LandingSlopeHazard => "5. Slope <5/15 deg",
+            SurfaceSkinMode::RawClayMesh => "6. Raw Clay",
+        }
+    }
+}
+
+/// Determines the clean default [`SurfaceSkinMode`] for a site when loaded or selected:
+/// - If the site is `test_site` or does not have a custom uploaded `.png` texture, defaults to
+///   `MartianMolaRelief` for Mars or `LunarLolaHypsometric` for Moon/Earth (never the UV checkerboard).
+/// - If the site has a custom `.png` texture, defaults to `JmarsTexture`.
+fn default_clean_skin_for_site(site: &SiteMetadata) -> SurfaceSkinMode {
+    let tex = site.texture_path.trim().to_ascii_lowercase();
+    let has_custom_png = site.id != "test_site"
+        && !tex.is_empty()
+        && !tex.contains("checkerboard")
+        && tex.ends_with(".png");
+
+    if has_custom_png {
+        SurfaceSkinMode::JmarsTexture
+    } else {
+        match site.body {
+            Body::Mars => SurfaceSkinMode::MartianMolaRelief,
+            Body::Moon | Body::Earth => SurfaceSkinMode::LunarLolaHypsometric,
+        }
+    }
+}
 
 /// Editable form state for authenticated researchers to register or update a site in the catalog.
 #[derive(Debug, Clone)]
@@ -258,7 +316,9 @@ pub struct ViewerAppState {
     pub catalog: Catalog,
     pub active_weights: BTreeMap<String, f64>,
     pub ranked_scores: Vec<ScoredSite>,
+    pub body_filter: Option<Body>,
     pub primary_site_id: String,
+    pub last_auto_skin_site_id: String,
     pub comparison_site_id: Option<String>,
     pub vertical_exaggeration: f32,
     pub show_checkerboard_uv: bool,
@@ -307,10 +367,13 @@ impl Default for ViewerAppState {
             catalog,
             active_weights,
             ranked_scores: recalc.results,
+            body_filter: None,
             primary_site_id,
+            last_auto_skin_site_id: String::new(),
             comparison_site_id: None,
-            vertical_exaggeration: 1.5,
-            show_checkerboard_uv: true,
+            vertical_exaggeration: 1.5_f32,
+            // Start with clean hypsometric skin (never the black-and-white UV checkerboard)
+            show_checkerboard_uv: false,
             mode_selected: false,
             authenticated: false,
             researcher_username: None,
@@ -319,9 +382,10 @@ impl Default for ViewerAppState {
             show_login_modal: false,
             show_left_panel: true,
             hide_all_ui: false,
+            // Start with floating windows closed so the 3D viewport is the protagonist
             show_similarity_charts_window: false,
-            show_planetary_telemetry: true,
-            viewport_left_fraction: 0.28,
+            show_planetary_telemetry: false,
+            viewport_left_fraction: 0.28_f32,
             active_tab: PanelTab::SitesAndCompare,
             status_message:
                 "Select Guest Public Demo Mode or log in with Researcher credentials to begin."
@@ -329,8 +393,8 @@ impl Default for ViewerAppState {
             error_message: None,
             loaded_primary_triangles: 2048,
             loaded_comparison_triangles: 0,
-            loaded_primary_bounding_radius: 1414.2,
-            loaded_comparison_bounding_radius: 1414.2,
+            loaded_primary_bounding_radius: 1414.2_f32,
+            loaded_comparison_bounding_radius: 1414.2_f32,
             loaded_primary_summary: SiteMeshSummary::default(),
             loaded_comparison_summary: None,
             site_editor,
@@ -487,26 +551,27 @@ fn configure_legible_style(ctx: &egui::Context) {
         use egui::{FontFamily, FontId, TextStyle};
         style.text_styles.insert(
             TextStyle::Heading,
-            FontId::new(17.5, FontFamily::Proportional),
+            FontId::new(17.5_f32, FontFamily::Proportional),
         );
-        style
-            .text_styles
-            .insert(TextStyle::Body, FontId::new(13.5, FontFamily::Proportional));
+        style.text_styles.insert(
+            TextStyle::Body,
+            FontId::new(13.5_f32, FontFamily::Proportional),
+        );
         style.text_styles.insert(
             TextStyle::Button,
-            FontId::new(13.5, FontFamily::Proportional),
+            FontId::new(13.5_f32, FontFamily::Proportional),
         );
         style.text_styles.insert(
             TextStyle::Monospace,
-            FontId::new(13.0, FontFamily::Monospace),
+            FontId::new(13.0_f32, FontFamily::Monospace),
         );
         style.text_styles.insert(
             TextStyle::Small,
-            FontId::new(12.0, FontFamily::Proportional),
+            FontId::new(12.0_f32, FontFamily::Proportional),
         );
 
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        style.spacing.item_spacing = egui::vec2(8.0_f32, 6.0_f32);
+        style.spacing.button_padding = egui::vec2(10.0_f32, 5.0_f32);
         style.wrap_mode = Some(egui::TextWrapMode::Wrap);
 
         style.visuals.override_text_color = Some(COLOR_TEXT_PRIMARY);
@@ -515,14 +580,18 @@ fn configure_legible_style(ctx: &egui::Context) {
         style.visuals.extreme_bg_color = egui::Color32::from_rgb(9, 13, 22);
         style.visuals.widgets.noninteractive.bg_fill = COLOR_CARD_BG;
         style.visuals.widgets.noninteractive.fg_stroke =
-            egui::Stroke::new(1.0, COLOR_TEXT_PRIMARY);
-        style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, COLOR_BORDER);
+            egui::Stroke::new(1.0_f32, COLOR_TEXT_PRIMARY);
+        style.visuals.widgets.noninteractive.bg_stroke =
+            egui::Stroke::new(1.0_f32, COLOR_BORDER);
         style.visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(30, 41, 59);
-        style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, COLOR_TEXT_PRIMARY);
+        style.visuals.widgets.inactive.fg_stroke =
+            egui::Stroke::new(1.0_f32, COLOR_TEXT_PRIMARY);
         style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(51, 65, 85);
-        style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
+        style.visuals.widgets.hovered.fg_stroke =
+            egui::Stroke::new(1.5_f32, egui::Color32::WHITE);
         style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(37, 99, 235);
-        style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
+        style.visuals.widgets.active.fg_stroke =
+            egui::Stroke::new(1.5_f32, egui::Color32::WHITE);
     });
 }
 
@@ -550,6 +619,38 @@ fn format_hms(seconds_of_day: f64) -> String {
     format!("{hh:02}:{mm:02}:{ss:02}")
 }
 
+/// Renders a reusable 7-option 3D Surface Skin `ComboBox` (`1..6` scientific skins + `7. UV Checkerboard Test`).
+fn render_skin_combo_box(
+    ui: &mut egui::Ui,
+    id_source: &str,
+    width: f32,
+    skin_mode: &mut SurfaceSkinMode,
+    show_checkerboard_uv: &mut bool,
+) {
+    egui::ComboBox::from_id_source(id_source)
+        .selected_text(skin_option_label(*skin_mode, *show_checkerboard_uv))
+        .width(width)
+        .show_ui(ui, |ui| {
+            for candidate in SurfaceSkinMode::ALL {
+                let is_selected = !*show_checkerboard_uv && *skin_mode == candidate;
+                if ui
+                    .selectable_label(is_selected, skin_option_label(candidate, false))
+                    .clicked()
+                {
+                    *skin_mode = candidate;
+                    *show_checkerboard_uv = false;
+                }
+            }
+            ui.separator();
+            if ui
+                .selectable_label(*show_checkerboard_uv, "7. UV Checkerboard Test")
+                .clicked()
+            {
+                *show_checkerboard_uv = true;
+            }
+        });
+}
+
 /// Main `bevy_egui` rendering system.
 pub fn viewer_ui_system(
     mut contexts: EguiContexts,
@@ -563,6 +664,17 @@ pub fn viewer_ui_system(
     if !app_state.style_configured {
         configure_legible_style(ctx);
         app_state.style_configured = true;
+    }
+
+    // Automatically select a clean default skin (`Lunar LOLA Hypsometric` or `Martian MOLA Relief`)
+    // when starting up or switching to `test_site` / a site without a custom PNG texture.
+    if let Some(site) = app_state.primary_site().cloned()
+        && app_state.last_auto_skin_site_id != site.id
+    {
+        app_state.last_auto_skin_site_id = site.id.clone();
+        if !app_state.show_checkerboard_uv {
+            *skin_mode = default_clean_skin_for_site(&site);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -646,93 +758,213 @@ pub fn viewer_ui_system(
         .unwrap_or(false);
 
     // -------------------------------------------------------------------------
-    // Top Status & Session Bar (hidden only when `hide_all_ui` is active)
+    // Top Status & Integrated Quick-Action Bar (no floating box blocking 3D view)
     // -------------------------------------------------------------------------
-    if !app_state.hide_all_ui {
-        egui::TopBottomPanel::top("top_status_bar")
-            .frame(
-                egui::Frame::none()
-                    .fill(COLOR_CARD_BG)
-                    .inner_margin(egui::Margin::symmetric(12.0, 7.0))
-                    .stroke(egui::Stroke::new(1.0, COLOR_BORDER)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    let toggle_label = if app_state.show_left_panel {
-                        "[H] Hide Panel"
-                    } else {
-                        "[H] Show Panel"
-                    };
+    egui::TopBottomPanel::top("top_status_bar")
+        .frame(
+            egui::Frame::none()
+                .fill(COLOR_CARD_BG)
+                .inner_margin(egui::Margin::symmetric(10.0_f32, 6.0_f32))
+                .stroke(egui::Stroke::new(1.0_f32, COLOR_BORDER)),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if app_state.hide_all_ui {
                     if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(toggle_label)
-                                    .strong()
-                                    .color(egui::Color32::from_rgb(125, 211, 252)),
-                            )
-                            .fill(egui::Color32::from_rgb(30, 41, 59)),
+                        .button(
+                            egui::RichText::new("[H] Show UI")
+                                .strong()
+                                .color(egui::Color32::from_rgb(125, 211, 252)),
                         )
-                        .on_hover_text("Collapse or expand the left panel (Shortcut: H)")
                         .clicked()
                     {
-                        app_state.show_left_panel = !app_state.show_left_panel;
+                        app_state.hide_all_ui = false;
+                        app_state.show_left_panel = true;
                     }
+                    return;
+                }
 
-                    ui.separator();
-                    ui.label(
-                        egui::RichText::new("Space-App-X86")
-                            .strong()
-                            .color(COLOR_TEXT_PRIMARY),
-                    );
-                    ui.separator();
+                let toggle_label = if app_state.show_left_panel {
+                    "[H] Hide Panel"
+                } else {
+                    "[H] Show Panel"
+                };
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new(toggle_label)
+                                .strong()
+                                .color(egui::Color32::from_rgb(125, 211, 252)),
+                        )
+                        .fill(egui::Color32::from_rgb(30, 41, 59)),
+                    )
+                    .on_hover_text("Collapse or expand the left panel (Shortcut: H)")
+                    .clicked()
+                {
+                    app_state.show_left_panel = !app_state.show_left_panel;
+                }
 
-                    if app_state.authenticated {
-                        let user = app_state
-                            .researcher_username
-                            .as_deref()
-                            .unwrap_or("researcher");
-                        ui.label(
-                            egui::RichText::new(format!("[Researcher: {user}]"))
-                                .color(egui::Color32::from_rgb(74, 222, 128))
-                                .strong(),
-                        );
-                        if ui.button("Log Out").clicked() {
-                            net.logout();
-                            app_state.authenticated = false;
-                            app_state.researcher_username = None;
-                            app_state.mode_selected = false;
-                            app_state.status_message =
-                                "Logged out. Returned to Space-App-X86 Access Gate.".to_string();
-                        }
+                ui.separator();
+
+                // Integrated Quick Action Buttons: [Charts], [Rotate], [Split], [Telemetry], [Reset Cam]
+                let charts_label = if app_state.show_similarity_charts_window {
+                    "[Charts: ON]"
+                } else {
+                    "[Charts]"
+                };
+                if ui
+                    .button(egui::RichText::new(charts_label).color(
+                        if app_state.show_similarity_charts_window {
+                            egui::Color32::from_rgb(125, 211, 252)
+                        } else {
+                            COLOR_TEXT_PRIMARY
+                        },
+                    ))
+                    .on_hover_text("Toggle floating Similarity & Math Breakdown window")
+                    .clicked()
+                {
+                    app_state.show_similarity_charts_window =
+                        !app_state.show_similarity_charts_window;
+                }
+
+                let rot_label = if is_auto_rotating {
+                    "[Rotate: ON]"
+                } else {
+                    "[Rotate]"
+                };
+                if ui
+                    .button(egui::RichText::new(rot_label).color(if is_auto_rotating {
+                        egui::Color32::from_rgb(74, 222, 128)
                     } else {
-                        ui.label(
-                            egui::RichText::new("[Guest: Public Demo Mode]")
-                                .color(egui::Color32::from_rgb(96, 165, 250))
-                                .strong(),
-                        );
-                        if ui.button("Researcher Login").clicked() {
-                            app_state.show_login_modal = true;
+                        COLOR_TEXT_PRIMARY
+                    }))
+                    .on_hover_text("Toggle smooth orbital Auto-Rotate (Shortcut: A)")
+                    .clicked()
+                {
+                    for (mut cam, _) in &mut camera_query {
+                        cam.auto_rotate = !cam.auto_rotate;
+                    }
+                }
+
+                let split_on = app_state.comparison_site_id.is_some();
+                let split_label = if split_on { "[Split: ON]" } else { "[Split]" };
+                if ui
+                    .button(egui::RichText::new(split_label).color(if split_on {
+                        egui::Color32::from_rgb(250, 204, 21)
+                    } else {
+                        COLOR_TEXT_PRIMARY
+                    }))
+                    .on_hover_text("Toggle synchronized Split-Screen 3D comparison (Shortcut: C)")
+                    .clicked()
+                {
+                    if split_on {
+                        app_state.comparison_site_id = None;
+                    } else if let Some(partner) = app_state.best_analog_partner().cloned() {
+                        app_state.comparison_site_id = Some(partner.id.clone());
+                        net.fetch_site_assets(TerrainSlot::Comparison, &partner);
+                    }
+                }
+
+                let telem_label = if app_state.show_planetary_telemetry {
+                    "[Telemetry: ON]"
+                } else {
+                    "[Telemetry]"
+                };
+                if ui
+                    .button(egui::RichText::new(telem_label).color(
+                        if app_state.show_planetary_telemetry {
+                            egui::Color32::from_rgb(56, 189, 248)
+                        } else {
+                            COLOR_TEXT_PRIMARY
+                        },
+                    ))
+                    .on_hover_text("Show or hide real-time Planetary Telemetry HUD")
+                    .clicked()
+                {
+                    app_state.show_planetary_telemetry = !app_state.show_planetary_telemetry;
+                }
+
+                if ui
+                    .button("[Reset Cam]")
+                    .on_hover_text("Reset 3D camera to terrain center (Shortcut: R)")
+                    .clicked()
+                {
+                    let r = app_state.loaded_primary_bounding_radius;
+                    for (mut cam, mut proj) in &mut camera_query {
+                        cam.frame_terrain(Vec3::ZERO, r);
+                        cam.apply_perspective_clip_planes(&mut proj);
+                    }
+                }
+
+                egui::ComboBox::from_id_source("topbar_surface_skin_combo")
+                    .selected_text(format!(
+                        "Skin: {}",
+                        skin_option_short_label(*skin_mode, app_state.show_checkerboard_uv)
+                    ))
+                    .width(155.0_f32)
+                    .show_ui(ui, |ui| {
+                        for candidate in SurfaceSkinMode::ALL {
+                            let is_sel =
+                                !app_state.show_checkerboard_uv && *skin_mode == candidate;
+                            if ui
+                                .selectable_label(is_sel, skin_option_label(candidate, false))
+                                .clicked()
+                            {
+                                *skin_mode = candidate;
+                                app_state.show_checkerboard_uv = false;
+                            }
                         }
+                        ui.separator();
                         if ui
-                            .button("Access Gate")
-                            .on_hover_text("Return to the startup Access Gate screen")
+                            .selectable_label(
+                                app_state.show_checkerboard_uv,
+                                "7. UV Checkerboard Test",
+                            )
                             .clicked()
                         {
-                            app_state.mode_selected = false;
+                            app_state.show_checkerboard_uv = true;
                         }
-                    }
+                    });
 
-                    ui.separator();
+                ui.separator();
+
+                if app_state.authenticated {
+                    let user = app_state
+                        .researcher_username
+                        .as_deref()
+                        .unwrap_or("researcher");
                     ui.label(
-                        egui::RichText::new(
-                            "Keys: [H] Panel | [A] Auto-Rotate | [C] Split | [R] Center | [Up/Down] Site | [+/-] Zoom",
-                        )
-                        .small()
-                        .color(COLOR_TEXT_SECONDARY),
+                        egui::RichText::new(format!("[Researcher: {user}]"))
+                            .color(egui::Color32::from_rgb(74, 222, 128))
+                            .strong(),
                     );
-                });
+                    if ui.button("Log Out").clicked() {
+                        net.logout();
+                        app_state.authenticated = false;
+                        app_state.researcher_username = None;
+                        app_state.mode_selected = false;
+                        app_state.status_message =
+                            "Logged out. Returned to Space-App-X86 Access Gate.".to_string();
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new("[Guest: Demo]")
+                            .color(egui::Color32::from_rgb(96, 165, 250))
+                            .strong(),
+                    );
+                    if ui.button("Researcher Login").clicked() {
+                        app_state.show_login_modal = true;
+                    }
+                    if ui
+                        .button("Access Gate")
+                        .on_hover_text("Return to the startup Access Gate screen")
+                        .clicked()
+                    {
+                        app_state.mode_selected = false;
+                    }
+                }
             });
-    }
+        });
 
     // -------------------------------------------------------------------------
     // Resizable, Non-Clipping Left Explorer Panel (5 Homogeneous Tabs)
@@ -740,13 +972,13 @@ pub fn viewer_ui_system(
     if app_state.show_left_panel && !app_state.hide_all_ui {
         let panel_resp = egui::SidePanel::left("left_control_panel")
             .resizable(true)
-            .default_width(405.0)
-            .width_range(340.0..=680.0)
+            .default_width(395.0_f32)
+            .width_range(330.0_f32..=680.0_f32)
             .frame(
                 egui::Frame::none()
                     .fill(COLOR_PANEL_BG)
-                    .inner_margin(egui::Margin::symmetric(12.0, 10.0))
-                    .stroke(egui::Stroke::new(1.0, COLOR_BORDER)),
+                    .inner_margin(egui::Margin::symmetric(12.0_f32, 10.0_f32))
+                    .stroke(egui::Stroke::new(1.0_f32, COLOR_BORDER)),
             )
             .show(ctx, |ui| {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
@@ -754,10 +986,10 @@ pub fn viewer_ui_system(
                 if let Some(err) = app_state.error_message.clone() {
                     egui::Frame::none()
                         .fill(egui::Color32::from_rgb(69, 10, 10))
-                        .inner_margin(egui::Margin::same(8.0))
-                        .rounding(egui::Rounding::same(5.0))
+                        .inner_margin(egui::Margin::same(8.0_f32))
+                        .rounding(egui::Rounding::same(5.0_f32))
                         .stroke(egui::Stroke::new(
-                            1.0,
+                            1.0_f32,
                             egui::Color32::from_rgb(248, 113, 113),
                         ))
                         .show(ui, |ui| {
@@ -771,19 +1003,19 @@ pub fn viewer_ui_system(
                                 }
                             });
                         });
-                    ui.add_space(6.0);
+                    ui.add_space(6.0_f32);
                 }
 
                 // 5 Standardized Homogeneous Navigation Tabs (2 rows for zero horizontal clipping)
                 egui::Frame::none()
                     .fill(COLOR_CARD_BG)
-                    .inner_margin(egui::Margin::same(6.0))
-                    .rounding(egui::Rounding::same(6.0))
-                    .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+                    .inner_margin(egui::Margin::same(6.0_f32))
+                    .rounding(egui::Rounding::same(6.0_f32))
+                    .stroke(egui::Stroke::new(1.0_f32, COLOR_BORDER))
                     .show(ui, |ui| {
                         ui.columns(3, |cols| {
                             let t1 = cols[0].add_sized(
-                                [cols[0].available_width(), 28.0],
+                                [cols[0].available_width(), 28.0_f32],
                                 egui::SelectableLabel::new(
                                     app_state.active_tab == PanelTab::SitesAndCompare,
                                     "1. Sites & Compare",
@@ -794,7 +1026,7 @@ pub fn viewer_ui_system(
                             }
 
                             let t2 = cols[1].add_sized(
-                                [cols[1].available_width(), 28.0],
+                                [cols[1].available_width(), 28.0_f32],
                                 egui::SelectableLabel::new(
                                     app_state.active_tab == PanelTab::ViewAndCamera,
                                     "2. 3D & Camera",
@@ -805,7 +1037,7 @@ pub fn viewer_ui_system(
                             }
 
                             let t3 = cols[2].add_sized(
-                                [cols[2].available_width(), 28.0],
+                                [cols[2].available_width(), 28.0_f32],
                                 egui::SelectableLabel::new(
                                     app_state.active_tab == PanelTab::ChartsAndMath,
                                     "3. Charts & Math",
@@ -815,10 +1047,10 @@ pub fn viewer_ui_system(
                                 app_state.active_tab = PanelTab::ChartsAndMath;
                             }
                         });
-                        ui.add_space(4.0);
+                        ui.add_space(4.0_f32);
                         ui.columns(2, |cols| {
                             let t4 = cols[0].add_sized(
-                                [cols[0].available_width(), 28.0],
+                                [cols[0].available_width(), 28.0_f32],
                                 egui::SelectableLabel::new(
                                     app_state.active_tab == PanelTab::SettlementGuide,
                                     "4. Settlement Guide",
@@ -829,7 +1061,7 @@ pub fn viewer_ui_system(
                             }
 
                             let t5 = cols[1].add_sized(
-                                [cols[1].available_width(), 28.0],
+                                [cols[1].available_width(), 28.0_f32],
                                 egui::SelectableLabel::new(
                                     app_state.active_tab == PanelTab::UploadAndReset,
                                     "5. Upload & Reset",
@@ -841,7 +1073,7 @@ pub fn viewer_ui_system(
                         });
                     });
 
-                ui.add_space(6.0);
+                ui.add_space(6.0_f32);
                 ui.label(
                     egui::RichText::new(&app_state.status_message)
                         .small()
@@ -855,7 +1087,12 @@ pub fn viewer_ui_system(
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                         match app_state.active_tab {
                             PanelTab::SitesAndCompare => {
-                                render_tab_sites_and_compare(ui, &mut app_state, &net);
+                                render_tab_sites_and_compare(
+                                    ui,
+                                    &mut app_state,
+                                    &mut skin_mode,
+                                    &net,
+                                );
                             }
                             PanelTab::ViewAndCamera => {
                                 render_tab_view_and_camera(
@@ -878,203 +1115,39 @@ pub fn viewer_ui_system(
                     });
             });
 
-        let screen_w = ctx.screen_rect().width().max(1.0);
+        let screen_w = ctx.screen_rect().width().max(1.0_f32);
         app_state.viewport_left_fraction =
-            (panel_resp.response.rect.width() / screen_w).clamp(0.0, 0.70);
+            (panel_resp.response.rect.width() / screen_w).clamp(0.0_f32, 0.70_f32);
     } else {
-        app_state.viewport_left_fraction = 0.0;
+        app_state.viewport_left_fraction = 0.0_f32;
     }
 
-    // -------------------------------------------------------------------------
-    // Persistent Top-Left Floating Quick-Action Toolbar (Always Accessible)
-    // -------------------------------------------------------------------------
     let screen_rect = ctx.screen_rect();
     let left_offset = if app_state.show_left_panel && !app_state.hide_all_ui {
-        (screen_rect.width() * app_state.viewport_left_fraction + 14.0)
-            .min(screen_rect.width() - 280.0)
+        (screen_rect.width() * app_state.viewport_left_fraction + 14.0_f32)
+            .min(screen_rect.width() - 280.0_f32)
     } else {
-        14.0
+        14.0_f32
     };
-    let top_offset = if app_state.hide_all_ui { 14.0 } else { 46.0 };
-
-    egui::Window::new("quick_floating_toolbar")
-        .title_bar(false)
-        .resizable(false)
-        .fixed_pos(egui::pos2(left_offset.max(10.0), top_offset))
-        .frame(
-            egui::Frame::window(&ctx.style())
-                .fill(egui::Color32::from_rgba_unmultiplied(15, 23, 42, 238))
-                .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
-                .rounding(egui::Rounding::same(6.0))
-                .inner_margin(egui::Margin::symmetric(8.0, 6.0)),
-        )
-        .show(ctx, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                if app_state.hide_all_ui {
-                    if ui
-                        .button(
-                            egui::RichText::new("[H] Show UI")
-                                .strong()
-                                .color(egui::Color32::from_rgb(125, 211, 252)),
-                        )
-                        .clicked()
-                    {
-                        app_state.hide_all_ui = false;
-                        app_state.show_left_panel = true;
-                    }
-                    return;
-                }
-
-                let panel_btn = if app_state.show_left_panel {
-                    "[< Panel]"
-                } else {
-                    "[> Panel]"
-                };
-                if ui
-                    .button(egui::RichText::new(panel_btn).strong())
-                    .on_hover_text("Show or hide the left explorer panel (Key: H)")
-                    .clicked()
-                {
-                    app_state.show_left_panel = !app_state.show_left_panel;
-                }
-
-                let charts_label = if app_state.show_similarity_charts_window {
-                    "[Charts: ON]"
-                } else {
-                    "[Charts]"
-                };
-                if ui
-                    .button(
-                        egui::RichText::new(charts_label).color(
-                            if app_state.show_similarity_charts_window {
-                                egui::Color32::from_rgb(125, 211, 252)
-                            } else {
-                                COLOR_TEXT_PRIMARY
-                            },
-                        ),
-                    )
-                    .on_hover_text("Toggle floating Similarity & Math Breakdown window")
-                    .clicked()
-                {
-                    app_state.show_similarity_charts_window =
-                        !app_state.show_similarity_charts_window;
-                }
-
-                let rot_label = if is_auto_rotating {
-                    "[Rotate: ON]"
-                } else {
-                    "[Rotate: OFF]"
-                };
-                if ui
-                    .button(egui::RichText::new(rot_label).color(if is_auto_rotating {
-                        egui::Color32::from_rgb(74, 222, 128)
-                    } else {
-                        COLOR_TEXT_PRIMARY
-                    }))
-                    .on_hover_text("Toggle smooth orbital Auto-Rotate (Key: A)")
-                    .clicked()
-                {
-                    for (mut cam, _) in &mut camera_query {
-                        cam.auto_rotate = !cam.auto_rotate;
-                    }
-                }
-
-                let split_on = app_state.comparison_site_id.is_some();
-                let split_label = if split_on {
-                    "[Split: ON]"
-                } else {
-                    "[Split: OFF]"
-                };
-                if ui
-                    .button(egui::RichText::new(split_label).color(if split_on {
-                        egui::Color32::from_rgb(250, 204, 21)
-                    } else {
-                        COLOR_TEXT_PRIMARY
-                    }))
-                    .on_hover_text("Toggle synchronized Split-Screen 3D comparison (Key: C)")
-                    .clicked()
-                {
-                    if split_on {
-                        app_state.comparison_site_id = None;
-                    } else if let Some(partner) = app_state.best_analog_partner().cloned() {
-                        app_state.comparison_site_id = Some(partner.id.clone());
-                        net.fetch_site_assets(TerrainSlot::Comparison, &partner);
-                    }
-                }
-
-                let telem_label = if app_state.show_planetary_telemetry {
-                    "[Telemetry: ON]"
-                } else {
-                    "[Telemetry: OFF]"
-                };
-                if ui
-                    .button(egui::RichText::new(telem_label).color(
-                        if app_state.show_planetary_telemetry {
-                            egui::Color32::from_rgb(56, 189, 248)
-                        } else {
-                            COLOR_TEXT_PRIMARY
-                        },
-                    ))
-                    .on_hover_text("Show or hide real-time Planetary Telemetry HUD")
-                    .clicked()
-                {
-                    app_state.show_planetary_telemetry = !app_state.show_planetary_telemetry;
-                }
-
-                if ui
-                    .button("[Center 3D]")
-                    .on_hover_text("Reset 3D camera to terrain center (Key: R)")
-                    .clicked()
-                {
-                    let r = app_state.loaded_primary_bounding_radius;
-                    for (mut cam, mut proj) in &mut camera_query {
-                        cam.frame_terrain(Vec3::ZERO, r);
-                        cam.apply_perspective_clip_planes(&mut proj);
-                    }
-                }
-
-                egui::ComboBox::from_id_source("toolbar_surface_skin_combo")
-                    .selected_text(format!("Skin: {}", skin_mode.short_label()))
-                    .width(138.0_f32)
-                    .show_ui(ui, |ui| {
-                        for candidate in SurfaceSkinMode::ALL {
-                            if ui
-                                .selectable_label(*skin_mode == candidate, candidate.label())
-                                .clicked()
-                            {
-                                *skin_mode = candidate;
-                                app_state.show_checkerboard_uv = false;
-                            }
-                        }
-                    });
-
-                if ui
-                    .small_button("[Full 3D]")
-                    .on_hover_text("Hide all panels for clean full-screen 3D view (Key: H)")
-                    .clicked()
-                {
-                    app_state.hide_all_ui = true;
-                }
-            });
-        });
+    let top_offset = 46.0_f32;
 
     // -------------------------------------------------------------------------
-    // Live Planetary Telemetry HUD Card (Top-Right of 3D Viewport)
+    // Live Planetary Telemetry HUD Card (Top-Right of 3D Viewport, closed by default)
     // -------------------------------------------------------------------------
     if app_state.show_planetary_telemetry && !app_state.hide_all_ui {
         render_planetary_telemetry_hud(ctx, &mut app_state);
     }
 
     // -------------------------------------------------------------------------
-    // Floating Similarity Charts & Mathematical Foundation Window
+    // Floating Similarity Charts & Mathematical Foundation Window (closed by default)
     // -------------------------------------------------------------------------
     if app_state.show_similarity_charts_window && !app_state.hide_all_ui {
         let mut open = app_state.show_similarity_charts_window;
         egui::Window::new("Planetary Analog Similarity Charts & Mathematical Foundation")
             .open(&mut open)
             .resizable(true)
-            .default_width(510.0)
-            .default_pos(egui::pos2(left_offset.max(16.0), top_offset + 44.0))
+            .default_width(510.0_f32)
+            .default_pos(egui::pos2(left_offset.max(16.0_f32), top_offset + 12.0_f32))
             .show(ctx, |ui| {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                 render_similarity_charts_and_math(ui, &app_state);
@@ -1090,20 +1163,20 @@ pub fn viewer_ui_system(
         && let Some(prim_site) = app_state.primary_site().cloned()
     {
         let usable_left = screen_rect.width() * app_state.viewport_left_fraction;
-        let usable_w = (screen_rect.width() - usable_left).max(200.0);
-        let left_x = usable_left + usable_w * 0.22 - 135.0;
-        let right_x = usable_left + usable_w * 0.72 - 135.0;
-        let badge_y = screen_rect.height() - 86.0;
+        let usable_w = (screen_rect.width() - usable_left).max(200.0_f32);
+        let left_x = usable_left + usable_w * 0.22_f32 - 135.0_f32;
+        let right_x = usable_left + usable_w * 0.72_f32 - 135.0_f32;
+        let badge_y = screen_rect.height() - 86.0_f32;
 
         egui::Window::new("split_left_badge")
             .title_bar(false)
             .resizable(false)
-            .fixed_pos(egui::pos2(left_x.max(usable_left + 8.0), badge_y))
+            .fixed_pos(egui::pos2(left_x.max(usable_left + 8.0_f32), badge_y))
             .frame(
                 egui::Frame::window(&ctx.style())
                     .fill(egui::Color32::from_rgba_unmultiplied(15, 23, 42, 230))
                     .stroke(egui::Stroke::new(
-                        1.5,
+                        1.5_f32,
                         egui::Color32::from_rgb(56, 189, 248),
                     )),
             )
@@ -1132,12 +1205,12 @@ pub fn viewer_ui_system(
         egui::Window::new("split_right_badge")
             .title_bar(false)
             .resizable(false)
-            .fixed_pos(egui::pos2(right_x.max(usable_left + 180.0), badge_y))
+            .fixed_pos(egui::pos2(right_x.max(usable_left + 180.0_f32), badge_y))
             .frame(
                 egui::Frame::window(&ctx.style())
                     .fill(egui::Color32::from_rgba_unmultiplied(15, 23, 42, 230))
                     .stroke(egui::Stroke::new(
-                        1.5,
+                        1.5_f32,
                         egui::Color32::from_rgb(250, 204, 21),
                     )),
             )
@@ -1171,17 +1244,17 @@ pub fn viewer_ui_system(
         egui::Window::new("Researcher Authentication (Argon2id)")
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0_f32, 0.0_f32])
             .show(ctx, |ui| {
-                ui.set_width(370.0);
+                ui.set_width(370.0_f32);
                 ui.label(
                     "Authenticate with Researcher credentials to unlock 512 MiB binary terrain uploads (.stl, .tif/.tiff, .png), 0D Persistent Homology TDA, canonical weight persistence, and Workspace Reset.",
                 );
-                ui.add_space(8.0);
+                ui.add_space(8.0_f32);
 
                 egui::Grid::new("modal_login_grid")
                     .num_columns(2)
-                    .spacing([10.0, 8.0])
+                    .spacing([10.0_f32, 8.0_f32])
                     .show(ui, |ui| {
                         ui.label("Username:");
                         ui.text_edit_singleline(&mut app_state.login_username);
@@ -1205,7 +1278,7 @@ pub fn viewer_ui_system(
                         ui.end_row();
                     });
 
-                ui.add_space(10.0);
+                ui.add_space(10.0_f32);
                 ui.horizontal(|ui| {
                     if ui
                         .add(
@@ -1244,49 +1317,49 @@ fn render_access_gate_screen(
         .frame(
             egui::Frame::none()
                 .fill(egui::Color32::from_rgb(10, 15, 26))
-                .inner_margin(egui::Margin::same(24.0)),
+                .inner_margin(egui::Margin::same(24.0_f32)),
         )
         .show(ctx, |ui| {
             let avail_h = ui.available_height();
-            let top_pad = ((avail_h - 460.0) * 0.45).max(16.0);
+            let top_pad = ((avail_h - 460.0_f32) * 0.45_f32).max(16.0_f32);
             ui.add_space(top_pad);
 
             ui.vertical_centered(|ui| {
                 egui::Frame::none()
                     .fill(COLOR_CARD_BG)
                     .stroke(egui::Stroke::new(
-                        1.5,
+                        1.5_f32,
                         egui::Color32::from_rgb(56, 189, 248),
                     ))
-                    .rounding(egui::Rounding::same(10.0))
-                    .inner_margin(egui::Margin::symmetric(28.0, 24.0))
+                    .rounding(egui::Rounding::same(10.0_f32))
+                    .inner_margin(egui::Margin::symmetric(28.0_f32, 24.0_f32))
                     .show(ui, |ui| {
-                        ui.set_max_width(560.0);
+                        ui.set_max_width(560.0_f32);
                         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
 
                         ui.heading(
                             egui::RichText::new(
-                                "Space-App-X86 Access Gate — Planetary Analogs 3D Platform",
+                                "Space-App-X86 Access Gate - Planetary Analogs 3D Platform",
                             )
                             .color(egui::Color32::from_rgb(125, 211, 252))
                             .strong(),
                         );
-                        ui.add_space(6.0);
+                        ui.add_space(6.0_f32);
                         ui.label(
                             egui::RichText::new(
-                                "3D Morphometric & Topological Data Analysis (0D Persistent Homology b0 & Euler Characteristic chi) for Lunar South Pole (Artemis) and Martian Landing & Habitat Site Selection.",
+                                "3D Morphometric & Topological Data Analysis (0D Persistent Homology beta_0 & Euler Characteristic chi) for Lunar South Pole (Artemis) and Martian Landing & Habitat Site Selection.",
                             )
                             .color(COLOR_TEXT_SECONDARY),
                         );
 
                         if let Some(err) = app_state.error_message.clone() {
-                            ui.add_space(8.0);
+                            ui.add_space(8.0_f32);
                             egui::Frame::none()
                                 .fill(egui::Color32::from_rgb(69, 10, 10))
-                                .inner_margin(egui::Margin::same(8.0))
-                                .rounding(egui::Rounding::same(5.0))
+                                .inner_margin(egui::Margin::same(8.0_f32))
+                                .rounding(egui::Rounding::same(5.0_f32))
                                 .stroke(egui::Stroke::new(
-                                    1.0,
+                                    1.0_f32,
                                     egui::Color32::from_rgb(248, 113, 113),
                                 ))
                                 .show(ui, |ui| {
@@ -1297,13 +1370,13 @@ fn render_access_gate_screen(
                                 });
                         }
 
-                        ui.add_space(14.0);
+                        ui.add_space(14.0_f32);
                         ui.separator();
-                        ui.add_space(10.0);
+                        ui.add_space(10.0_f32);
 
                         // Option 1: Researcher Authentication Form
                         ui.label(
-                            egui::RichText::new("Option 1 — Authenticated Researcher Workspace")
+                            egui::RichText::new("Option 1 - Authenticated Researcher Workspace")
                                 .strong()
                                 .color(egui::Color32::from_rgb(74, 222, 128)),
                         );
@@ -1314,17 +1387,17 @@ fn render_access_gate_screen(
                             .small()
                             .color(COLOR_TEXT_SECONDARY),
                         );
-                        ui.add_space(6.0);
+                        ui.add_space(6.0_f32);
 
                         egui::Grid::new("access_gate_login_grid")
                             .num_columns(2)
-                            .spacing([12.0, 8.0])
+                            .spacing([12.0_f32, 8.0_f32])
                             .show(ui, |ui| {
                                 ui.label(
                                     egui::RichText::new("Username:").color(COLOR_TEXT_PRIMARY),
                                 );
                                 ui.add_sized(
-                                    [320.0, 28.0],
+                                    [320.0_f32, 28.0_f32],
                                     egui::TextEdit::singleline(&mut app_state.login_username),
                                 );
                                 ui.end_row();
@@ -1333,7 +1406,7 @@ fn render_access_gate_screen(
                                     egui::RichText::new("Password:").color(COLOR_TEXT_PRIMARY),
                                 );
                                 let pass_resp = ui.add_sized(
-                                    [320.0, 28.0],
+                                    [320.0_f32, 28.0_f32],
                                     egui::TextEdit::singleline(&mut app_state.login_password)
                                         .password(true),
                                 );
@@ -1350,10 +1423,10 @@ fn render_access_gate_screen(
                                 ui.end_row();
                             });
 
-                        ui.add_space(8.0);
+                        ui.add_space(8.0_f32);
                         if ui
                             .add_sized(
-                                [ui.available_width(), 34.0],
+                                [ui.available_width(), 34.0_f32],
                                 egui::Button::new(
                                     egui::RichText::new("Log in as Researcher (Argon2id)")
                                         .strong()
@@ -1371,28 +1444,28 @@ fn render_access_gate_screen(
                             app_state.login_password.clear();
                         }
 
-                        ui.add_space(14.0);
+                        ui.add_space(14.0_f32);
                         ui.separator();
-                        ui.add_space(10.0);
+                        ui.add_space(10.0_f32);
 
                         // Option 2: Guest Public Demo Mode
                         ui.label(
-                            egui::RichText::new("Option 2 — Guest / Judge Public Demo Mode")
+                            egui::RichText::new("Option 2 - Guest / Judge Public Demo Mode")
                                 .strong()
                                 .color(egui::Color32::from_rgb(125, 211, 252)),
                         );
                         ui.label(
                             egui::RichText::new(
-                                "Passwordless access to 3D planetary terrains, planar UV checkerboard verification, synchronized Split-Screen comparison, live Planetary Telemetry HUD, and custom weight simulations.",
+                                "Passwordless access to 3D planetary terrains, Lunar LOLA / Mars MOLA / Slope Hazard skins, synchronized Split-Screen comparison, and custom weight simulations.",
                             )
                             .small()
                             .color(COLOR_TEXT_SECONDARY),
                         );
-                        ui.add_space(8.0);
+                        ui.add_space(8.0_f32);
 
                         if ui
                             .add_sized(
-                                [ui.available_width(), 36.0],
+                                [ui.available_width(), 36.0_f32],
                                 egui::Button::new(
                                     egui::RichText::new("Enter as Guest (Public Demo Mode)")
                                         .strong()
@@ -1404,6 +1477,9 @@ fn render_access_gate_screen(
                         {
                             app_state.mode_selected = true;
                             app_state.error_message = None;
+                            app_state.show_similarity_charts_window = false;
+                            app_state.show_planetary_telemetry = false;
+                            app_state.show_checkerboard_uv = false;
                             net.fetch_demo_mode();
                         }
                     });
@@ -1423,26 +1499,29 @@ fn render_planetary_telemetry_hud(ctx: &egui::Context, app_state: &mut ViewerApp
         Body::Mars => [18.38, 77.58],
         Body::Earth => [19.47, -155.58],
     });
-    let elev_range = site.elevation_range_m.unwrap_or([-45.0, 120.0]);
-    let relief_m = (elev_range[1] - elev_range[0]).max(0.0);
+    let elev_range = site.elevation_range_m.unwrap_or([-45.0_f32, 120.0_f32]);
+    let relief_m = (elev_range[1] - elev_range[0]).max(0.0_f32);
 
     let screen_rect = ctx.screen_rect();
     egui::Window::new("planetary_telemetry_hud")
         .title_bar(false)
         .resizable(false)
-        .fixed_pos(egui::pos2((screen_rect.width() - 340.0).max(20.0), 46.0))
+        .fixed_pos(egui::pos2(
+            (screen_rect.width() - 340.0_f32).max(20.0_f32),
+            46.0_f32,
+        ))
         .frame(
             egui::Frame::window(&ctx.style())
                 .fill(egui::Color32::from_rgba_unmultiplied(11, 18, 31, 238))
                 .stroke(egui::Stroke::new(
-                    1.2,
+                    1.2_f32,
                     egui::Color32::from_rgb(56, 189, 248),
                 ))
-                .rounding(egui::Rounding::same(8.0))
-                .inner_margin(egui::Margin::symmetric(12.0, 10.0)),
+                .rounding(egui::Rounding::same(8.0_f32))
+                .inner_margin(egui::Margin::symmetric(12.0_f32, 10.0_f32)),
         )
         .show(ctx, |ui| {
-            ui.set_width(316.0);
+            ui.set_width(316.0_f32);
             ui.horizontal(|ui| {
                 let badge_color = match site.body {
                     Body::Moon => egui::Color32::from_rgb(148, 163, 184),
@@ -1499,7 +1578,7 @@ fn render_planetary_telemetry_hud(ctx: &egui::Context, app_state: &mut ViewerApp
 
                     egui::Grid::new("moon_telem_grid")
                         .num_columns(2)
-                        .spacing([8.0, 4.0])
+                        .spacing([8.0_f32, 4.0_f32])
                         .show(ui, |ui| {
                             ui.label(
                                 egui::RichText::new("Lunar Solar Time (LST):")
@@ -1539,7 +1618,7 @@ fn render_planetary_telemetry_hud(ctx: &egui::Context, app_state: &mut ViewerApp
                                     .color(COLOR_TEXT_SECONDARY),
                             );
                             ui.monospace(format!(
-                                "{lat_deg:.2} deg, {lon_deg:.2} deg | dz {relief_m:.0} m"
+                                "{lat_deg:.2} deg, {lon_deg:.2} deg | Delta_z {relief_m:.0} m"
                             ));
                             ui.end_row();
                         });
@@ -1560,7 +1639,7 @@ fn render_planetary_telemetry_hud(ctx: &egui::Context, app_state: &mut ViewerApp
 
                     egui::Grid::new("mars_telem_grid")
                         .num_columns(2)
-                        .spacing([8.0, 4.0])
+                        .spacing([8.0_f32, 4.0_f32])
                         .show(ui, |ui| {
                             ui.label(
                                 egui::RichText::new("Mars Sol & LMST:")
@@ -1600,7 +1679,7 @@ fn render_planetary_telemetry_hud(ctx: &egui::Context, app_state: &mut ViewerApp
                                     .color(COLOR_TEXT_SECONDARY),
                             );
                             ui.monospace(format!(
-                                "{lat_deg:.2} deg, {lon_deg:.2} deg | dz {relief_m:.0} m"
+                                "{lat_deg:.2} deg, {lon_deg:.2} deg | Delta_z {relief_m:.0} m"
                             ));
                             ui.end_row();
                         });
@@ -1611,14 +1690,16 @@ fn render_planetary_telemetry_hud(ctx: &egui::Context, app_state: &mut ViewerApp
                     let lst_hours = lst_secs / 3600.0;
                     let diurnal_wave =
                         (((lst_hours - 14.0) / 24.0 * std::f64::consts::TAU).cos()) as f32;
-                    let mean_elev_km = ((elev_range[0] + elev_range[1]) * 0.5 / 1000.0).max(0.0);
+                    let mean_elev_km =
+                        ((elev_range[0] + elev_range[1]) * 0.5_f32 / 1000.0_f32).max(0.0_f32);
                     let temp_c = 18.0_f32 - 6.5_f32 * mean_elev_km + 7.5_f32 * diurnal_wave;
-                    let pressure_hpa =
-                        1013.25_f32 * (1.0 - 0.0065 * mean_elev_km * 1000.0 / 288.15).powf(5.255);
+                    let pressure_hpa = 1013.25_f32
+                        * (1.0_f32 - 0.0065_f32 * mean_elev_km * 1000.0_f32 / 288.15_f32)
+                            .powf(5.255_f32);
 
                     egui::Grid::new("earth_telem_grid")
                         .num_columns(2)
-                        .spacing([8.0, 4.0])
+                        .spacing([8.0_f32, 4.0_f32])
                         .show(ui, |ui| {
                             ui.label(
                                 egui::RichText::new("UTC / Local Solar Time:")
@@ -1639,7 +1720,7 @@ fn render_planetary_telemetry_hud(ctx: &egui::Context, app_state: &mut ViewerApp
                             );
                             ui.monospace(format!(
                                 "{temp_c:.1} C ({:.0} K)",
-                                temp_c + 273.15
+                                temp_c + 273.15_f32
                             ));
                             ui.end_row();
 
@@ -1657,7 +1738,7 @@ fn render_planetary_telemetry_hud(ctx: &egui::Context, app_state: &mut ViewerApp
                                     .color(COLOR_TEXT_SECONDARY),
                             );
                             ui.monospace(format!(
-                                "{lat_deg:.2} deg, {lon_deg:.2} deg | dz {relief_m:.0} m"
+                                "{lat_deg:.2} deg, {lon_deg:.2} deg | Delta_z {relief_m:.0} m"
                             ));
                             ui.end_row();
                         });
@@ -1666,22 +1747,28 @@ fn render_planetary_telemetry_hud(ctx: &egui::Context, app_state: &mut ViewerApp
         });
 }
 
-/// Tab 1: Primary site selector, Side-by-Side Comparison selector, and Analog Similarity Card.
+/// Tab 1: Clean, progressive startup controls:
+/// - Body filter (`All / Moon / Mars / Earth`)
+/// - Primary Site selector (`Primary Site`)
+/// - Quick `3D Skin` selector (`1..7`)
+/// - `[C] Compare Split-View` toggle button
+/// - Detailed metrics and similarity breakdown inside `CollapsingHeader::new("Detailed Similarity & TDA Breakdown").default_open(false)`.
 fn render_tab_sites_and_compare(
     ui: &mut egui::Ui,
     app_state: &mut ViewerAppState,
+    skin_mode: &mut SurfaceSkinMode,
     net: &NetBridge,
 ) {
     ui.heading("1. Terrain Catalog & Split Comparison");
-    ui.add_space(4.0);
+    ui.add_space(4.0_f32);
 
     if app_state.catalog.sites.is_empty() {
         egui::Frame::none()
             .fill(COLOR_CARD_BG)
-            .inner_margin(egui::Margin::same(12.0))
-            .rounding(egui::Rounding::same(6.0))
+            .inner_margin(egui::Margin::same(12.0_f32))
+            .rounding(egui::Rounding::same(6.0_f32))
             .stroke(egui::Stroke::new(
-                1.0,
+                1.0_f32,
                 egui::Color32::from_rgb(250, 204, 21),
             ))
             .show(ui, |ui| {
@@ -1693,7 +1780,7 @@ fn render_tab_sites_and_compare(
                 ui.label(
                     "Open Tab '5. Upload & Reset' to upload your own .stl / .tif / .png planetary maps or click 'Restore Reference Demo Site'.",
                 );
-                ui.add_space(6.0);
+                ui.add_space(6.0_f32);
                 if ui.button("Go to 5. Upload & Reset").clicked() {
                     app_state.active_tab = PanelTab::UploadAndReset;
                 }
@@ -1701,307 +1788,386 @@ fn render_tab_sites_and_compare(
         return;
     }
 
-    let current_primary_id = app_state.primary_site_id.clone();
     let sites_snapshot = app_state.catalog.sites.clone();
 
-    ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new("Primary Site:").strong());
-        egui::ComboBox::from_id_source("primary_site_combo")
-            .selected_text(&current_primary_id)
-            .width(230.0)
-            .show_ui(ui, |ui| {
-                for site in &sites_snapshot {
-                    let label = format!(
-                        "{} ({} - {})",
-                        site.id,
-                        site.name,
-                        site.body.as_str().to_uppercase()
-                    );
-                    if ui
-                        .selectable_label(app_state.primary_site_id == site.id, label)
-                        .clicked()
-                    {
-                        app_state.primary_site_id = site.id.clone();
-                        app_state.site_editor = SiteEditorForm::from_site(site);
-                        net.fetch_site_assets(TerrainSlot::Primary, site);
+    // Essential Control 1: Planetary Body Filter (All / Moon / Mars / Earth)
+    egui::Frame::none()
+        .fill(COLOR_CARD_BG)
+        .inner_margin(egui::Margin::same(10.0_f32))
+        .rounding(egui::Rounding::same(6.0_f32))
+        .stroke(egui::Stroke::new(1.0_f32, COLOR_BORDER))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new("Planetary Body Filter:").strong());
+            ui.horizontal_wrapped(|ui| {
+                let filters: [(Option<Body>, &str); 4] = [
+                    (None, "All"),
+                    (Some(Body::Moon), "Moon"),
+                    (Some(Body::Mars), "Mars"),
+                    (Some(Body::Earth), "Earth"),
+                ];
+                for (filter_val, label) in filters {
+                    let selected = app_state.body_filter == filter_val;
+                    if ui.selectable_label(selected, label).clicked() {
+                        app_state.body_filter = filter_val;
+                        if let Some(body) = filter_val {
+                            let current_matches = app_state
+                                .primary_site()
+                                .map(|s| s.body == body)
+                                .unwrap_or(false);
+                            if !current_matches
+                                && let Some(first_match) =
+                                    sites_snapshot.iter().find(|s| s.body == body)
+                            {
+                                app_state.primary_site_id = first_match.id.clone();
+                                app_state.site_editor = SiteEditorForm::from_site(first_match);
+                                net.fetch_site_assets(TerrainSlot::Primary, first_match);
+                            }
+                        }
                     }
                 }
             });
-    });
 
-    // Keyboard-friendly Previous / Next site buttons
-    if sites_snapshot.len() > 1 {
-        ui.horizontal_wrapped(|ui| {
-            let curr_idx = sites_snapshot
+            ui.add_space(6.0_f32);
+
+            // Essential Control 2: Primary Site Selector
+            let filtered_sites: Vec<SiteMetadata> = sites_snapshot
                 .iter()
-                .position(|s| s.id == app_state.primary_site_id)
-                .unwrap_or(0);
-            if ui
-                .button("< Prev Site [Up]")
-                .on_hover_text("Select previous site in catalog (ArrowUp)")
-                .clicked()
-            {
-                let prev = &sites_snapshot[(curr_idx + sites_snapshot.len() - 1) % sites_snapshot.len()];
-                app_state.primary_site_id = prev.id.clone();
-                app_state.site_editor = SiteEditorForm::from_site(prev);
-                net.fetch_site_assets(TerrainSlot::Primary, prev);
-            }
-            if ui
-                .button("Next Site [Down] >")
-                .on_hover_text("Select next site in catalog (ArrowDown)")
-                .clicked()
-            {
-                let next = &sites_snapshot[(curr_idx + 1) % sites_snapshot.len()];
-                app_state.primary_site_id = next.id.clone();
-                app_state.site_editor = SiteEditorForm::from_site(next);
-                net.fetch_site_assets(TerrainSlot::Primary, next);
-            }
-        });
-    }
+                .filter(|s| app_state.body_filter.map_or(true, |b| s.body == b))
+                .cloned()
+                .collect();
+            let list_for_combo = if filtered_sites.is_empty() {
+                &sites_snapshot
+            } else {
+                &filtered_sites
+            };
 
-    ui.add_space(4.0);
+            let current_primary_label = app_state
+                .primary_site()
+                .map(|s| format!("{} [{}]", s.name, s.body.as_str().to_uppercase()))
+                .unwrap_or_else(|| app_state.primary_site_id.clone());
 
-    let comp_text = app_state
-        .comparison_site_id
-        .clone()
-        .unwrap_or_else(|| "None (Single View)".to_string());
-    ui.horizontal_wrapped(|ui| {
-        ui.label(egui::RichText::new("Compare With:").strong());
-        egui::ComboBox::from_id_source("comparison_site_combo")
-            .selected_text(comp_text)
-            .width(230.0)
-            .show_ui(ui, |ui| {
-                if ui
-                    .selectable_label(
-                        app_state.comparison_site_id.is_none(),
-                        "None (Single View)",
-                    )
-                    .clicked()
-                {
-                    app_state.comparison_site_id = None;
-                }
-                for site in &sites_snapshot {
-                    let label = format!(
-                        "{} ({} - {})",
-                        site.id,
-                        site.name,
-                        site.body.as_str().to_uppercase()
-                    );
-                    let is_selected =
-                        app_state.comparison_site_id.as_deref() == Some(site.id.as_str());
-                    if ui.selectable_label(is_selected, label).clicked() {
-                        app_state.comparison_site_id = Some(site.id.clone());
-                        net.fetch_site_assets(TerrainSlot::Comparison, site);
-                    }
-                }
-            });
-    });
-
-    if let Some(site) = app_state.primary_site().cloned() {
-        ui.add_space(6.0);
-        egui::Frame::none()
-            .fill(COLOR_CARD_BG)
-            .inner_margin(egui::Margin::same(10.0))
-            .rounding(egui::Rounding::same(6.0))
-            .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} [{}]",
-                        site.name,
-                        site.body.as_str().to_uppercase()
-                    ))
-                    .strong()
-                    .color(egui::Color32::from_rgb(125, 211, 252)),
-                );
-                ui.label(
-                    egui::RichText::new(&site.description)
-                        .small()
-                        .color(COLOR_TEXT_SECONDARY),
-                );
-                ui.add_space(4.0);
-                let s = &app_state.loaded_primary_summary;
-                let relief_dz = (s.max_elevation_m - s.min_elevation_m).max(0.0);
-                ui.monospace(format!(
-                    "Extent: {:.1}m × {:.1}m | Relief Δz: {:.1}m | β₀ basins: {} | χ: {} | {} tris",
-                    site.dem_extent.width(),
-                    site.dem_extent.height(),
-                    relief_dz,
-                    s.persistent_basins_b0,
-                    s.euler_characteristic,
-                    app_state.loaded_primary_triangles
-                ));
-                ui.monospace(format!(
-                    "Landing Safety: <15° Safe = {:.1}% | <5° Optimal Pad = {:.1}% | Mean θ = {:.1}°",
-                    s.safe_landing_pct_under_15deg,
-                    s.optimal_pad_pct_under_5deg,
-                    s.mean_slope_deg
-                ));
-            });
-    }
-
-    // -------------------------------------------------------------------------
-    // Highlighted Card: Planetary Analog Similarity Breakdown (Earth <-> Moon/Mars)
-    // -------------------------------------------------------------------------
-    if let Some(sim) = app_state.build_pairwise_similarity() {
-        ui.add_space(8.0);
-        egui::Frame::none()
-            .fill(COLOR_CARD_BG)
-            .inner_margin(egui::Margin::same(10.0))
-            .rounding(egui::Rounding::same(6.0))
-            .stroke(egui::Stroke::new(
-                1.5,
-                egui::Color32::from_rgb(56, 189, 248),
-            ))
-            .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Planetary Analog Similarity Breakdown (Earth ↔ Moon/Mars)",
-                    )
-                    .strong()
-                    .color(egui::Color32::from_rgb(125, 211, 252)),
-                );
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} [{}]  ↔  {} [{}]",
-                        sim.primary_name,
-                        sim.primary_body.as_str().to_uppercase(),
-                        sim.compare_name,
-                        sim.compare_body.as_str().to_uppercase()
-                    ))
-                    .small()
-                    .strong()
-                    .color(COLOR_TEXT_PRIMARY),
-                );
-
-                ui.add_space(4.0);
-                let overall_frac = (sim.overall_similarity_pct / 100.0).clamp(0.0, 1.0) as f32;
-                ui.add(
-                    egui::ProgressBar::new(overall_frac)
-                        .text(format!(
-                            "Global Morphometric & TDA Similarity: {:.1}%",
-                            sim.overall_similarity_pct
-                        ))
-                        .fill(egui::Color32::from_rgb(37, 99, 235)),
-                );
-
-                ui.add_space(6.0);
-                for (dim_label, va, vb, sim_pct) in &sim.dimensions {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new(dim_label).small().strong());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.monospace(format!(
-                                "{sim_pct:.0}% ({va:.2} vs {vb:.2})"
-                            ));
-                        });
-                    });
-                    ui.add(
-                        egui::ProgressBar::new((*sim_pct / 100.0) as f32)
-                            .desired_height(6.0)
-                            .fill(egui::Color32::from_rgb(16, 185, 129)),
-                    );
-                }
-
-                if sim.delta_b0_basins.is_some() || sim.delta_euler_chi.is_some() {
-                    ui.add_space(4.0);
-                    ui.monospace(format!(
-                        "TDA Invariants: Δβ₀ basins = {} | Δχ Euler = {}",
-                        sim.delta_b0_basins
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "n/a".to_string()),
-                        sim.delta_euler_chi
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "n/a".to_string()),
-                    ));
-                }
-
-                // Mission Engineering Indicator: Landing Safety & Cold-Trap Proxy Comparison
-                ui.add_space(6.0);
-                egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(9, 14, 24))
-                    .inner_margin(egui::Margin::same(8.0))
-                    .rounding(egui::Rounding::same(5.0))
-                    .stroke(egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgb(34, 197, 94),
-                    ))
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                "Mission Engineering: Landing Safety & Cold-Trap Proxy",
-                            )
-                            .small()
-                            .strong()
-                            .color(egui::Color32::from_rgb(74, 222, 128)),
-                        );
-                        ui.monospace(format!(
-                            "Safe Landing (< 15°): {:.1}% ({})  ↔  {:.1}% ({})",
-                            sim.primary_safe_landing_15_pct,
-                            sim.primary_body.as_str().to_uppercase(),
-                            sim.compare_safe_landing_15_pct,
-                            sim.compare_body.as_str().to_uppercase(),
-                        ));
-                        ui.monospace(format!(
-                            "Optimal Pad  (<  5°): {:.1}% (θ̄ {:.1}°) ↔  {:.1}% (θ̄ {:.1}°)",
-                            sim.primary_optimal_pad_5_pct,
-                            sim.primary_mean_slope_deg,
-                            sim.compare_optimal_pad_5_pct,
-                            sim.compare_mean_slope_deg,
-                        ));
-                        ui.monospace(format!(
-                            "Cold-Trap / Shielding Basins (β₀): {}  ↔  {}",
-                            sim.primary_b0_basins, sim.compare_b0_basins
-                        ));
-                        ui.label(
-                            egui::RichText::new(
-                                "Artemis Lunar South Pole & Martian Habitat Utility: Quantifies rollover-safe lander touchdown zones (< 15°), level pressurized habitat foundations (< 5°), and β₀ depression cold-trap / radiation-shielding basins.",
-                            )
-                            .small()
-                            .color(COLOR_TEXT_SECONDARY),
-                        );
-                    });
-
-                ui.add_space(6.0);
-                let split_active =
-                    app_state.comparison_site_id.as_deref() == Some(sim.compare_id.as_str());
-                ui.horizontal_wrapped(|ui| {
-                    if split_active {
-                        if ui.button("Exit Split-Screen [C]").clicked() {
-                            app_state.comparison_site_id = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Primary Site:").strong());
+                egui::ComboBox::from_id_source("primary_site_combo")
+                    .selected_text(current_primary_label)
+                    .width(235.0_f32)
+                    .show_ui(ui, |ui| {
+                        for site in list_for_combo {
+                            let label = format!(
+                                "{} ({} - {})",
+                                site.id,
+                                site.name,
+                                site.body.as_str().to_uppercase()
+                            );
+                            if ui
+                                .selectable_label(app_state.primary_site_id == site.id, label)
+                                .clicked()
+                            {
+                                app_state.primary_site_id = site.id.clone();
+                                app_state.site_editor = SiteEditorForm::from_site(site);
+                                net.fetch_site_assets(TerrainSlot::Primary, site);
+                            }
                         }
-                    } else if ui
-                        .button(
-                            egui::RichText::new(format!(
-                                "Split-Screen 3D Compare with '{}' [C]",
-                                sim.compare_name
-                            ))
-                            .strong()
-                            .color(egui::Color32::from_rgb(253, 224, 71)),
-                        )
+                    });
+            });
+
+            if list_for_combo.len() > 1 {
+                ui.horizontal_wrapped(|ui| {
+                    let curr_idx = list_for_combo
+                        .iter()
+                        .position(|s| s.id == app_state.primary_site_id)
+                        .unwrap_or(0);
+                    if ui
+                        .small_button("< Prev Site [Up]")
+                        .on_hover_text("Select previous site in catalog (ArrowUp)")
                         .clicked()
                     {
-                        if let Some(partner) = app_state
-                            .catalog
-                            .sites
-                            .iter()
-                            .find(|s| s.id == sim.compare_id)
-                            .cloned()
-                        {
-                            app_state.comparison_site_id = Some(partner.id.clone());
-                            net.fetch_site_assets(TerrainSlot::Comparison, &partner);
-                        }
+                        let prev = &list_for_combo
+                            [(curr_idx + list_for_combo.len() - 1) % list_for_combo.len()];
+                        app_state.primary_site_id = prev.id.clone();
+                        app_state.site_editor = SiteEditorForm::from_site(prev);
+                        net.fetch_site_assets(TerrainSlot::Primary, prev);
                     }
-
-                    if ui.button("Open Charts & Math").clicked() {
-                        app_state.active_tab = PanelTab::ChartsAndMath;
+                    if ui
+                        .small_button("Next Site [Down] >")
+                        .on_hover_text("Select next site in catalog (ArrowDown)")
+                        .clicked()
+                    {
+                        let next = &list_for_combo[(curr_idx + 1) % list_for_combo.len()];
+                        app_state.primary_site_id = next.id.clone();
+                        app_state.site_editor = SiteEditorForm::from_site(next);
+                        net.fetch_site_assets(TerrainSlot::Primary, next);
                     }
                 });
+            }
+
+            ui.add_space(6.0_f32);
+
+            // Essential Control 3: Quick 3D Skin Selector
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("3D Skin:").strong());
+                render_skin_combo_box(
+                    ui,
+                    "tab1_surface_skin_combo",
+                    235.0_f32,
+                    skin_mode,
+                    &mut app_state.show_checkerboard_uv,
+                );
             });
-    }
+
+            ui.add_space(8.0_f32);
+
+            // Essential Control 4: [C] Compare Split-View Button
+            let split_active = app_state.comparison_site_id.is_some();
+            let split_btn_text = if split_active {
+                "[C] Exit Compare Split-View"
+            } else {
+                "[C] Compare Split-View (Side-by-Side 3D)"
+            };
+            let split_btn_color = if split_active {
+                egui::Color32::from_rgb(185, 28, 28)
+            } else {
+                egui::Color32::from_rgb(37, 99, 235)
+            };
+            if ui
+                .add_sized(
+                    [ui.available_width(), 32.0_f32],
+                    egui::Button::new(
+                        egui::RichText::new(split_btn_text)
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(split_btn_color),
+                )
+                .clicked()
+            {
+                if split_active {
+                    app_state.comparison_site_id = None;
+                } else if let Some(partner) = app_state.best_analog_partner().cloned() {
+                    app_state.comparison_site_id = Some(partner.id.clone());
+                    net.fetch_site_assets(TerrainSlot::Comparison, &partner);
+                }
+            }
+
+            if split_active || sites_snapshot.len() > 1 {
+                ui.add_space(4.0_f32);
+                let comp_text = app_state
+                    .comparison_site_id
+                    .clone()
+                    .unwrap_or_else(|| "None (Single View)".to_string());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Compare Partner:").small());
+                    egui::ComboBox::from_id_source("comparison_site_combo")
+                        .selected_text(comp_text)
+                        .width(220.0_f32)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(
+                                    app_state.comparison_site_id.is_none(),
+                                    "None (Single View)",
+                                )
+                                .clicked()
+                            {
+                                app_state.comparison_site_id = None;
+                            }
+                            for site in &sites_snapshot {
+                                let label = format!(
+                                    "{} ({} - {})",
+                                    site.id,
+                                    site.name,
+                                    site.body.as_str().to_uppercase()
+                                );
+                                let is_selected = app_state.comparison_site_id.as_deref()
+                                    == Some(site.id.as_str());
+                                if ui.selectable_label(is_selected, label).clicked() {
+                                    app_state.comparison_site_id = Some(site.id.clone());
+                                    net.fetch_site_assets(TerrainSlot::Comparison, site);
+                                }
+                            }
+                        });
+                });
+            }
+        });
+
+    ui.add_space(8.0_f32);
+
+    // -------------------------------------------------------------------------
+    // Progressive Disclosure: Detailed Similarity & TDA Breakdown (closed by default)
+    // -------------------------------------------------------------------------
+    egui::CollapsingHeader::new(
+        egui::RichText::new("Detailed Similarity & TDA Breakdown")
+            .strong()
+            .color(egui::Color32::from_rgb(125, 211, 252)),
+    )
+    .default_open(false)
+    .show(ui, |ui| {
+        if let Some(site) = app_state.primary_site().cloned() {
+            egui::Frame::none()
+                .fill(COLOR_CARD_BG)
+                .inner_margin(egui::Margin::same(10.0_f32))
+                .rounding(egui::Rounding::same(6.0_f32))
+                .stroke(egui::Stroke::new(1.0_f32, COLOR_BORDER))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} [{}]",
+                            site.name,
+                            site.body.as_str().to_uppercase()
+                        ))
+                        .strong()
+                        .color(egui::Color32::from_rgb(125, 211, 252)),
+                    );
+                    ui.label(
+                        egui::RichText::new(&site.description)
+                            .small()
+                            .color(COLOR_TEXT_SECONDARY),
+                    );
+                    ui.add_space(4.0_f32);
+                    let s = &app_state.loaded_primary_summary;
+                    let relief_dz = (s.max_elevation_m - s.min_elevation_m).max(0.0_f32);
+                    ui.monospace(format!(
+                        "Extent: {:.1}m x {:.1}m | Relief Delta_z: {:.1}m | beta_0 basins: {} | chi: {} | {} tris",
+                        site.dem_extent.width(),
+                        site.dem_extent.height(),
+                        relief_dz,
+                        s.persistent_basins_b0,
+                        s.euler_characteristic,
+                        app_state.loaded_primary_triangles
+                    ));
+                    ui.monospace(format!(
+                        "Landing Safety: <15 deg Safe = {:.1}% | <5 deg Optimal Pad = {:.1}% | Mean theta = {:.1} deg",
+                        s.safe_landing_pct_under_15deg,
+                        s.optimal_pad_pct_under_5deg,
+                        s.mean_slope_deg
+                    ));
+                });
+        }
+
+        if let Some(sim) = app_state.build_pairwise_similarity() {
+            ui.add_space(6.0_f32);
+            egui::Frame::none()
+                .fill(COLOR_CARD_BG)
+                .inner_margin(egui::Margin::same(10.0_f32))
+                .rounding(egui::Rounding::same(6.0_f32))
+                .stroke(egui::Stroke::new(
+                    1.5_f32,
+                    egui::Color32::from_rgb(56, 189, 248),
+                ))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Planetary Analog Similarity Breakdown (Earth <-> Moon/Mars)",
+                        )
+                        .strong()
+                        .color(egui::Color32::from_rgb(125, 211, 252)),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} [{}]  <->  {} [{}]",
+                            sim.primary_name,
+                            sim.primary_body.as_str().to_uppercase(),
+                            sim.compare_name,
+                            sim.compare_body.as_str().to_uppercase()
+                        ))
+                        .small()
+                        .strong()
+                        .color(COLOR_TEXT_PRIMARY),
+                    );
+
+                    ui.add_space(4.0_f32);
+                    let overall_frac =
+                        (sim.overall_similarity_pct / 100.0).clamp(0.0, 1.0) as f32;
+                    ui.add(
+                        egui::ProgressBar::new(overall_frac)
+                            .text(format!(
+                                "Global Morphometric & TDA Similarity: {:.1}%",
+                                sim.overall_similarity_pct
+                            ))
+                            .fill(egui::Color32::from_rgb(37, 99, 235)),
+                    );
+
+                    ui.add_space(6.0_f32);
+                    for (dim_label, va, vb, sim_pct) in &sim.dimensions {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(egui::RichText::new(dim_label).small().strong());
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.monospace(format!("{sim_pct:.0}% ({va:.2} vs {vb:.2})"));
+                                },
+                            );
+                        });
+                        ui.add(
+                            egui::ProgressBar::new((*sim_pct / 100.0) as f32)
+                                .desired_height(6.0_f32)
+                                .fill(egui::Color32::from_rgb(16, 185, 129)),
+                        );
+                    }
+
+                    if sim.delta_b0_basins.is_some() || sim.delta_euler_chi.is_some() {
+                        ui.add_space(4.0_f32);
+                        ui.monospace(format!(
+                            "TDA Invariants: Delta_beta_0 basins = {} | Delta_chi Euler = {}",
+                            sim.delta_b0_basins
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "n/a".to_string()),
+                            sim.delta_euler_chi
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "n/a".to_string()),
+                        ));
+                    }
+
+                    ui.add_space(6.0_f32);
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(9, 14, 24))
+                        .inner_margin(egui::Margin::same(8.0_f32))
+                        .rounding(egui::Rounding::same(5.0_f32))
+                        .stroke(egui::Stroke::new(
+                            1.0_f32,
+                            egui::Color32::from_rgb(34, 197, 94),
+                        ))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Mission Engineering: Landing Safety & Cold-Trap Proxy",
+                                )
+                                .small()
+                                .strong()
+                                .color(egui::Color32::from_rgb(74, 222, 128)),
+                            );
+                            ui.monospace(format!(
+                                "Safe Landing (< 15 deg): {:.1}% ({}) <-> {:.1}% ({})",
+                                sim.primary_safe_landing_15_pct,
+                                sim.primary_body.as_str().to_uppercase(),
+                                sim.compare_safe_landing_15_pct,
+                                sim.compare_body.as_str().to_uppercase(),
+                            ));
+                            ui.monospace(format!(
+                                "Optimal Pad  (<  5 deg): {:.1}% (theta {:.1} deg) <-> {:.1}% (theta {:.1} deg)",
+                                sim.primary_optimal_pad_5_pct,
+                                sim.primary_mean_slope_deg,
+                                sim.compare_optimal_pad_5_pct,
+                                sim.compare_mean_slope_deg,
+                            ));
+                            ui.monospace(format!(
+                                "Cold-Trap / Shielding Basins (beta_0): {} <-> {}",
+                                sim.primary_b0_basins, sim.compare_b0_basins
+                            ));
+                            ui.label(
+                                egui::RichText::new(
+                                    "Artemis Lunar South Pole & Martian Habitat Utility: Quantifies rollover-safe lander touchdown zones (< 15 deg), level pressurized habitat foundations (< 5 deg), and beta_0 depression cold-trap / radiation-shielding basins.",
+                                )
+                                .small()
+                                .color(COLOR_TEXT_SECONDARY),
+                            );
+                        });
+                });
+        }
+    });
 }
 
 /// Tab 2: Real-Time 3D Surface Skin / Palette Selector, Mission Engineering Landing Safety Card,
-/// Vertical Exaggeration, Planar UV Checkerboard test, and Mouse/Keyboard Camera controls.
+/// Vertical Exaggeration, and Mouse/Keyboard Camera controls.
 fn render_tab_view_and_camera(
     ui: &mut egui::Ui,
     app_state: &mut ViewerAppState,
@@ -2009,17 +2175,17 @@ fn render_tab_view_and_camera(
     camera_query: &mut Query<(&mut OrbitCamera, &mut Projection)>,
 ) {
     ui.heading("2. 3D Terrain, Surface Skins & Camera");
-    ui.add_space(4.0);
+    ui.add_space(4.0_f32);
 
     // -------------------------------------------------------------------------
-    // Card A: Real-Time 3D Surface Skin / Palette Selector (6 Scientific Modes)
+    // Card A: Real-Time 3D Surface Skin / Palette Selector (6 Scientific Modes + 7. UV Checkerboard)
     // -------------------------------------------------------------------------
     egui::Frame::none()
         .fill(COLOR_CARD_BG)
-        .inner_margin(egui::Margin::same(10.0))
-        .rounding(egui::Rounding::same(6.0))
+        .inner_margin(egui::Margin::same(10.0_f32))
+        .rounding(egui::Rounding::same(6.0_f32))
         .stroke(egui::Stroke::new(
-            1.2,
+            1.2_f32,
             egui::Color32::from_rgb(56, 189, 248),
         ))
         .show(ui, |ui| {
@@ -2030,37 +2196,31 @@ fn render_tab_view_and_camera(
             );
             ui.label(
                 egui::RichText::new(
-                    "Dynamically recolors Primary and Split-View 3D meshes via vertex attributes (elevation y or normal slope angle θ = arccos(n_y)) and material texture switching:",
+                    "Dynamically recolors Primary and Split-View 3D meshes via vertex attributes (elevation y or normal slope angle theta = arccos(n_y)) and material texture switching:",
                 )
                 .small()
                 .color(COLOR_TEXT_SECONDARY),
             );
-            ui.add_space(4.0);
+            ui.add_space(4.0_f32);
 
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("Active 3D Skin:").strong());
-                egui::ComboBox::from_id_source("surface_skin_combo")
-                    .selected_text(skin_mode.label())
-                    .width(235.0_f32)
-                    .show_ui(ui, |ui| {
-                        for candidate in SurfaceSkinMode::ALL {
-                            if ui
-                                .selectable_label(*skin_mode == candidate, candidate.label())
-                                .clicked()
-                            {
-                                *skin_mode = candidate;
-                                app_state.show_checkerboard_uv = false;
-                            }
-                        }
-                    });
+                render_skin_combo_box(
+                    ui,
+                    "surface_skin_combo",
+                    235.0_f32,
+                    skin_mode,
+                    &mut app_state.show_checkerboard_uv,
+                );
             });
 
-            ui.add_space(4.0);
+            ui.add_space(4.0_f32);
             ui.horizontal_wrapped(|ui| {
                 for candidate in SurfaceSkinMode::ALL {
-                    let is_active = *skin_mode == candidate && !app_state.show_checkerboard_uv;
+                    let is_active =
+                        *skin_mode == candidate && !app_state.show_checkerboard_uv;
                     let btn = egui::Button::new(
-                        egui::RichText::new(candidate.short_label())
+                        egui::RichText::new(skin_option_short_label(candidate, false))
                             .small()
                             .strong()
                             .color(if is_active {
@@ -2076,35 +2236,63 @@ fn render_tab_view_and_camera(
                     });
                     if ui
                         .add(btn)
-                        .on_hover_text(candidate.label())
+                        .on_hover_text(skin_option_label(candidate, false))
                         .clicked()
                     {
                         *skin_mode = candidate;
                         app_state.show_checkerboard_uv = false;
                     }
                 }
+
+                // Option 7 button: Explicit UV Checkerboard Test
+                let uv_btn = egui::Button::new(
+                    egui::RichText::new("7. UV Checkerboard")
+                        .small()
+                        .strong()
+                        .color(if app_state.show_checkerboard_uv {
+                            egui::Color32::WHITE
+                        } else {
+                            COLOR_TEXT_PRIMARY
+                        }),
+                )
+                .fill(if app_state.show_checkerboard_uv {
+                    egui::Color32::from_rgb(37, 99, 235)
+                } else {
+                    egui::Color32::from_rgb(30, 41, 59)
+                });
+                if ui
+                    .add(uv_btn)
+                    .on_hover_text(
+                        "7. UV Checkerboard Test (NW = u:0,v:0 | SE = u:1,v:1)",
+                    )
+                    .clicked()
+                {
+                    app_state.show_checkerboard_uv = true;
+                }
             });
 
-            if *skin_mode == SurfaceSkinMode::LandingSlopeHazard {
-                ui.add_space(4.0);
+            if !app_state.show_checkerboard_uv
+                && *skin_mode == SurfaceSkinMode::LandingSlopeHazard
+            {
+                ui.add_space(4.0_f32);
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(
                         egui::Color32::from_rgb(34, 197, 94),
-                        "■ Green (#22C55E): Optimal Pad < 5°",
+                        "[#] Green (#22C55E): Optimal Pad < 5 deg",
                     );
                     ui.colored_label(
                         egui::Color32::from_rgb(245, 158, 11),
-                        "■ Amber (#F59E0B): Caution 5°–15°",
+                        "[#] Amber (#F59E0B): Caution 5-15 deg",
                     );
                     ui.colored_label(
                         egui::Color32::from_rgb(239, 68, 68),
-                        "■ Red (#EF4444): Hazard > 15°",
+                        "[#] Red (#EF4444): Hazard > 15 deg",
                     );
                 });
             }
         });
 
-    ui.add_space(6.0);
+    ui.add_space(6.0_f32);
 
     // -------------------------------------------------------------------------
     // Card B: Scientific Mission Engineering Indicator (Landing Safety & Cold-Trap Proxy)
@@ -2112,23 +2300,29 @@ fn render_tab_view_and_camera(
     let prim_summary = app_state.loaded_primary_summary;
     egui::Frame::none()
         .fill(COLOR_CARD_BG)
-        .inner_margin(egui::Margin::same(10.0))
-        .rounding(egui::Rounding::same(6.0))
+        .inner_margin(egui::Margin::same(10.0_f32))
+        .rounding(egui::Rounding::same(6.0_f32))
         .stroke(egui::Stroke::new(
-            1.2,
+            1.2_f32,
             egui::Color32::from_rgb(34, 197, 94),
         ))
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    egui::RichText::new("Mission Engineering: Landing Safety & Cold-Trap Proxy")
-                        .strong()
-                        .color(egui::Color32::from_rgb(74, 222, 128)),
+                    egui::RichText::new(
+                        "Mission Engineering: Landing Safety & Cold-Trap Proxy",
+                    )
+                    .strong()
+                    .color(egui::Color32::from_rgb(74, 222, 128)),
                 );
-                if *skin_mode != SurfaceSkinMode::LandingSlopeHazard {
+                if app_state.show_checkerboard_uv
+                    || *skin_mode != SurfaceSkinMode::LandingSlopeHazard
+                {
                     if ui
                         .small_button("Visualize Slope Hazard Map")
-                        .on_hover_text("Switch 3D skin to Landing Slope Hazard (<5° / 15°)")
+                        .on_hover_text(
+                            "Switch 3D skin to 5. Landing Slope Hazard (<5 deg / 15 deg)",
+                        )
                         .clicked()
                     {
                         *skin_mode = SurfaceSkinMode::LandingSlopeHazard;
@@ -2137,70 +2331,66 @@ fn render_tab_view_and_camera(
                 }
             });
 
-            ui.add_space(4.0);
-            let safe_15_frac = (prim_summary.safe_landing_pct_under_15deg / 100.0_f32).clamp(0.0, 1.0);
+            ui.add_space(4.0_f32);
+            let safe_15_frac =
+                (prim_summary.safe_landing_pct_under_15deg / 100.0_f32).clamp(0.0_f32, 1.0_f32);
             ui.add(
                 egui::ProgressBar::new(safe_15_frac)
                     .text(format!(
-                        "Safe Landing Area (θ < 15°): {:.1}% of surface",
+                        "Safe Landing Area (theta < 15 deg): {:.1}% of surface",
                         prim_summary.safe_landing_pct_under_15deg
                     ))
                     .fill(egui::Color32::from_rgb(245, 158, 11)),
             );
 
-            let opt_5_frac = (prim_summary.optimal_pad_pct_under_5deg / 100.0_f32).clamp(0.0, 1.0);
+            let opt_5_frac =
+                (prim_summary.optimal_pad_pct_under_5deg / 100.0_f32).clamp(0.0_f32, 1.0_f32);
             ui.add(
                 egui::ProgressBar::new(opt_5_frac)
                     .text(format!(
-                        "Optimal Habitat Pad (θ < 5°): {:.1}% of surface",
+                        "Optimal Habitat Pad (theta < 5 deg): {:.1}% of surface",
                         prim_summary.optimal_pad_pct_under_5deg
                     ))
                     .fill(egui::Color32::from_rgb(34, 197, 94)),
             );
 
-            ui.add_space(4.0);
+            ui.add_space(4.0_f32);
             ui.monospace(format!(
-                "Mean Slope θ̄: {:.2}° | Persistent Basins β₀: {} | Euler χ: {}",
+                "Mean Slope theta: {:.2} deg | Persistent Basins beta_0: {} | Euler chi: {}",
                 prim_summary.mean_slope_deg,
                 prim_summary.persistent_basins_b0,
                 prim_summary.euler_characteristic
             ));
             ui.label(
                 egui::RichText::new(
-                    "Mission Utility: Identifies level touchdown ellipses (θ < 15°) and pressurized habitat foundations (θ < 5°) while β₀ basins locate candidate Permanently Shadowed Region (PSR) ice cold-traps for Artemis (Lunar South Pole) and radiation-shielded depressions for Mars.",
+                    "Mission Utility: Identifies level touchdown ellipses (theta < 15 deg) and pressurized habitat foundations (theta < 5 deg) while beta_0 basins locate candidate Permanently Shadowed Region (PSR) ice cold-traps for Artemis (Lunar South Pole) and radiation-shielded depressions for Mars.",
                 )
                 .small()
                 .color(COLOR_TEXT_SECONDARY),
             );
         });
 
-    ui.add_space(6.0);
+    ui.add_space(6.0_f32);
 
     ui.label("Vertical Exaggeration (scales Bevy +Y up axis only):");
     ui.add(
-        egui::Slider::new(&mut app_state.vertical_exaggeration, 0.25..=10.0)
+        egui::Slider::new(&mut app_state.vertical_exaggeration, 0.25_f32..=10.0_f32)
             .text("Y-scale")
             .step_by(0.05),
     );
 
-    ui.add_space(4.0);
-    ui.checkbox(
-        &mut app_state.show_checkerboard_uv,
-        "Checkerboard UV Alignment Test (NW = u:0,v:0 | SE = u:1,v:1)",
-    );
-
-    ui.add_space(6.0);
+    ui.add_space(6.0_f32);
     if let Ok((mut cam, mut proj)) = camera_query.get_single_mut() {
         ui.checkbox(
             &mut cam.auto_rotate,
             "Auto-Rotate Terrain Orbit [Shortcut: A] (pauses while dragging)",
         );
         ui.add(
-            egui::Slider::new(&mut cam.auto_rotate_speed, 0.05..=1.2)
+            egui::Slider::new(&mut cam.auto_rotate_speed, 0.05_f32..=1.2_f32)
                 .text("Orbit Speed (rad/s)"),
         );
 
-        ui.add_space(6.0);
+        ui.add_space(6.0_f32);
         ui.label(egui::RichText::new("No-Mouse / Touchpad Camera Controls:").strong());
 
         let step_angle = 0.22_f32;
@@ -2212,10 +2402,10 @@ fn render_tab_view_and_camera(
                 cam.target_yaw -= step_angle;
             }
             if ui.button("^ Tilt Up").clicked() {
-                cam.target_pitch = (cam.target_pitch + 0.14).clamp(0.05, 1.52);
+                cam.target_pitch = (cam.target_pitch + 0.14_f32).clamp(0.05_f32, 1.52_f32);
             }
             if ui.button("v Tilt Down").clicked() {
-                cam.target_pitch = (cam.target_pitch - 0.14).clamp(0.05, 1.52);
+                cam.target_pitch = (cam.target_pitch - 0.14_f32).clamp(0.05_f32, 1.52_f32);
             }
         });
 
@@ -2223,12 +2413,12 @@ fn render_tab_view_and_camera(
             if ui.button("[+] Zoom In").clicked() {
                 let min_r = cam.min_radius;
                 let max_r = cam.max_radius;
-                cam.target_radius = (cam.target_radius * 0.80).clamp(min_r, max_r);
+                cam.target_radius = (cam.target_radius * 0.80_f32).clamp(min_r, max_r);
             }
             if ui.button("[-] Zoom Out").clicked() {
                 let min_r = cam.min_radius;
                 let max_r = cam.max_radius;
-                cam.target_radius = (cam.target_radius * 1.25).clamp(min_r, max_r);
+                cam.target_radius = (cam.target_radius * 1.25_f32).clamp(min_r, max_r);
             }
             if ui.button("[R] Reset & Center 3D Camera").clicked() {
                 cam.frame_terrain(Vec3::ZERO, app_state.loaded_primary_bounding_radius);
@@ -2237,28 +2427,31 @@ fn render_tab_view_and_camera(
         });
     }
 
-    ui.add_space(8.0);
-    egui::Frame::none()
-        .fill(COLOR_CARD_BG)
-        .inner_margin(egui::Margin::same(10.0))
-        .rounding(egui::Rounding::same(6.0))
-        .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new("Coordinate System & UV Laws (AGENTS.md Section 2)")
-                    .strong()
-                    .color(egui::Color32::from_rgb(125, 211, 252)),
-            );
-            ui.label(
-                egui::RichText::new(
-                    "• Blender / JMARS Z-up STL centered in f64 to (0,0,0) and mapped to Bevy Y-up: X_bevy = X_stl, Y_bevy = Z_stl (Up), Z_bevy = −Y_stl (South).\n\
-                     • Planar UVs from centered DemExtent: u = (X − min_x)/(max_x − min_x), v = (max_y − Y)/(max_y − min_y).\n\
-                     • Mouse / Touchpad: Left-drag = Orbit | Right-drag or Shift+Left-drag = Pan | Scroll = Zoom.",
-                )
-                .small()
-                .color(COLOR_TEXT_SECONDARY),
-            );
-        });
+    ui.add_space(8.0_f32);
+    egui::CollapsingHeader::new(
+        egui::RichText::new("Coordinate System & UV Laws (AGENTS.md Section 2)")
+            .strong()
+            .color(egui::Color32::from_rgb(125, 211, 252)),
+    )
+    .default_open(false)
+    .show(ui, |ui| {
+        egui::Frame::none()
+            .fill(COLOR_CARD_BG)
+            .inner_margin(egui::Margin::same(10.0_f32))
+            .rounding(egui::Rounding::same(6.0_f32))
+            .stroke(egui::Stroke::new(1.0_f32, COLOR_BORDER))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "- Blender / JMARS Z-up STL centered in f64 to (0,0,0) and mapped to Bevy Y-up: X_bevy = X_stl, Y_bevy = Z_stl (Up), Z_bevy = -Y_stl (South).\n\
+                         - Planar UVs from centered DemExtent: u = (X - min_x)/(max_x - min_x), v = (max_y - Y)/(max_y - min_y).\n\
+                         - Mouse / Touchpad: Left-drag = Orbit | Right-drag or Shift+Left-drag = Pan | Scroll = Zoom.",
+                    )
+                    .small()
+                    .color(COLOR_TEXT_SECONDARY),
+                );
+            });
+    });
 }
 
 /// Tab 3: Similarity Charts, Collapsible Mathematical Foundation, and Interactive Weights.
@@ -2268,11 +2461,11 @@ fn render_tab_charts_and_math(
     net: &NetBridge,
 ) {
     ui.heading("3. Similarity Charts, Math & Weights");
-    ui.add_space(4.0);
+    ui.add_space(4.0_f32);
 
     render_similarity_charts_and_math(ui, app_state);
 
-    ui.add_space(8.0);
+    ui.add_space(8.0_f32);
     ui.separator();
     ui.label(
         egui::RichText::new("Interactive Morphometric Feature Weights [0.0 .. 1.0]:").strong(),
@@ -2321,60 +2514,41 @@ fn render_tab_charts_and_math(
     });
 }
 
-/// Helper to render a single mathematical equation card using clean Unicode symbols,
-/// cyan/amber `TextStyle::Monospace` formula boxes, and indented English variable explanations.
-fn render_unicode_equation_card(
-    ui: &mut egui::Ui,
-    id_source: &str,
-    title: &str,
-    title_color: egui::Color32,
-    formula: &str,
-    formula_color: egui::Color32,
-    variables: &[(&str, &str)],
-) {
-    egui::Frame::none()
-        .fill(COLOR_CARD_BG)
-        .inner_margin(egui::Margin::same(10.0))
-        .rounding(egui::Rounding::same(6.0))
-        .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(title).strong().color(title_color));
-            ui.add_space(4.0);
+/// Formats main equation tokens in crisp `14.0_f32` Monospace typography (100% ASCII-safe).
+fn math_token(text: &str, color: egui::Color32) -> egui::RichText {
+    egui::RichText::new(text)
+        .font(egui::FontId::monospace(14.0_f32))
+        .strong()
+        .color(color)
+}
 
-            // Highlighted Monospace Equation Banner
-            egui::Frame::none()
-                .fill(egui::Color32::from_rgb(9, 14, 24))
-                .inner_margin(egui::Margin::symmetric(10.0, 7.0))
-                .rounding(egui::Rounding::same(4.0))
-                .stroke(egui::Stroke::new(1.0, formula_color))
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(formula)
-                            .text_style(egui::TextStyle::Monospace)
-                            .strong()
-                            .color(formula_color),
-                    );
-                });
+/// Formats subscript tokens in `10.5_f32` Monospace typography (100% ASCII-safe, zero `□` glyphs).
+fn math_sub(text: &str, color: egui::Color32) -> egui::RichText {
+    egui::RichText::new(text)
+        .font(egui::FontId::monospace(10.5_f32))
+        .color(color)
+}
 
-            ui.add_space(4.0);
-            ui.indent(id_source, |ui| {
-                for (symbol, explanation) in variables {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(
-                            egui::RichText::new(*symbol)
-                                .text_style(egui::TextStyle::Monospace)
-                                .strong()
-                                .color(egui::Color32::from_rgb(125, 211, 252)),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!("— {explanation}"))
-                                .small()
-                                .color(COLOR_TEXT_SECONDARY),
-                        );
-                    });
-                }
+/// Renders an indented list of variable definitions beneath an equation card.
+fn render_equation_variables(ui: &mut egui::Ui, id_source: &str, variables: &[(&str, &str)]) {
+    ui.add_space(4.0_f32);
+    ui.indent(id_source, |ui| {
+        for (symbol, explanation) in variables {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(*symbol)
+                        .font(egui::FontId::monospace(12.5_f32))
+                        .strong()
+                        .color(egui::Color32::from_rgb(125, 211, 252)),
+                );
+                ui.label(
+                    egui::RichText::new(format!("- {explanation}"))
+                        .small()
+                        .color(COLOR_TEXT_SECONDARY),
+                );
             });
-        });
+        }
+    });
 }
 
 /// Draws custom `egui::Painter` multi-bar charts, overall catalog analog ranking bars, and the
@@ -2383,13 +2557,13 @@ fn render_similarity_charts_and_math(ui: &mut egui::Ui, app_state: &ViewerAppSta
     if let Some(sim) = app_state.build_pairwise_similarity() {
         egui::Frame::none()
             .fill(COLOR_CARD_BG)
-            .inner_margin(egui::Margin::same(10.0))
-            .rounding(egui::Rounding::same(6.0))
-            .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+            .inner_margin(egui::Margin::same(10.0_f32))
+            .rounding(egui::Rounding::same(6.0_f32))
+            .stroke(egui::Stroke::new(1.0_f32, COLOR_BORDER))
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(format!(
-                        "Pairwise Feature Chart: {} [{}] ↔ {} [{}] ({:.1}% Match)",
+                        "Pairwise Feature Chart: {} [{}] <-> {} [{}] ({:.1}% Match)",
                         sim.primary_name,
                         sim.primary_body.as_str().to_uppercase(),
                         sim.compare_name,
@@ -2415,72 +2589,82 @@ fn render_similarity_charts_and_math(ui: &mut egui::Ui, app_state: &ViewerAppSta
                     );
                 });
 
-                ui.add_space(4.0);
+                ui.add_space(4.0_f32);
 
-                let chart_w = ui.available_width().max(260.0);
-                let row_h = 40.0;
-                let chart_h = row_h * (sim.dimensions.len() as f32) + 12.0;
+                let chart_w = ui.available_width().max(260.0_f32);
+                let row_h = 40.0_f32;
+                let chart_h = row_h * (sim.dimensions.len() as f32) + 12.0_f32;
                 let (rect, _) =
                     ui.allocate_exact_size(egui::vec2(chart_w, chart_h), egui::Sense::hover());
                 let painter = ui.painter_at(rect);
 
                 painter.rect_filled(
                     rect,
-                    egui::Rounding::same(4.0),
+                    egui::Rounding::same(4.0_f32),
                     egui::Color32::from_rgb(9, 14, 24),
                 );
 
-                let label_col_w = 132.0_f32.min(chart_w * 0.40);
-                let bar_area_w = (chart_w - label_col_w - 64.0).max(80.0);
+                let label_col_w = 132.0_f32.min(chart_w * 0.40_f32);
+                let bar_area_w = (chart_w - label_col_w - 64.0_f32).max(80.0_f32);
 
                 for i in 0..=4 {
-                    let frac = i as f32 * 0.25;
+                    let frac = i as f32 * 0.25_f32;
                     let gx = rect.min.x + label_col_w + bar_area_w * frac;
                     painter.line_segment(
-                        [egui::pos2(gx, rect.min.y + 4.0), egui::pos2(gx, rect.max.y - 4.0)],
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(30, 41, 59)),
+                        [
+                            egui::pos2(gx, rect.min.y + 4.0_f32),
+                            egui::pos2(gx, rect.max.y - 4.0_f32),
+                        ],
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(30, 41, 59)),
                     );
                 }
 
                 for (idx, (label, va, vb, sim_pct)) in sim.dimensions.iter().enumerate() {
-                    let y0 = rect.min.y + 6.0 + (idx as f32) * row_h;
+                    let y0 = rect.min.y + 6.0_f32 + (idx as f32) * row_h;
                     painter.text(
-                        egui::pos2(rect.min.x + 6.0, y0 + 10.0),
+                        egui::pos2(rect.min.x + 6.0_f32, y0 + 10.0_f32),
                         egui::Align2::LEFT_CENTER,
                         label,
-                        egui::FontId::proportional(12.0),
+                        egui::FontId::proportional(12.0_f32),
                         COLOR_TEXT_PRIMARY,
                     );
 
                     let bx = rect.min.x + label_col_w;
-                    let w_a = (*va as f32).clamp(0.0, 1.0) * bar_area_w;
-                    let w_b = (*vb as f32).clamp(0.0, 1.0) * bar_area_w;
-                    let w_sim = ((*sim_pct / 100.0) as f32).clamp(0.0, 1.0) * bar_area_w;
+                    let w_a = (*va as f32).clamp(0.0_f32, 1.0_f32) * bar_area_w;
+                    let w_b = (*vb as f32).clamp(0.0_f32, 1.0_f32) * bar_area_w;
+                    let w_sim =
+                        ((*sim_pct / 100.0) as f32).clamp(0.0_f32, 1.0_f32) * bar_area_w;
 
                     painter.rect_filled(
-                        egui::Rect::from_min_size(egui::pos2(bx, y0 + 2.0), egui::vec2(w_a, 8.0)),
-                        egui::Rounding::same(2.0),
+                        egui::Rect::from_min_size(
+                            egui::pos2(bx, y0 + 2.0_f32),
+                            egui::vec2(w_a, 8.0_f32),
+                        ),
+                        egui::Rounding::same(2.0_f32),
                         egui::Color32::from_rgb(56, 189, 248),
                     );
                     painter.rect_filled(
-                        egui::Rect::from_min_size(egui::pos2(bx, y0 + 12.0), egui::vec2(w_b, 8.0)),
-                        egui::Rounding::same(2.0),
+                        egui::Rect::from_min_size(
+                            egui::pos2(bx, y0 + 12.0_f32),
+                            egui::vec2(w_b, 8.0_f32),
+                        ),
+                        egui::Rounding::same(2.0_f32),
                         egui::Color32::from_rgb(250, 204, 21),
                     );
                     painter.rect_filled(
                         egui::Rect::from_min_size(
-                            egui::pos2(bx, y0 + 22.0),
-                            egui::vec2(w_sim, 8.0),
+                            egui::pos2(bx, y0 + 22.0_f32),
+                            egui::vec2(w_sim, 8.0_f32),
                         ),
-                        egui::Rounding::same(2.0),
+                        egui::Rounding::same(2.0_f32),
                         egui::Color32::from_rgb(16, 185, 129),
                     );
 
                     painter.text(
-                        egui::pos2(bx + bar_area_w + 6.0, y0 + 16.0),
+                        egui::pos2(bx + bar_area_w + 6.0_f32, y0 + 16.0_f32),
                         egui::Align2::LEFT_CENTER,
                         format!("{sim_pct:.0}%"),
-                        egui::FontId::monospace(12.0),
+                        egui::FontId::monospace(12.0_f32),
                         egui::Color32::from_rgb(167, 243, 208),
                     );
                 }
@@ -2488,12 +2672,12 @@ fn render_similarity_charts_and_math(ui: &mut egui::Ui, app_state: &ViewerAppSta
     }
 
     // Overall Catalog Ranking Chart
-    ui.add_space(6.0);
+    ui.add_space(6.0_f32);
     egui::Frame::none()
         .fill(COLOR_CARD_BG)
-        .inner_margin(egui::Margin::same(10.0))
-        .rounding(egui::Rounding::same(6.0))
-        .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+        .inner_margin(egui::Margin::same(10.0_f32))
+        .rounding(egui::Rounding::same(6.0_f32))
+        .stroke(egui::Stroke::new(1.0_f32, COLOR_BORDER))
         .show(ui, |ui| {
             ui.label(
                 egui::RichText::new("Catalog Analog Score Ranking (0% .. 100%)")
@@ -2511,7 +2695,7 @@ fn render_similarity_charts_and_math(ui: &mut egui::Ui, app_state: &ViewerAppSta
                 ui.add(
                     egui::ProgressBar::new((pct / 100.0) as f32)
                         .text(format!(
-                            "#{}: {} [{}] — {:.1}% (canonical {:.1}%)",
+                            "#{}: {} [{}] - {:.1}% (canonical {:.1}%)",
                             rank + 1,
                             scored.name,
                             scored.body.as_str().to_uppercase(),
@@ -2523,79 +2707,276 @@ fn render_similarity_charts_and_math(ui: &mut egui::Ui, app_state: &ViewerAppSta
             }
         });
 
-    // Collapsible Mathematical Foundation & TDA Equations Card (Styled Unicode Equation Cards)
-    ui.add_space(6.0);
+    // Collapsible Mathematical Foundation & TDA Equations Card (closed by default, 100% ASCII-safe)
+    ui.add_space(6.0_f32);
     egui::CollapsingHeader::new(
-        egui::RichText::new("Mathematical Foundation & TDA Equations (Unicode Reference)")
+        egui::RichText::new("Mathematical Foundation & TDA Equations")
             .strong()
             .color(egui::Color32::from_rgb(125, 211, 252)),
     )
-    .default_open(true)
+    .default_open(false)
     .show(ui, |ui| {
         let cyan = egui::Color32::from_rgb(56, 189, 248);
         let amber = egui::Color32::from_rgb(250, 204, 21);
         let green = egui::Color32::from_rgb(74, 222, 128);
 
-        render_unicode_equation_card(
-            ui,
-            "eq_weighted_similarity",
-            "1. Weighted Morphometric Analog Similarity (S_analog)",
-            green,
-            "S_analog(A, B) = ∑ᵢ wᵢ · (1 − |fᵢ(A) − fᵢ(B)|)     where ∑ᵢ wᵢ = 1",
-            cyan,
-            &[
-                ("S_analog(A, B)", "Pairwise planetary analog similarity in [0, 1] (Earth ↔ Moon/Mars)."),
-                ("wᵢ", "Normalized researcher weight for morphometric dimension i (∑ᵢ wᵢ = 1)."),
-                ("fᵢ(A), fᵢ(B)", "Pre-normalized feature scores in [0, 1] computed from meter-projected DEMs."),
-                ("|fᵢ(A) − fᵢ(B)|", "Absolute feature discrepancy between Primary site A and Partner site B."),
-            ],
-        );
+        // Equation 1: Weighted Morphometric Analog Similarity
+        egui::Frame::none()
+            .fill(COLOR_CARD_BG)
+            .inner_margin(egui::Margin::same(10.0_f32))
+            .rounding(egui::Rounding::same(6.0_f32))
+            .stroke(egui::Stroke::new(1.0_f32, COLOR_BORDER))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("1. Weighted Morphometric Analog Similarity")
+                        .strong()
+                        .color(green),
+                );
+                ui.add_space(4.0_f32);
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(9, 14, 24))
+                    .inner_margin(egui::Margin::symmetric(10.0_f32, 8.0_f32))
+                    .rounding(egui::Rounding::same(4.0_f32))
+                    .stroke(egui::Stroke::new(1.0_f32, cyan))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0_f32;
+                            ui.label(math_token("S", cyan));
+                            ui.label(math_sub("analog", cyan));
+                            ui.label(math_token("(A, B) = Sum", cyan));
+                            ui.label(math_sub("i", cyan));
+                            ui.label(math_token(" w", cyan));
+                            ui.label(math_sub("i", cyan));
+                            ui.label(math_token(" * (1 - |f", cyan));
+                            ui.label(math_sub("i,A", cyan));
+                            ui.label(math_token(" - f", cyan));
+                            ui.label(math_sub("i,B", cyan));
+                            ui.label(math_token("|)   [Sum", cyan));
+                            ui.label(math_sub("i", cyan));
+                            ui.label(math_token(" w", cyan));
+                            ui.label(math_sub("i", cyan));
+                            ui.label(math_token(" = 1]", cyan));
+                        });
+                    });
+                render_equation_variables(
+                    ui,
+                    "eq_vars_similarity",
+                    &[
+                        (
+                            "S_analog(A, B)",
+                            "Pairwise planetary analog similarity in [0, 1] (Earth <-> Moon/Mars).",
+                        ),
+                        (
+                            "w_i",
+                            "Normalized researcher weight for morphometric dimension i (Sum_i w_i = 1).",
+                        ),
+                        (
+                            "f_i,A , f_i,B",
+                            "Pre-normalized feature scores in [0, 1] computed from meter-projected DEMs.",
+                        ),
+                    ],
+                );
+            });
 
-        ui.add_space(6.0);
-        render_unicode_equation_card(
-            ui,
-            "eq_relief_hypsometric",
-            "2. Elevation Relief (Δz) & Hypsometric Integral (HI)",
-            green,
-            "Δz = z_max − z_min     |     HI = (z_mean − z_min) / (z_max − z_min)",
-            cyan,
-            &[
-                ("Δz", "Total vertical relief in meters between peak elevation z_max and basin floor z_min."),
-                ("z_mean", "Mean surface elevation across all welded mesh vertices or DEM cells."),
-                ("HI ≈ 0.5", "Hypsometric Integral measuring basin vs. highland mass distribution in [0, 1]."),
-            ],
-        );
+        ui.add_space(6.0_f32);
 
-        ui.add_space(6.0);
-        render_unicode_equation_card(
-            ui,
-            "eq_tri_roughness",
-            "3. Terrain Ruggedness Index (TRI) & Surface Slope Safety (θ)",
-            amber,
-            "TRI = √( (1/8) · ∑ₙ₌₁..₈ (zₙ − z₀)² )     |     θ = arctan( ‖∇z‖ ) = arccos( n_y )",
-            amber,
-            &[
-                ("z₀, zₙ", "Center cell elevation z₀ and its 8 immediate 3×3 neighbors zₙ (meters)."),
-                ("∇z", "Horizontal surface gradient (∂z/∂x, ∂z/∂y) in local meter projection (+units=m)."),
-                ("θ ≤ 5° / 15°", "Local slope angle from vertical normal n_y: θ < 5° optimal habitat pad, θ < 15° safe lander touchdown."),
-            ],
-        );
+        // Equation 2: Elevation Relief (Delta_z) & Hypsometric Integral (HI) with horizontal fraction bar
+        egui::Frame::none()
+            .fill(COLOR_CARD_BG)
+            .inner_margin(egui::Margin::same(10.0_f32))
+            .rounding(egui::Rounding::same(6.0_f32))
+            .stroke(egui::Stroke::new(1.0_f32, COLOR_BORDER))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("2. Elevation Relief (Delta_z) & Hypsometric Integral (HI)")
+                        .strong()
+                        .color(green),
+                );
+                ui.add_space(4.0_f32);
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(9, 14, 24))
+                    .inner_margin(egui::Margin::symmetric(10.0_f32, 8.0_f32))
+                    .rounding(egui::Rounding::same(4.0_f32))
+                    .stroke(egui::Stroke::new(1.0_f32, cyan))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0_f32;
+                            ui.label(math_token("Delta", cyan));
+                            ui.label(math_sub("z", cyan));
+                            ui.label(math_token(" = z", cyan));
+                            ui.label(math_sub("max", cyan));
+                            ui.label(math_token(" - z", cyan));
+                            ui.label(math_sub("min", cyan));
+                            ui.label(math_token("    |    HI = ", cyan));
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0_f32;
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0_f32;
+                                    ui.label(math_token("z", cyan));
+                                    ui.label(math_sub("mean", cyan));
+                                    ui.label(math_token(" - z", cyan));
+                                    ui.label(math_sub("min", cyan));
+                                });
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 2.0_f32;
+                                    ui.label(math_token("z", cyan));
+                                    ui.label(math_sub("max", cyan));
+                                    ui.label(math_token(" - z", cyan));
+                                    ui.label(math_sub("min", cyan));
+                                });
+                            });
+                        });
+                    });
+                render_equation_variables(
+                    ui,
+                    "eq_vars_relief_hi",
+                    &[
+                        (
+                            "Delta_z",
+                            "Total vertical relief in meters between peak elevation z_max and basin floor z_min.",
+                        ),
+                        (
+                            "z_mean",
+                            "Mean surface elevation across all welded mesh vertices or DEM cells.",
+                        ),
+                        (
+                            "HI in [0, 1]",
+                            "Hypsometric Integral measuring basin vs. highland mass distribution.",
+                        ),
+                    ],
+                );
+            });
 
-        ui.add_space(6.0);
-        render_unicode_equation_card(
-            ui,
-            "eq_tda_homology",
-            "4. 0D Persistent Homology (β₀) & Simplicial Euler Characteristic (χ)",
-            amber,
-            "χ = V − E + F     |     Persistence  pₖ = |dₖ − bₖ| ≥ τ_noise",
-            amber,
-            &[
-                ("β₀", "0D Betti number counting persistent topological basins (craters/cold-traps) and peaks."),
-                ("(bₖ, dₖ)", "Component birth height bₖ and merge death height dₖ tracked via Union-Find Elder Rule."),
-                ("τ_noise", "Persistence threshold (5% of Δz) filtering micro-roughness from true craters/ridges."),
-                ("χ = V − E + F", "Euler characteristic (Vertices − Edges + Faces); Δβ₀ and Δχ measure topological match."),
-            ],
-        );
+        ui.add_space(6.0_f32);
+
+        // Equation 3: Terrain Ruggedness Index (TRI) & Surface Slope Safety (theta) with fraction bar
+        egui::Frame::none()
+            .fill(COLOR_CARD_BG)
+            .inner_margin(egui::Margin::same(10.0_f32))
+            .rounding(egui::Rounding::same(6.0_f32))
+            .stroke(egui::Stroke::new(1.0_f32, COLOR_BORDER))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "3. Terrain Ruggedness Index (TRI) & Surface Slope Angle (theta)",
+                    )
+                    .strong()
+                    .color(amber),
+                );
+                ui.add_space(4.0_f32);
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(9, 14, 24))
+                    .inner_margin(egui::Margin::symmetric(10.0_f32, 8.0_f32))
+                    .rounding(egui::Rounding::same(4.0_f32))
+                    .stroke(egui::Stroke::new(1.0_f32, amber))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0_f32;
+                            ui.label(math_token("TRI = sqrt( ", amber));
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0_f32;
+                                ui.label(math_token("1", amber));
+                                ui.separator();
+                                ui.label(math_token("8", amber));
+                            });
+                            ui.label(math_token(" * Sum", amber));
+                            ui.label(math_sub("n=1..8", amber));
+                            ui.label(math_token(" (z", amber));
+                            ui.label(math_sub("n", amber));
+                            ui.label(math_token(" - z", amber));
+                            ui.label(math_sub("0", amber));
+                            ui.label(math_token(")^2 )", amber));
+                        });
+                        ui.add_space(4.0_f32);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0_f32;
+                            ui.label(math_token(
+                                "theta = arctan( sqrt( (dz/dx)^2 + (dz/dy)^2 ) ) = arccos( n",
+                                amber,
+                            ));
+                            ui.label(math_sub("y", amber));
+                            ui.label(math_token(" )", amber));
+                        });
+                    });
+                render_equation_variables(
+                    ui,
+                    "eq_vars_tri_slope",
+                    &[
+                        (
+                            "z_0 , z_n",
+                            "Center cell elevation z_0 and its 8 immediate 3x3 neighbors z_n (meters).",
+                        ),
+                        (
+                            "dz/dx , dz/dy",
+                            "Horizontal surface gradients in local meter projection (+units=m).",
+                        ),
+                        (
+                            "theta <= 5 / 15 deg",
+                            "Local slope from vertical normal n_y: < 5 deg optimal habitat pad, < 15 deg safe lander touchdown.",
+                        ),
+                    ],
+                );
+            });
+
+        ui.add_space(6.0_f32);
+
+        // Equation 4: 0D Persistent Homology (beta_0) & Simplicial Euler Characteristic (chi)
+        egui::Frame::none()
+            .fill(COLOR_CARD_BG)
+            .inner_margin(egui::Margin::same(10.0_f32))
+            .rounding(egui::Rounding::same(6.0_f32))
+            .stroke(egui::Stroke::new(1.0_f32, COLOR_BORDER))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "4. 0D Persistent Homology (beta_0) & Euler Characteristic (chi)",
+                    )
+                    .strong()
+                    .color(amber),
+                );
+                ui.add_space(4.0_f32);
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(9, 14, 24))
+                    .inner_margin(egui::Margin::symmetric(10.0_f32, 8.0_f32))
+                    .rounding(egui::Rounding::same(4.0_f32))
+                    .stroke(egui::Stroke::new(1.0_f32, amber))
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0_f32;
+                            ui.label(math_token("chi = V - E + F   |   Persistence p", amber));
+                            ui.label(math_sub("k", amber));
+                            ui.label(math_token(" = |d", amber));
+                            ui.label(math_sub("k", amber));
+                            ui.label(math_token(" - b", amber));
+                            ui.label(math_sub("k", amber));
+                            ui.label(math_token("| >= tau", amber));
+                            ui.label(math_sub("noise", amber));
+                        });
+                    });
+                render_equation_variables(
+                    ui,
+                    "eq_vars_tda",
+                    &[
+                        (
+                            "beta_0",
+                            "0D Betti number counting persistent topological basins (craters/cold-traps) and peaks.",
+                        ),
+                        (
+                            "(b_k, d_k)",
+                            "Component birth height b_k and merge death height d_k tracked via Union-Find Elder Rule.",
+                        ),
+                        (
+                            "tau_noise",
+                            "Persistence threshold (5% of Delta_z) filtering micro-roughness from true craters/ridges.",
+                        ),
+                        (
+                            "chi = V - E + F",
+                            "Euler characteristic (Vertices - Edges + Faces); Delta_beta_0 and Delta_chi measure topological match.",
+                        ),
+                    ],
+                );
+            });
     });
 }
 
@@ -2609,31 +2990,31 @@ fn render_tab_settlement_guide(ui: &mut egui::Ui) {
         .small()
         .color(COLOR_TEXT_SECONDARY),
     );
-    ui.add_space(6.0);
+    ui.add_space(6.0_f32);
 
     let items = [
         (
-            "1. Landing & Habitat Slope Stability (θ < 5° .. 15°)",
-            "Challenge: Lunar and Martian landers risk dynamic rollover on slopes exceeding 10°–15°, and pressurized habitat modules require stable, low-gradient foundations (θ < 5°).",
-            "Solved by: Slope Safety & meter-projected DEM gradient analysis (θ = arctan(‖∇z‖) = arccos(n_y)), live Landing Slope Hazard 3D skin, and automated Safe Landing Area % (< 15° and < 5°).",
+            "1. Landing & Habitat Slope Stability (theta < 5 deg .. 15 deg)",
+            "Challenge: Lunar and Martian landers risk dynamic rollover on slopes exceeding 10-15 deg, and pressurized habitat modules require stable, low-gradient foundations (theta < 5 deg).",
+            "Solved by: Slope Safety & meter-projected DEM gradient analysis (theta = arccos(n_y)), live Landing Slope Hazard 3D skin, and automated Safe Landing Area % (< 15 deg and < 5 deg).",
         ),
         (
             "2. Solar Power & Cryogenic Volatile Access (Lunar South Pole)",
             "Challenge: Equatorial lunar nights last 354 hours (~100 K), whereas South Pole crater rims ('peaks of eternal light') receive >80% sunlight right next to ~40 K Permanently Shadowed Regions (PSRs) rich in water ice.",
-            "Solved by: Elevation Relief (Δz), Hypsometric Integral (HI), and the live Planetary Telemetry HUD (tracking Lunar Solar Time, synodic illumination %, and surface thermal range).",
+            "Solved by: Elevation Relief (Delta_z), Hypsometric Integral (HI), and the live Planetary Telemetry HUD (tracking Lunar Solar Time, synodic illumination %, and surface thermal range).",
         ),
         (
             "3. Rover Trafficability & Crew EVA Mobility",
             "Challenge: High boulder density and sharp decameter-scale ejecta ridges cause wheel slip, chassis high-centering, and elevated metabolic/battery energy consumption during EVAs.",
-            "Solved by: Terrain Ruggedness Index (TRI = √((1/8) · ∑(zₙ − z₀)²)) & Roughness Similarity, quantifying local root-mean-square elevation steps across the entire site.",
+            "Solved by: Terrain Ruggedness Index (TRI = sqrt((1/8) * Sum(z_n - z_0)^2)) & Roughness Similarity, quantifying local root-mean-square elevation steps across the entire site.",
         ),
         (
             "4. Natural Radiation & Micrometeorite Shielding",
             "Challenge: Outside Earth's magnetosphere, Galactic Cosmic Rays (GCR), Solar Particle Events (SPE), and secondary regolith ejecta require subterranean lava tubes, pit craters, or enclosed basin berms.",
-            "Solved by: 0D Persistent Homology (β₀ sublevel filtration via Union-Find Elder Rule) & Euler Characteristic (χ = V − E + F), automatically counting persistent closed basins and depressions for natural regolith shielding.",
+            "Solved by: 0D Persistent Homology (beta_0 sublevel filtration via Union-Find Elder Rule) & Euler Characteristic (chi = V - E + F), automatically counting persistent closed basins and depressions for natural regolith shielding.",
         ),
         (
-            "5. Pre-Flight Terrestrial Analog Validation (Earth ↔ Moon/Mars)",
+            "5. Pre-Flight Terrestrial Analog Validation (Earth <-> Moon/Mars)",
             "Challenge: Every habitat deployment mechanism, ISRU drill, and autonomous rover navigation stack must be field-tested on Earth in terrains that match target extraterrestrial geomorphology.",
             "Solved by: Cross-Body Analog Similarity Ranking (S_analog) & synchronized Split-Screen 3D Comparison, pairing terrestrial volcanic/impact sites directly with Lunar and Martian targets.",
         ),
@@ -2642,9 +3023,9 @@ fn render_tab_settlement_guide(ui: &mut egui::Ui) {
     for (title, challenge, solution) in items {
         egui::Frame::none()
             .fill(COLOR_CARD_BG)
-            .inner_margin(egui::Margin::same(10.0))
-            .rounding(egui::Rounding::same(6.0))
-            .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+            .inner_margin(egui::Margin::same(10.0_f32))
+            .rounding(egui::Rounding::same(6.0_f32))
+            .stroke(egui::Stroke::new(1.0_f32, COLOR_BORDER))
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new(title)
@@ -2656,7 +3037,7 @@ fn render_tab_settlement_guide(ui: &mut egui::Ui) {
                         .small()
                         .color(COLOR_TEXT_SECONDARY),
                 );
-                ui.add_space(2.0);
+                ui.add_space(2.0_f32);
                 ui.label(
                     egui::RichText::new(solution)
                         .small()
@@ -2664,7 +3045,7 @@ fn render_tab_settlement_guide(ui: &mut egui::Ui) {
                         .color(egui::Color32::from_rgb(74, 222, 128)),
                 );
             });
-        ui.add_space(6.0);
+        ui.add_space(6.0_f32);
     }
 }
 
@@ -2675,14 +3056,14 @@ fn render_tab_upload_and_reset(
     net: &NetBridge,
 ) {
     ui.heading("5. Researcher Upload, TDA & Workspace Reset");
-    ui.add_space(4.0);
+    ui.add_space(4.0_f32);
 
     if !app_state.authenticated {
         egui::Frame::none()
             .fill(COLOR_CARD_BG)
-            .inner_margin(egui::Margin::same(12.0))
-            .rounding(egui::Rounding::same(6.0))
-            .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+            .inner_margin(egui::Margin::same(12.0_f32))
+            .rounding(egui::Rounding::same(6.0_f32))
+            .stroke(egui::Stroke::new(1.0_f32, COLOR_BORDER))
             .show(ui, |ui| {
                 ui.label(
                     egui::RichText::new("Researcher Authentication Required")
@@ -2692,7 +3073,7 @@ fn render_tab_upload_and_reset(
                 ui.label(
                     "Log in with Researcher credentials to upload 50-100+ MiB .stl/.tif/.png files via binary multipart/form-data, run 0D Persistent Homology TDA, or clear/reset preloaded catalog maps.",
                 );
-                ui.add_space(6.0);
+                ui.add_space(6.0_f32);
                 if ui
                     .add(
                         egui::Button::new(
@@ -2715,10 +3096,10 @@ fn render_tab_upload_and_reset(
     // -------------------------------------------------------------------------
     egui::Frame::none()
         .fill(COLOR_CARD_BG)
-        .inner_margin(egui::Margin::same(10.0))
-        .rounding(egui::Rounding::same(6.0))
+        .inner_margin(egui::Margin::same(10.0_f32))
+        .rounding(egui::Rounding::same(6.0_f32))
         .stroke(egui::Stroke::new(
-            1.2,
+            1.2_f32,
             egui::Color32::from_rgb(248, 113, 113),
         ))
         .show(ui, |ui| {
@@ -2734,7 +3115,7 @@ fn render_tab_upload_and_reset(
                 .small()
                 .color(COLOR_TEXT_SECONDARY),
             );
-            ui.add_space(6.0);
+            ui.add_space(6.0_f32);
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add(
@@ -2770,16 +3151,16 @@ fn render_tab_upload_and_reset(
             });
         });
 
-    ui.add_space(8.0);
+    ui.add_space(8.0_f32);
 
     // -------------------------------------------------------------------------
     // Section B: Binary Multipart Terrain Upload & Automated TDA
     // -------------------------------------------------------------------------
     egui::Frame::none()
         .fill(COLOR_CARD_BG)
-        .inner_margin(egui::Margin::same(10.0))
-        .rounding(egui::Rounding::same(6.0))
-        .stroke(egui::Stroke::new(1.0, COLOR_BORDER))
+        .inner_margin(egui::Margin::same(10.0_f32))
+        .rounding(egui::Rounding::same(6.0_f32))
+        .stroke(egui::Stroke::new(1.0_f32, COLOR_BORDER))
         .show(ui, |ui| {
             ui.label(
                 egui::RichText::new(
@@ -2795,7 +3176,7 @@ fn render_tab_upload_and_reset(
                 .small()
                 .color(COLOR_TEXT_SECONDARY),
             );
-            ui.add_space(6.0);
+            ui.add_space(6.0_f32);
 
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Select .STL").clicked() {
@@ -2814,7 +3195,7 @@ fn render_tab_upload_and_reset(
 
             egui::Grid::new("upload_files_status_grid")
                 .num_columns(2)
-                .spacing([8.0, 4.0])
+                .spacing([8.0_f32, 4.0_f32])
                 .show(ui, |ui| {
                     ui.label("3D Mesh (.stl):");
                     if let (Some(name), Some(bytes)) = (
@@ -2895,10 +3276,10 @@ fn render_tab_upload_and_reset(
                 ));
             }
 
-            ui.add_space(6.0);
+            ui.add_space(6.0_f32);
             egui::Grid::new("upload_meta_grid")
                 .num_columns(2)
-                .spacing([8.0, 5.0])
+                .spacing([8.0_f32, 5.0_f32])
                 .show(ui, |ui| {
                     ui.label("Site Name:");
                     ui.text_edit_singleline(&mut app_state.upload_form.site_name);
@@ -2943,7 +3324,7 @@ fn render_tab_upload_and_reset(
                     ui.end_row();
                 });
 
-            ui.add_space(6.0);
+            ui.add_space(6.0_f32);
             let can_upload =
                 app_state.upload_form.has_terrain_file() && !app_state.upload_form.is_uploading;
             ui.add_enabled_ui(can_upload, |ui| {
@@ -2954,7 +3335,7 @@ fn render_tab_upload_and_reset(
                 };
                 if ui
                     .add_sized(
-                        [ui.available_width(), 32.0],
+                        [ui.available_width(), 32.0_f32],
                         egui::Button::new(
                             egui::RichText::new(btn_label)
                                 .strong()
@@ -2976,13 +3357,13 @@ fn render_tab_upload_and_reset(
         });
 
     if let Some(report) = &app_state.last_analysis_report {
-        ui.add_space(8.0);
+        ui.add_space(8.0_f32);
         egui::Frame::none()
             .fill(COLOR_CARD_BG)
-            .inner_margin(egui::Margin::same(10.0))
-            .rounding(egui::Rounding::same(6.0))
+            .inner_margin(egui::Margin::same(10.0_f32))
+            .rounding(egui::Rounding::same(6.0_f32))
             .stroke(egui::Stroke::new(
-                1.0,
+                1.0_f32,
                 egui::Color32::from_rgb(56, 189, 248),
             ))
             .show(ui, |ui| {
@@ -3008,14 +3389,14 @@ fn render_tab_upload_and_reset(
                     );
                 }
                 ui.monospace(format!(
-                    "Relief dz: {:.1}m | Slope mean: {:.2} deg | TRI: {:.2}m | HI: {:.3}",
+                    "Relief Delta_z: {:.1}m | Slope mean: {:.2} deg | TRI: {:.2}m | HI: {:.3}",
                     report.morphometry.elevation_range_m,
                     report.morphometry.slope_mean_deg,
                     report.morphometry.tri_mean_m,
                     report.morphometry.hypsometric_integral
                 ));
                 ui.monospace(format!(
-                    "Euler chi: {} | b0 Basins: {} | b0 Peaks: {}",
+                    "Euler chi: {} | beta_0 Basins: {} | beta_0 Peaks: {}",
                     report.topology.euler_characteristic,
                     report.topology.persistent_basins_b0,
                     report.topology.persistent_peaks_b0
@@ -3028,13 +3409,13 @@ fn render_tab_upload_and_reset(
             });
     }
 
-    ui.add_space(8.0);
+    ui.add_space(8.0_f32);
     egui::CollapsingHeader::new("Manual Site Metadata Editor (POST /api/sites)")
         .default_open(false)
         .show(ui, |ui| {
             egui::Grid::new("site_editor_grid")
                 .num_columns(2)
-                .spacing([8.0, 4.0])
+                .spacing([8.0_f32, 4.0_f32])
                 .show(ui, |ui| {
                     ui.label("Site ID:");
                     ui.text_edit_singleline(&mut app_state.site_editor.id);
