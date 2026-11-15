@@ -8,7 +8,8 @@
 //! - Scales vertical exaggeration exclusively along Bevy's `+Y` up axis:
 //!   `Transform.scale = Vec3::new(1.0, exaggeration, 1.0)`.
 //! - Includes the procedural 8x8 NW/SE UV verification checkerboard toggle.
-//! - Supports passwordless Public Demo Mode for judges and Argon2id Researcher Mode.
+//! - Supports passwordless Public Demo Mode for judges and Argon2id Researcher Mode
+//!   with 3D/DEM terrain upload and Topological Data Analysis (TDA).
 
 pub mod camera;
 pub mod mesh_loader;
@@ -16,8 +17,12 @@ pub mod net;
 pub mod ui;
 
 use analog_core::scoring::recalculate_catalog;
+#[cfg(not(target_arch = "wasm32"))]
+use analog_core::terrain_analysis::base64_encode;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::prelude::*;
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::window::FileDragAndDrop;
 use bevy_egui::EguiPlugin;
 
 use camera::{OrbitCamera, orbit_camera_system};
@@ -25,7 +30,12 @@ use mesh_loader::{
     build_checkerboard_bevy_image, decode_png_to_bevy_image,
     generate_synthetic_test_site_welded_mesh, parse_site_terrain_bytes, welded_mesh_to_bevy_mesh,
 };
-use net::{NetBridge, NetEvent, TerrainSlot};
+#[cfg(not(target_arch = "wasm32"))]
+use net::BrowserSelectedFile;
+use net::{
+    NetBridge, NetEvent, TerrainSlot, install_browser_file_drop_listener,
+    poll_browser_uploaded_files,
+};
 use ui::{SiteEditorForm, ViewerAppState, viewer_ui_system};
 
 /// Marker component for the primary 3D terrain mesh entity.
@@ -83,7 +93,7 @@ fn main() {
 }
 
 /// Initializes lighting, the orbital 3D camera, the UV verification checkerboard texture,
-/// and the initial `test_site` terrain mesh.
+/// the browser file drop listener, and the initial `test_site` terrain mesh.
 fn setup_scene_system(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -92,6 +102,8 @@ fn setup_scene_system(
     app_state: Res<ViewerAppState>,
     net: Res<NetBridge>,
 ) {
+    install_browser_file_drop_listener();
+
     // Primary solar directional light
     commands.spawn(DirectionalLightBundle {
         directional_light: DirectionalLight {
@@ -196,7 +208,8 @@ fn setup_scene_system(
     }
 }
 
-/// Processes asynchronous HTTP / asset loading responses from [`NetBridge`].
+/// Processes asynchronous HTTP / asset loading responses from [`NetBridge`] as well as
+/// browser/native file selections for `.stl`, `.tif`/`.tiff`, and `.png` uploads.
 fn process_net_events_system(
     net: Res<NetBridge>,
     mut app_state: ResMut<ViewerAppState>,
@@ -204,12 +217,57 @@ fn process_net_events_system(
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
     mut cam_query: Query<&mut OrbitCamera>,
+    #[cfg(not(target_arch = "wasm32"))] mut dnd_events: EventReader<FileDragAndDrop>,
 ) {
+    // 1. Poll files selected or dropped in the browser (WASM)
+    for file in poll_browser_uploaded_files() {
+        match app_state.upload_form.ingest_selected_file(file) {
+            Ok(msg) => {
+                app_state.status_message = msg;
+                app_state.error_message = None;
+            }
+            Err(err) => {
+                app_state.error_message = Some(err);
+            }
+        }
+    }
+
+    // 2. Poll native desktop drag-and-drop files
+    #[cfg(not(target_arch = "wasm32"))]
+    for ev in dnd_events.read() {
+        if let FileDragAndDrop::DroppedFile { path_buf, .. } = ev {
+            if let Ok(bytes) = std::fs::read(path_buf) {
+                let name = path_buf
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("dropped.stl")
+                    .to_string();
+                let selected = BrowserSelectedFile {
+                    name,
+                    size: bytes.len(),
+                    base64: base64_encode(&bytes),
+                };
+                match app_state.upload_form.ingest_selected_file(selected) {
+                    Ok(msg) => {
+                        app_state.status_message = msg;
+                        app_state.error_message = None;
+                    }
+                    Err(err) => {
+                        app_state.error_message = Some(err);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Process HTTP / asset events
     for event in net.drain_events() {
         match event {
             NetEvent::DemoLoaded { catalog, message } => {
                 app_state.status_message = message;
-                app_state.error_message = None;
+                if app_state.mode_selected {
+                    app_state.error_message = None;
+                }
                 app_state.apply_catalog(catalog);
                 if let Some(site) = app_state.primary_site().cloned() {
                     net.fetch_site_assets(TerrainSlot::Primary, &site);
@@ -218,7 +276,9 @@ fn process_net_events_system(
             NetEvent::CatalogLoaded(catalog) => {
                 app_state.status_message =
                     format!("Loaded catalog with {} site(s).", catalog.sites.len());
-                app_state.error_message = None;
+                if app_state.mode_selected {
+                    app_state.error_message = None;
+                }
                 app_state.apply_catalog(catalog);
                 if let Some(site) = app_state.primary_site().cloned() {
                     net.fetch_site_assets(TerrainSlot::Primary, &site);
@@ -272,6 +332,27 @@ fn process_net_events_system(
                 app_state.site_editor = SiteEditorForm::from_site(&saved_site);
                 net.fetch_site_assets(TerrainSlot::Primary, &saved_site);
             }
+            NetEvent::SiteUploaded(uploaded) => {
+                app_state.upload_form.is_uploading = false;
+                app_state.error_message = None;
+                let new_site = uploaded.report.generated_site_metadata.clone();
+                app_state.status_message = format!(
+                    "Analyzed '{}': proposed {} analog (score={:.4}, closest='{}', χ={}, β₀ basins={}).",
+                    new_site.name,
+                    uploaded.report.proposal.proposed_body.as_str().to_uppercase(),
+                    uploaded.report.proposal.analog_score,
+                    uploaded.report.proposal.closest_site_id,
+                    uploaded.report.topology.euler_characteristic,
+                    uploaded.report.topology.persistent_basins_b0
+                );
+                app_state.last_analysis_report = Some(uploaded.report);
+                app_state.primary_site_id = new_site.id.clone();
+                app_state.apply_catalog(uploaded.updated_catalog);
+                app_state.primary_site_id = new_site.id.clone();
+                app_state.site_editor = SiteEditorForm::from_site(&new_site);
+                app_state.show_checkerboard_uv = false;
+                net.fetch_site_assets(TerrainSlot::Primary, &new_site);
+            }
             NetEvent::SiteMeshBytesLoaded {
                 slot,
                 site_id,
@@ -301,8 +382,7 @@ fn process_net_events_system(
                                     "Loaded 3D mesh for '{}' ({} triangles, DemExtent UV mapped).",
                                     site.name, tri_count
                                 );
-                                let span =
-                                    site.dem_extent.width().max(site.dem_extent.height());
+                                let span = site.dem_extent.width().max(site.dem_extent.height());
                                 for mut cam in &mut cam_query {
                                     cam.frame_terrain(Vec3::ZERO, span);
                                 }
@@ -344,6 +424,7 @@ fn process_net_events_system(
                 }
             },
             NetEvent::Error(err) => {
+                app_state.upload_form.is_uploading = false;
                 app_state.error_message = Some(err);
             }
         }
@@ -385,7 +466,7 @@ fn sync_terrain_visuals_system(
             Visibility::Visible
         } else {
             Visibility::Hidden
-        };
+        }
     }
 
     // Update primary material texture (Checkerboard vs loaded PNG)
@@ -421,8 +502,8 @@ fn sync_terrain_visuals_system(
 
 #[cfg(test)]
 mod tests {
-    use analog_core::{Body, DemExtent, MeshFormat, SiteMetadata};
     use analog_core::tiff_dem::encode_uncompressed_f32_tiff;
+    use analog_core::{Body, DemExtent, MeshFormat, SiteMetadata};
     use std::collections::BTreeMap;
 
     use crate::mesh_loader::{

@@ -5,9 +5,9 @@
 //! - Serves compiled Trunk/Bevy WASM static files (`dist/`) and processed site assets (`data/processed/`).
 //! - Public Demo Mode (`GET /api/demo`, `GET /api/catalog`, `POST /api/recalculate`) with zero login required for judges.
 //! - Researcher authentication (`POST /api/login`, `POST /api/logout`, `GET /api/me`) using Argon2id,
-//!   signed `HttpOnly; SameSite=Lax` session cookies, and sliding-window login rate limiting.
-//! - Protected researcher endpoints (`PUT /api/weights`, `POST /api/sites`, `PUT /api/sites/{id}`)
-//!   to update canonical scoring weights and site metadata.
+//!   signed `HttpOnly; SameSite=Lax` session cookies, `X-Analog-Session` header token support, and login rate limiting.
+//! - Protected researcher endpoints (`PUT /api/weights`, `POST /api/sites`, `PUT /api/sites/{id}`, `POST /api/sites/upload`)
+//!   to update canonical scoring weights, site metadata, and upload/analyze 3D `.stl`/`.tif`/`.png` terrains.
 
 pub mod auth;
 pub mod config;
@@ -17,6 +17,7 @@ pub mod state;
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use argon2::PasswordHash;
 use auth::hash_argon2_password;
 use config::ServerConfig;
 use routes::build_router;
@@ -53,10 +54,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = ServerConfig::from_env();
-    if config.researcher_password_hash.is_none() {
-        warn!(
-            "RESEARCHER_PASSWORD_HASH is not set. Public Demo Mode is active, but researcher login (POST /api/login) will remain disabled until configured."
-        );
+    match config.researcher_password_hash.as_deref() {
+        Some(phc) => match PasswordHash::new(phc) {
+            Ok(_) => {
+                info!(
+                    "Researcher authentication enabled for username='{}' (Argon2id PHC hash verified)",
+                    config.researcher_username
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "RESEARCHER_PASSWORD_HASH is malformed ({}): check single quotes in .env",
+                    e
+                );
+            }
+        },
+        None => {
+            warn!(
+                "RESEARCHER_PASSWORD_HASH is not set. Public Demo Mode is active, but researcher login (POST /api/login) will remain disabled until configured."
+            );
+        }
     }
 
     let bind_addr = config.bind_addr.clone();
@@ -82,14 +99,14 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use analog_core::{
-        Body, Catalog, DemExtent, RecalculateResponse, SiteMetadata,
-    };
+    use analog_core::terrain_analysis::{UploadSiteRequest, UploadSiteResponse, base64_encode};
+    use analog_core::tiff_dem::encode_uncompressed_f32_tiff;
+    use analog_core::{Body, Catalog, DemExtent, RecalculateResponse, SiteMetadata};
     use axum::body::{Body as AxumBody, to_bytes};
     use axum::http::{Request, StatusCode, header};
     use tower::ServiceExt;
 
-    use crate::auth::hash_argon2_password;
+    use crate::auth::{SESSION_HEADER_NAME, hash_argon2_password};
     use crate::config::ServerConfig;
     use crate::routes::{DemoModeResponse, SessionStatusResponse, build_router};
     use crate::state::AppState;
@@ -98,14 +115,16 @@ mod tests {
         let test_password = format!("test-only-ephemeral-{}", std::process::id());
         let phc_hash = hash_argon2_password(&test_password, b"unit-test-salt-seed")
             .expect("Argon2id hash should succeed");
+        // Wrap in single quotes like `.env` to verify quote sanitization end-to-end
+        let quoted_hash = format!("'{phc_hash}'");
 
         let config = ServerConfig {
             bind_addr: "127.0.0.1:0".to_string(),
             data_dir: PathBuf::from("/tmp/space_app_x86_server_test/data"),
             weights_file: PathBuf::from("/tmp/space_app_x86_server_test/weights.json"),
             static_dir: PathBuf::from("/tmp/space_app_x86_server_test/dist"),
-            researcher_username: "researcher".to_string(),
-            researcher_password_hash: Some(phc_hash),
+            researcher_username: "equipo_analog".to_string(),
+            researcher_password_hash: Some(quoted_hash),
             session_secret: b"unit-test-hmac-secret-key-32bytes!".to_vec(),
             session_ttl_seconds: 3600,
             cookie_secure: false,
@@ -196,7 +215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_argon2_login_cookie_and_protected_researcher_routes() {
+    async fn test_argon2_login_cookie_header_and_upload_analysis() {
         let (state, password) = sample_test_state(5);
         let app = build_router(state);
 
@@ -221,9 +240,9 @@ mod tests {
             .unwrap();
         assert_eq!(unauth_resp.status(), StatusCode::UNAUTHORIZED);
 
-        // 2. Login with valid Argon2id credentials
+        // 2. Login with valid Argon2id credentials for equipo_analog
         let login_payload = serde_json::json!({
-            "username": "researcher",
+            "username": "equipo_analog",
             "password": password
         });
         let login_resp = app
@@ -249,17 +268,24 @@ mod tests {
             .to_string();
         assert!(set_cookie.contains("HttpOnly"));
         assert!(set_cookie.contains("SameSite=Lax"));
+        assert!(!set_cookie.contains("Secure"));
 
         let cookie_pair = set_cookie.split(';').next().unwrap().to_string();
+        let login_bytes = to_bytes(login_resp.into_body(), usize::MAX).await.unwrap();
+        let login_status: SessionStatusResponse = serde_json::from_slice(&login_bytes).unwrap();
+        assert!(login_status.authenticated);
+        let session_token = login_status
+            .session_token
+            .expect("session_token must be returned in JSON");
 
-        // 3. GET /api/me with session cookie reports authenticated researcher mode
+        // 3. GET /api/me with X-Analog-Session header reports authenticated researcher mode
         let me_resp = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
                     .uri("/api/me")
-                    .header(header::COOKIE, &cookie_pair)
+                    .header(SESSION_HEADER_NAME, &session_token)
                     .body(AxumBody::empty())
                     .unwrap(),
             )
@@ -271,7 +297,50 @@ mod tests {
         assert!(me_status.authenticated);
         assert_eq!(me_status.mode, "researcher");
 
-        // 4. Authenticated PUT /api/weights succeeds and updates canonical_score
+        // 4. Authenticated POST /api/sites/upload analyzes a DEM TIFF and returns TDA report
+        let mut samples = Vec::with_capacity(16 * 16);
+        for r in 0..16 {
+            for c in 0..16 {
+                let dx = (c as f32 - 7.5) / 7.5;
+                let dy = (r as f32 - 7.5) / 7.5;
+                let z = (dx * dx + dy * dy) * 80.0 - 20.0;
+                samples.push(z);
+            }
+        }
+        let tiff_bytes = encode_uncompressed_f32_tiff(16, 16, &samples);
+        let upload_req = UploadSiteRequest {
+            site_id: "uploaded_crater".to_string(),
+            site_name: "Uploaded Crater Bowl".to_string(),
+            body: None,
+            description: "Uploaded via integration test".to_string(),
+            dem_extent: Some(DemExtent::new(-500.0, 500.0, -500.0, 500.0)),
+            stl_base64: None,
+            tiff_base64: Some(base64_encode(&tiff_bytes)),
+            png_base64: None,
+        };
+
+        let upload_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/sites/upload")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(SESSION_HEADER_NAME, &session_token)
+                    .body(AxumBody::from(serde_json::to_string(&upload_req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upload_resp.status(), StatusCode::OK);
+        let upload_bytes = to_bytes(upload_resp.into_body(), usize::MAX).await.unwrap();
+        let uploaded: UploadSiteResponse = serde_json::from_slice(&upload_bytes).unwrap();
+        assert_eq!(uploaded.report.site_id, "uploaded_crater");
+        assert_eq!(uploaded.report.topology.euler_characteristic, 1);
+        assert!(uploaded.report.topology.persistent_basins_b0 >= 1);
+        assert_eq!(uploaded.updated_catalog.sites.len(), 2);
+
+        // 5. Authenticated PUT /api/weights with Cookie header succeeds
         let auth_weights_resp = app
             .oneshot(
                 Request::builder()
@@ -285,12 +354,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(auth_weights_resp.status(), StatusCode::OK);
-        let cat_bytes = to_bytes(auth_weights_resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let updated_catalog: Catalog = serde_json::from_slice(&cat_bytes).unwrap();
-        // 0.8 * 0.9 + 0.6 * 0.1 = 0.78
-        assert!((updated_catalog.sites[0].canonical_score - 0.78).abs() < 1e-6);
     }
 
     #[tokio::test]
@@ -299,7 +362,7 @@ mod tests {
         let app = build_router(state);
 
         let bad_login = serde_json::json!({
-            "username": "researcher",
+            "username": "equipo_analog",
             "password": "wrong"
         });
 

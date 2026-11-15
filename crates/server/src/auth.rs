@@ -1,6 +1,6 @@
 // AI-assisted
 //! Argon2id researcher authentication, HMAC-SHA256 signed `HttpOnly` / `SameSite=Lax`
-//! session cookies, and sliding-window login rate limiting.
+//! session cookies, header token fallback (`X-Analog-Session`), and sliding-window login rate limiting.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -11,17 +11,42 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::http::{HeaderMap, header};
 use sha2::{Digest, Sha256};
 
+use crate::config::sanitize_env_value;
+
 /// Name of the researcher session cookie.
 pub const SESSION_COOKIE_NAME: &str = "analog_session";
 
+/// Name of the researcher session header used as a cookie-less fallback over HTTP LAN (`10.42.0.133:8080`).
+pub const SESSION_HEADER_NAME: &str = "x-analog-session";
+
 /// Verifies a plain-text password against an Argon2id PHC string (`$argon2id$...`).
 pub fn verify_argon2_password(password: &str, expected_phc_hash: &str) -> Result<bool, String> {
-    let parsed_hash = PasswordHash::new(expected_phc_hash.trim())
-        .map_err(|e| format!("Invalid Argon2 PHC password hash configuration: {e}"))?;
+    let cleaned_hash = sanitize_env_value(expected_phc_hash);
+    let parsed_hash = PasswordHash::new(&cleaned_hash).map_err(|e| {
+        format!(
+            "Invalid Argon2 PHC password hash configuration (starts with '{}'): {e}",
+            cleaned_hash.chars().take(18).collect::<String>()
+        )
+    })?;
 
-    Ok(Argon2::default()
+    let argon = Argon2::default();
+    if argon
         .verify_password(password.as_bytes(), &parsed_hash)
-        .is_ok())
+        .is_ok()
+    {
+        return Ok(true);
+    }
+
+    let trimmed = password.trim();
+    if trimmed != password
+        && argon
+            .verify_password(trimmed.as_bytes(), &parsed_hash)
+            .is_ok()
+    {
+        return Ok(true);
+    }
+
+    Ok(false)
 }
 
 /// Generates an Argon2id PHC password hash string (`$argon2id$v=19$...`) for `.env` setup
@@ -37,7 +62,7 @@ pub fn hash_argon2_password(password: &str, salt_seed: &[u8]) -> Result<String, 
         .map_err(|e| format!("Failed to encode Argon2 salt: {e}"))?;
 
     let phc = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.trim().as_bytes(), &salt)
         .map_err(|e| format!("Failed to hash password with Argon2id: {e}"))?
         .to_string();
 
@@ -146,6 +171,7 @@ pub fn verify_session_token(
 }
 
 /// Builds a `Set-Cookie` header value with `HttpOnly` and `SameSite=Lax` attributes.
+/// Does NOT add `Secure` unless `secure` is explicitly enabled, so plain HTTP (`127.0.0.1` and LAN IP) works.
 pub fn build_session_cookie_header(
     username: &str,
     secret: &[u8],
@@ -153,6 +179,15 @@ pub fn build_session_cookie_header(
     secure: bool,
 ) -> String {
     let token = create_session_token(username, secret, ttl_seconds);
+    build_session_cookie_header_from_token(&token, ttl_seconds, secure)
+}
+
+/// Formats a `Set-Cookie` header value for an already-created session token.
+pub fn build_session_cookie_header_from_token(
+    token: &str,
+    ttl_seconds: u64,
+    secure: bool,
+) -> String {
     let secure_attr = if secure { "; Secure" } else { "" };
     format!(
         "{SESSION_COOKIE_NAME}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={ttl_seconds}{secure_attr}"
@@ -165,12 +200,40 @@ pub fn build_logout_cookie_header(secure: bool) -> String {
     format!("{SESSION_COOKIE_NAME}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure_attr}")
 }
 
-/// Extracts and validates the researcher session cookie from incoming HTTP headers.
+/// Extracts and validates the researcher session from `X-Analog-Session`, `Authorization: Bearer`,
+/// or `Cookie: analog_session=...`.
 pub fn extract_authenticated_researcher(
     headers: &HeaderMap,
     secret: &[u8],
     expected_username: &str,
 ) -> Option<String> {
+    // 1. Check explicit X-Analog-Session header (WASM / native client header)
+    if let Some(hdr) = headers
+        .get(SESSION_HEADER_NAME)
+        .and_then(|v| v.to_str().ok())
+    {
+        let token = hdr.trim();
+        if let Some(user) = verify_session_token(token, secret, expected_username) {
+            return Some(user);
+        }
+    }
+
+    // 2. Check Authorization: Bearer <token>
+    if let Some(auth_hdr) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    {
+        let token = auth_hdr
+            .trim()
+            .strip_prefix("Bearer ")
+            .or_else(|| auth_hdr.trim().strip_prefix("bearer "))
+            .unwrap_or(auth_hdr.trim());
+        if let Some(user) = verify_session_token(token, secret, expected_username) {
+            return Some(user);
+        }
+    }
+
+    // 3. Check Cookie: analog_session=<token>
     for cookie_header in headers.get_all(header::COOKIE) {
         let Ok(raw_str) = cookie_header.to_str() else {
             continue;
@@ -251,5 +314,12 @@ impl LoginRateLimiter {
 
         attempts.push(now);
         Ok(())
+    }
+
+    /// Clears rate-limit history for `client_key` after a successful login.
+    pub fn clear_for_client(&self, client_key: &str) {
+        if let Ok(mut guard) = self.buckets.lock() {
+            guard.remove(client_key);
+        }
     }
 }

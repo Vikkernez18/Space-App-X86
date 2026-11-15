@@ -1,13 +1,18 @@
 // AI-assisted
 //! Axum router and HTTP handlers for Public Demo Mode, Argon2id Researcher Auth,
-//! protected catalog/weight management, and static WASM/asset serving.
+//! protected catalog/weight management, 3D/DEM terrain upload & topological analysis,
+//! and static WASM/asset serving.
 
 use std::collections::BTreeMap;
+use std::fs;
 
 use analog_core::scoring::{compute_weighted_score, normalize_weights, recalculate_catalog};
 use analog_core::stl::MAX_TRIANGLES;
+use analog_core::terrain_analysis::{
+    UploadSiteRequest, UploadSiteResponse, analyze_and_build_site_bundle,
+};
 use analog_core::{Catalog, RecalculateRequest, RecalculateResponse, SiteMetadata};
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -16,12 +21,16 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
+use tracing::{info, warn};
 
 use crate::auth::{
-    build_logout_cookie_header, build_session_cookie_header, extract_authenticated_researcher,
-    extract_client_key, verify_argon2_password,
+    build_logout_cookie_header, build_session_cookie_header_from_token, create_session_token,
+    extract_authenticated_researcher, extract_client_key, verify_argon2_password,
 };
 use crate::state::AppState;
+
+/// Maximum JSON request body size for `/api/sites/upload` (64 MiB to accommodate binary `.stl`, `.tif`, `.png`).
+pub const MAX_UPLOAD_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Standard JSON error payload (always in English per `AGENTS.md` §4.3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +54,8 @@ pub struct SessionStatusResponse {
     pub mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
     pub message: String,
     pub generated_by: String,
 }
@@ -100,9 +111,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/me", get(session_status_handler))
         .route("/login", post(login_handler))
         .route("/logout", post(logout_handler))
-        .route("/weights", put(update_weights_handler).post(update_weights_handler))
+        .route(
+            "/weights",
+            put(update_weights_handler).post(update_weights_handler),
+        )
         .route("/sites", post(upsert_site_body_handler))
-        .route("/sites/{id}", put(upsert_site_path_handler));
+        .route("/sites/upload", post(upload_and_analyze_site_handler))
+        .route("/sites/{id}", put(upsert_site_path_handler))
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BODY_BYTES));
 
     Router::new()
         .nest("/api", api_router.clone())
@@ -187,10 +203,16 @@ async fn session_status_handler(
         &state.config.session_secret,
         &state.config.researcher_username,
     ) {
+        let token = create_session_token(
+            &username,
+            &state.config.session_secret,
+            state.config.session_ttl_seconds,
+        );
         Json(SessionStatusResponse {
             authenticated: true,
             mode: "researcher".to_string(),
             username: Some(username),
+            session_token: Some(token),
             message: "Authenticated researcher session active.".to_string(),
             generated_by: "analog_server".to_string(),
         })
@@ -199,6 +221,7 @@ async fn session_status_handler(
             authenticated: false,
             mode: "demo".to_string(),
             username: None,
+            session_token: None,
             message: "Public Demo Mode active (no login required for viewing and recalculation)."
                 .to_string(),
             generated_by: "analog_server".to_string(),
@@ -207,7 +230,7 @@ async fn session_status_handler(
 }
 
 /// `POST /api/login` — Authenticates a researcher using Argon2id, enforces per-IP rate limiting,
-/// and issues a signed `HttpOnly; SameSite=Lax` session cookie.
+/// and issues both a signed `HttpOnly; SameSite=Lax` session cookie and a `session_token` for WASM/LAN clients.
 async fn login_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -229,36 +252,59 @@ async fn login_handler(
     }
 
     let Some(expected_hash) = state.config.researcher_password_hash.as_deref() else {
+        warn!("POST /api/login rejected: RESEARCHER_PASSWORD_HASH is not configured");
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Researcher login is disabled because RESEARCHER_PASSWORD_HASH is not set in the server environment. Use Public Demo Mode instead.",
+            "Researcher login is disabled because RESEARCHER_PASSWORD_HASH is not set in the server environment (.env). Use Public Demo Mode instead.",
         );
     };
 
-    let username_matches = req.username.trim() == state.config.researcher_username;
+    let submitted_user = req.username.trim();
+    let expected_user = state.config.researcher_username.trim();
+    let username_matches = submitted_user == expected_user;
     let password_matches = match verify_argon2_password(&req.password, expected_hash) {
         Ok(valid) => valid,
         Err(err) => {
+            warn!("Argon2 configuration error during POST /api/login: {err}");
             return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
         }
     };
 
     if !username_matches || !password_matches {
-        return json_error(StatusCode::UNAUTHORIZED, "Invalid username or password.");
+        warn!(
+            "Failed researcher login attempt for user '{}' (expected '{}', username_match={}, password_match={})",
+            submitted_user, expected_user, username_matches, password_matches
+        );
+        return json_error(
+            StatusCode::UNAUTHORIZED,
+            format!(
+                "Invalid username or password (expected researcher username: '{expected_user}')."
+            ),
+        );
     }
 
-    let cookie_val = build_session_cookie_header(
-        &state.config.researcher_username,
+    // Clear rate-limit bucket on successful authentication
+    state.rate_limiter.clear_for_client(&client_key);
+
+    let token = create_session_token(
+        expected_user,
         &state.config.session_secret,
+        state.config.session_ttl_seconds,
+    );
+    let cookie_val = build_session_cookie_header_from_token(
+        &token,
         state.config.session_ttl_seconds,
         state.config.cookie_secure,
     );
 
+    info!("Researcher '{}' authenticated via Argon2id", expected_user);
+
     let body = SessionStatusResponse {
         authenticated: true,
         mode: "researcher".to_string(),
-        username: Some(state.config.researcher_username.clone()),
-        message: "Researcher login successful (Argon2id verified).".to_string(),
+        username: Some(expected_user.to_string()),
+        session_token: Some(token),
+        message: format!("Researcher '{expected_user}' logged in (Argon2id verified)."),
         generated_by: "analog_server".to_string(),
     };
 
@@ -276,6 +322,7 @@ async fn logout_handler(State(state): State<AppState>) -> Response {
         authenticated: false,
         mode: "demo".to_string(),
         username: None,
+        session_token: None,
         message: "Researcher session ended. Returned to Public Demo Mode.".to_string(),
         generated_by: "analog_server".to_string(),
     };
@@ -329,6 +376,116 @@ async fn update_weights_handler(
     let _ = state.persist_catalog(&updated_catalog);
 
     Ok(Json(updated_catalog))
+}
+
+/// `POST /api/sites/upload` — Authenticated researcher endpoint to upload binary `.stl`,
+/// `.tif`/`.tiff` DEM, and/or `.png` texture files, execute full mathematical, differential-geometric,
+/// and topological data analysis (0D Persistent Homology + Euler-Poincaré characteristic),
+/// persist the site assets to `data/processed/<site_id>/`, and register the site in `catalog.json`.
+async fn upload_and_analyze_site_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<UploadSiteRequest>,
+) -> Result<Json<UploadSiteResponse>, Response> {
+    let researcher = require_researcher(&headers, &state)?;
+
+    let current_catalog = state
+        .catalog
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+
+    let bundle = analyze_and_build_site_bundle(&req, &current_catalog)
+        .map_err(|e| json_error(StatusCode::BAD_REQUEST, e))?;
+
+    let site_id = bundle.report.site_id.clone();
+    let site_metadata = bundle.report.generated_site_metadata.clone();
+
+    // Persist terrain.stl, dem.tif, albedo.png, and metadata.json under data/processed/<site_id>/
+    let site_dir = state.config.data_dir.join(&site_id);
+    if let Err(e) = fs::create_dir_all(&site_dir) {
+        return Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "Failed to create site directory {}: {e}",
+                site_dir.display()
+            ),
+        ));
+    }
+
+    let stl_path = site_dir.join("terrain.stl");
+    if let Err(e) = fs::write(&stl_path, &bundle.stl_bytes) {
+        return Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to write {}: {e}", stl_path.display()),
+        ));
+    }
+
+    let tiff_path = site_dir.join("dem.tif");
+    if let Err(e) = fs::write(&tiff_path, &bundle.tiff_bytes) {
+        return Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to write {}: {e}", tiff_path.display()),
+        ));
+    }
+
+    let png_path = site_dir.join("albedo.png");
+    if let Err(e) = fs::write(&png_path, &bundle.png_bytes) {
+        return Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to write {}: {e}", png_path.display()),
+        ));
+    }
+
+    let metadata_path = site_dir.join("metadata.json");
+    if let Ok(meta_json) = serde_json::to_string_pretty(&site_metadata) {
+        let _ = fs::write(&metadata_path, meta_json);
+    }
+
+    info!(
+        "Researcher '{}' uploaded & analyzed site '{}' (triangles={}, analog_score={:.4}, closest='{}')",
+        researcher,
+        site_id,
+        site_metadata.triangle_count,
+        bundle.report.proposal.analog_score,
+        bundle.report.proposal.closest_site_id
+    );
+
+    let updated_catalog = {
+        let mut catalog = state
+            .catalog
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        if let Some(existing) = catalog
+            .sites
+            .iter_mut()
+            .find(|s| s.id == site_metadata.id)
+        {
+            *existing = site_metadata;
+        } else {
+            catalog.sites.push(site_metadata);
+        }
+
+        catalog.sites.sort_by(|a, b| {
+            b.canonical_score
+                .partial_cmp(&a.canonical_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        catalog.generated_by = Some(format!(
+            "analog_server (uploaded & analyzed by {researcher})"
+        ));
+        catalog.clone()
+    };
+
+    let _ = state.persist_catalog(&updated_catalog);
+
+    Ok(Json(UploadSiteResponse {
+        report: bundle.report,
+        updated_catalog,
+        generated_by: "AI-assisted (analog_server::upload_and_analyze_site)".to_string(),
+    }))
 }
 
 /// `POST /api/sites` — Authenticated researcher endpoint to insert or update a site in the catalog.

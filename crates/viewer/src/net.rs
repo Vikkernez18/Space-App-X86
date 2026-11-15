@@ -1,15 +1,18 @@
 // AI-assisted
-//! Asynchronous HTTP client bridge (`ehttp`) for WASM and native desktop.
+//! Asynchronous HTTP client bridge (`ehttp`) and browser file picker / drag-and-drop bridge
+//! for WASM and native desktop.
 //!
 //! Connects the Bevy viewer to:
 //! - Public Demo Mode (`GET /api/demo`, `GET /api/catalog`, `POST /api/recalculate`)
 //! - Static fallback (`data/processed/catalog.json`, `.stl`, `.tif`, `.png`) for GitHub Pages
 //! - Argon2id Researcher Authentication (`POST /api/login`, `POST /api/logout`, `GET /api/me`)
-//! - Protected Researcher Actions (`PUT /api/weights`, `POST /api/sites`)
+//!   with both `HttpOnly; SameSite=Lax` cookies and `X-Analog-Session` token header support
+//! - Protected Researcher Actions (`PUT /api/weights`, `POST /api/sites`, `POST /api/sites/upload`)
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use analog_core::terrain_analysis::{UploadSiteRequest, UploadSiteResponse};
 use analog_core::{
     Body, Catalog, DemExtent, RecalculateRequest, RecalculateResponse, SiteMetadata,
 };
@@ -21,6 +24,14 @@ use serde::{Deserialize, Serialize};
 pub enum TerrainSlot {
     Primary,
     Comparison,
+}
+
+/// File selected via browser `<input type="file">` or HTML5 drag-and-drop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserSelectedFile {
+    pub name: String,
+    pub size: usize,
+    pub base64: String,
 }
 
 /// Events produced by asynchronous HTTP / asset callbacks and consumed by Bevy `Update` systems.
@@ -40,6 +51,7 @@ pub enum NetEvent {
     Recalculated(RecalculateResponse),
     CanonicalWeightsSaved(Catalog),
     SiteSaved(SiteMetadata),
+    SiteUploaded(UploadSiteResponse),
     SiteMeshBytesLoaded {
         slot: TerrainSlot,
         site_id: String,
@@ -66,6 +78,8 @@ struct SessionApiPayload {
     #[serde(default)]
     pub username: Option<String>,
     #[serde(default)]
+    pub session_token: Option<String>,
+    #[serde(default)]
     pub message: String,
 }
 
@@ -85,6 +99,7 @@ struct LoginApiPayload {
 pub struct NetBridge {
     queue: Arc<Mutex<VecDeque<NetEvent>>>,
     session_cookie: Arc<Mutex<Option<String>>>,
+    session_token: Arc<Mutex<Option<String>>>,
     base_url: String,
 }
 
@@ -99,6 +114,7 @@ impl Default for NetBridge {
         Self {
             queue: Arc::new(Mutex::new(VecDeque::new())),
             session_cookie: Arc::new(Mutex::new(None)),
+            session_token: Arc::new(Mutex::new(None)),
             base_url: base_url.trim_end_matches('/').to_string(),
         }
     }
@@ -128,7 +144,7 @@ impl NetBridge {
     fn api_url(&self, path: &str) -> String {
         let clean = path.trim_start_matches('/');
         if self.base_url.is_empty() {
-            clean.to_string()
+            format!("/{clean}")
         } else {
             format!("{}/{}", self.base_url, clean)
         }
@@ -151,7 +167,15 @@ impl NetBridge {
         }
     }
 
-    fn attach_cookie(&self, req: &mut ehttp::Request) {
+    fn attach_auth(&self, req: &mut ehttp::Request) {
+        if let Some(token) = self
+            .session_token
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            req.headers.insert("x-analog-session", token);
+        }
         if let Some(cookie) = self
             .session_cookie
             .lock()
@@ -188,17 +212,21 @@ impl NetBridge {
         }
     }
 
-    /// Queries `GET /api/me` to check if an authenticated researcher session cookie is active.
+    /// Queries `GET /api/me` to check if an authenticated researcher session is active.
     pub fn check_session(&self) {
         let mut req = ehttp::Request::get(self.api_url("api/me"));
-        self.attach_cookie(&mut req);
+        self.attach_auth(&mut req);
         let queue = Arc::clone(&self.queue);
+        let token_store = Arc::clone(&self.session_token);
 
         ehttp::fetch(req, move |result| {
             if let Ok(resp) = result
                 && resp.ok
                 && let Ok(status) = serde_json::from_slice::<SessionApiPayload>(&resp.bytes)
             {
+                if let Some(tok) = &status.session_token {
+                    *token_store.lock().unwrap_or_else(|p| p.into_inner()) = Some(tok.clone());
+                }
                 Self::push_to_queue(
                     &queue,
                     NetEvent::SessionStatus {
@@ -294,11 +322,17 @@ impl NetBridge {
 
         let queue = Arc::clone(&self.queue);
         let cookie_store = Arc::clone(&self.session_cookie);
+        let token_store = Arc::clone(&self.session_token);
+        let bridge_after_login = self.clone();
 
         ehttp::fetch(req, move |result| match result {
             Ok(resp) if resp.ok => {
                 Self::capture_cookie_from_response(&cookie_store, &resp);
                 if let Ok(status) = serde_json::from_slice::<SessionApiPayload>(&resp.bytes) {
+                    if let Some(tok) = &status.session_token {
+                        *token_store.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(tok.clone());
+                    }
                     Self::push_to_queue(
                         &queue,
                         NetEvent::SessionStatus {
@@ -308,6 +342,9 @@ impl NetBridge {
                             message: status.message,
                         },
                     );
+                    if status.authenticated {
+                        bridge_after_login.fetch_catalog_with_static_fallback();
+                    }
                 }
             }
             Ok(resp) => {
@@ -322,15 +359,17 @@ impl NetBridge {
         });
     }
 
-    /// Submits `POST /api/logout` to clear the researcher session cookie.
+    /// Submits `POST /api/logout` to clear the researcher session cookie and token.
     pub fn logout(&self) {
         let mut req = ehttp::Request::post(self.api_url("api/logout"), Vec::new());
-        self.attach_cookie(&mut req);
+        self.attach_auth(&mut req);
         let queue = Arc::clone(&self.queue);
         let cookie_store = Arc::clone(&self.session_cookie);
+        let token_store = Arc::clone(&self.session_token);
 
         ehttp::fetch(req, move |result| {
             *cookie_store.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            *token_store.lock().unwrap_or_else(|p| p.into_inner()) = None;
             if let Ok(resp) = result
                 && resp.ok
                 && let Ok(status) = serde_json::from_slice::<SessionApiPayload>(&resp.bytes)
@@ -364,7 +403,7 @@ impl NetBridge {
         let body = serde_json::to_vec(&payload).unwrap_or_default();
         let mut req = ehttp::Request::post(self.api_url("api/recalculate"), body);
         req.headers.insert("Content-Type", "application/json");
-        self.attach_cookie(&mut req);
+        self.attach_auth(&mut req);
 
         let queue = Arc::clone(&self.queue);
         ehttp::fetch(req, move |result| {
@@ -384,7 +423,7 @@ impl NetBridge {
         let mut req = ehttp::Request::post(self.api_url("api/weights"), body);
         req.method = "PUT".to_string();
         req.headers.insert("Content-Type", "application/json");
-        self.attach_cookie(&mut req);
+        self.attach_auth(&mut req);
 
         let queue = Arc::clone(&self.queue);
         ehttp::fetch(req, move |result| match result {
@@ -410,7 +449,7 @@ impl NetBridge {
         let body = serde_json::to_vec(&site).unwrap_or_default();
         let mut req = ehttp::Request::post(self.api_url("api/sites"), body);
         req.headers.insert("Content-Type", "application/json");
-        self.attach_cookie(&mut req);
+        self.attach_auth(&mut req);
 
         let queue = Arc::clone(&self.queue);
         ehttp::fetch(req, move |result| match result {
@@ -426,6 +465,41 @@ impl NetBridge {
                 Self::push_to_queue(
                     &queue,
                     NetEvent::Error(format!("Failed to save site metadata: {err}")),
+                );
+            }
+        });
+    }
+
+    /// Sends `POST /api/sites/upload` (authenticated researcher only) to upload `.stl`, `.tif`/`.tiff`,
+    /// and/or `.png` files, run morphometric + topological data analysis (0D Persistent Homology + Euler characteristic),
+    /// and register the new site in `data/processed/`.
+    pub fn upload_and_analyze_site(&self, upload_req: UploadSiteRequest) {
+        let body = serde_json::to_vec(&upload_req).unwrap_or_default();
+        let mut req = ehttp::Request::post(self.api_url("api/sites/upload"), body);
+        req.headers.insert("Content-Type", "application/json");
+        self.attach_auth(&mut req);
+
+        let queue = Arc::clone(&self.queue);
+        ehttp::fetch(req, move |result| match result {
+            Ok(resp) if resp.ok => match serde_json::from_slice::<UploadSiteResponse>(&resp.bytes)
+            {
+                Ok(uploaded) => {
+                    Self::push_to_queue(&queue, NetEvent::SiteUploaded(uploaded));
+                }
+                Err(err) => {
+                    Self::push_to_queue(
+                        &queue,
+                        NetEvent::Error(format!("Failed to parse upload analysis response: {err}")),
+                    );
+                }
+            },
+            Ok(resp) => {
+                Self::push_to_queue(&queue, NetEvent::Error(Self::parse_api_error(&resp)));
+            }
+            Err(err) => {
+                Self::push_to_queue(
+                    &queue,
+                    NetEvent::Error(format!("Upload & terrain analysis request failed: {err}")),
                 );
             }
         });
@@ -515,6 +589,94 @@ impl NetBridge {
     }
 }
 
+/// Installs an HTML5 drag-and-drop file reader on `window` when running in WebAssembly.
+pub fn install_browser_file_drop_listener() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let script = r#"
+        (function() {
+            if (window.__space_app_drop_installed) return;
+            window.__space_app_drop_installed = true;
+            window.__space_app_uploads = window.__space_app_uploads || [];
+            window.__space_app_read_files = function(fileList) {
+                if (!fileList) return;
+                for (let i = 0; i < fileList.length; i++) {
+                    const f = fileList[i];
+                    const reader = new FileReader();
+                    reader.onload = function(evt) {
+                        const res = evt.target && evt.target.result ? String(evt.target.result) : "";
+                        const comma = res.indexOf(",");
+                        const b64 = comma >= 0 ? res.slice(comma + 1) : res;
+                        window.__space_app_uploads.push({
+                            name: f.name,
+                            size: f.size,
+                            base64: b64
+                        });
+                    };
+                    reader.readAsDataURL(f);
+                }
+            };
+            window.addEventListener("dragover", function(e) {
+                e.preventDefault();
+            }, false);
+            window.addEventListener("drop", function(e) {
+                e.preventDefault();
+                if (e.dataTransfer && e.dataTransfer.files) {
+                    window.__space_app_read_files(e.dataTransfer.files);
+                }
+            }, false);
+        })();
+        "#;
+        let _ = js_sys::eval(script);
+    }
+}
+
+/// Opens a browser `<input type="file">` dialog for selecting `.stl`, `.tif`/`.tiff`, or `.png` files.
+#[allow(unused_variables)]
+pub fn open_browser_file_dialog(accept: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        install_browser_file_drop_listener();
+        let escaped_accept = accept.replace('"', "");
+        let script = format!(
+            r#"
+            (function() {{
+                let inp = document.createElement("input");
+                inp.type = "file";
+                inp.multiple = true;
+                inp.accept = "{escaped_accept}";
+                inp.style.display = "none";
+                inp.onchange = function(e) {{
+                    if (inp.files && window.__space_app_read_files) {{
+                        window.__space_app_read_files(inp.files);
+                    }}
+                    inp.remove();
+                }};
+                document.body.appendChild(inp);
+                inp.click();
+            }})();
+            "#
+        );
+        let _ = js_sys::eval(&script);
+    }
+}
+
+/// Drains any files selected or dropped in the browser since the last frame.
+pub fn poll_browser_uploaded_files() -> Vec<BrowserSelectedFile> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Ok(val) = js_sys::eval(
+            "window.__space_app_uploads && window.__space_app_uploads.length > 0 ? JSON.stringify(window.__space_app_uploads.splice(0)) : ''",
+        ) && let Some(json_str) = val.as_string()
+            && !json_str.is_empty()
+            && let Ok(files) = serde_json::from_str::<Vec<BrowserSelectedFile>>(&json_str)
+        {
+            return files;
+        }
+    }
+    Vec::new()
+}
+
 /// Built-in synthetic fallback catalog containing `test_site` so the viewer works
 /// even before `catalog.json` or the backend server is reachable.
 pub fn fallback_synthetic_catalog() -> Catalog {
@@ -541,7 +703,7 @@ pub fn fallback_synthetic_catalog() -> Catalog {
             center_lat_lon: Some([-89.5, 0.0]),
             dem_extent: DemExtent::new(-1000.0, 1000.0, -1000.0, 1000.0),
             elevation_range_m: Some([-45.0, 120.0]),
-            triangle_count: 2048,
+            triangle_count: 8192,
             mesh_path: "test_site/terrain.stl".to_string(),
             mesh_format: None,
             texture_path: "test_site/checkerboard.png".to_string(),

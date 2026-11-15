@@ -12,6 +12,7 @@
 pub mod models;
 pub mod scoring;
 pub mod stl;
+pub mod terrain_analysis;
 pub mod tiff_dem;
 
 pub use models::{
@@ -19,6 +20,11 @@ pub use models::{
     SiteMetadata, WeightsConfig,
 };
 pub use stl::{WeldedMesh, parse_and_weld_stl};
+pub use terrain_analysis::{
+    AnalogProposal, MorphometryMetrics, ProcessedSiteBundle, TerrainAnalysisReport,
+    TopologyMetrics, UploadSiteRequest, UploadSiteResponse, analyze_and_build_site_bundle,
+    base64_decode, base64_encode,
+};
 pub use tiff_dem::parse_dem_tiff;
 
 #[cfg(test)]
@@ -296,5 +302,102 @@ mod tests {
         assert_eq!(response.results.len(), 2);
         assert_eq!(response.results[0].site_id, "site_a");
         assert!((response.results[0].score - 0.80).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_terrain_analysis_morphometry_persistent_homology_and_euler_on_test_site() {
+        use crate::terrain_analysis::{
+            UploadSiteRequest, analyze_and_build_site_bundle, base64_encode,
+        };
+
+        let stl_bytes = include_bytes!("../../../data/processed/test_site/terrain.stl");
+        let extent = DemExtent::new(-1000.0, 1000.0, -1000.0, 1000.0);
+
+        let mut default_weights = BTreeMap::new();
+        default_weights.insert("slope_safety".to_string(), 0.35);
+        default_weights.insert("roughness_similarity".to_string(), 0.25);
+        default_weights.insert("elevation_relief".to_string(), 0.20);
+        default_weights.insert("geomorphology_match".to_string(), 0.20);
+
+        let mut ref_features = BTreeMap::new();
+        ref_features.insert("slope_safety".to_string(), 0.85);
+        ref_features.insert("roughness_similarity".to_string(), 0.90);
+        ref_features.insert("elevation_relief".to_string(), 0.75);
+        ref_features.insert("geomorphology_match".to_string(), 0.88);
+
+        let catalog = Catalog {
+            version: "1.0.0".to_string(),
+            default_weights,
+            sites: vec![SiteMetadata {
+                id: "test_site".to_string(),
+                name: "Synthetic Crater & Ridge UV Verification Site".to_string(),
+                body: Body::Moon,
+                description: "Reference lunar crater site".to_string(),
+                center_lat_lon: Some([-89.5, 0.0]),
+                dem_extent: extent,
+                elevation_range_m: Some([-45.0, 120.0]),
+                triangle_count: 2048,
+                mesh_path: "test_site/terrain.stl".to_string(),
+                mesh_format: Some(MeshFormat::Stl),
+                texture_path: "test_site/checkerboard.png".to_string(),
+                feature_scores: ref_features,
+                canonical_score: 0.8485,
+                generated_by: None,
+            }],
+            generated_by: None,
+        };
+
+        let req = UploadSiteRequest {
+            site_id: "test_site_tda".to_string(),
+            site_name: "Synthetic Crater TDA Test".to_string(),
+            body: None,
+            description: "Topological & morphometric verification".to_string(),
+            dem_extent: Some(extent),
+            stl_base64: Some(base64_encode(stl_bytes)),
+            tiff_base64: None,
+            png_base64: None,
+        };
+
+        let bundle = analyze_and_build_site_bundle(&req, &catalog)
+            .expect("analyze_and_build_site_bundle should succeed on test_site STL");
+
+        // Verify triangle budget & STL/TIFF/PNG generation
+        assert!(bundle.report.generated_site_metadata.triangle_count <= MAX_TRIANGLES);
+        assert_eq!(bundle.report.generated_site_metadata.triangle_count, 2048);
+        assert!(!bundle.stl_bytes.is_empty());
+        assert!(!bundle.tiff_bytes.is_empty());
+        assert!(bundle.png_bytes.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]));
+
+        // Verify morphometry metrics (slope, TRI, hypsometric integral, tortuosity)
+        let morph = &bundle.report.morphometry;
+        assert!(morph.elevation_range_m > 100.0);
+        assert!(morph.slope_mean_deg > 1.0 && morph.slope_mean_deg < 45.0);
+        assert!(morph.slope_p90_deg >= morph.slope_mean_deg);
+        assert!(morph.tri_mean_m > 0.0);
+        assert!(morph.roughness_rms_m > 0.0);
+        assert!(morph.hypsometric_integral > 0.05 && morph.hypsometric_integral < 0.95);
+        assert!(morph.surface_to_planar_ratio > 1.0);
+
+        // Verify 0D Persistent Homology (beta_0 sublevel basins & superlevel peaks) and Euler characteristic
+        let topo = &bundle.report.topology;
+        assert!(
+            topo.persistent_basins_b0 >= 1,
+            "Crater terrain must have at least 1 persistent sublevel basin"
+        );
+        assert!(
+            topo.persistent_peaks_b0 >= 1,
+            "Crater rim/central peak must have at least 1 persistent superlevel peak"
+        );
+        assert!(topo.max_persistence_m > 5.0);
+        // Simply connected 32x32 grid sheet: V = 1089, E = 3136, F = 2048 -> V - E + F = 1
+        assert_eq!(topo.euler_characteristic, 1);
+        assert_eq!(topo.connected_components, 1);
+        assert!(topo.is_manifold_with_boundary);
+
+        // Verify Analog Proposal
+        let proposal = &bundle.report.proposal;
+        assert!(proposal.analog_score > 0.0 && proposal.analog_score <= 1.0);
+        assert_eq!(proposal.closest_site_id, "test_site");
+        assert!(!proposal.justification.is_empty());
     }
 }
