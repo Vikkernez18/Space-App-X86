@@ -5,7 +5,8 @@
 //! Strictly enforces `AGENTS.md` §2:
 //! - Converts Z-up STL / DEM coordinates to Bevy's right-handed Y-up space via `analog_core`.
 //! - Uses planar UVs derived strictly from `DemExtent` (`min_x`, `max_x`, `min_y`, `max_y`).
-//! - Uses `Indices::U32` and enforces `<= 50,000` triangles per site.
+//! - Uses `Indices::U32` and enforces `<= 50,000` triangles per site (automatically simplifying
+//!   any `.stl` or `.tif` exceeding `50,000` triangles).
 
 use std::io::Cursor;
 
@@ -16,6 +17,10 @@ use bevy::prelude::*;
 use bevy::render::mesh::{Indices, PrimitiveTopology};
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+
+/// Maximum GPU texture dimension per axis in the 3D viewer (`2048x2048`) so huge 50+ MiB
+/// `.png` textures never exceed WebGL2 `MAX_TEXTURE_SIZE` or exhaust WASM memory.
+pub const MAX_VIEWER_TEXTURE_DIM: u32 = 2048;
 
 /// Parses either a binary `.stl` or a `.tif`/`.tiff` elevation DEM into a [`WeldedMesh`]
 /// in Bevy right-handed Y-up space with `DemExtent` planar UVs.
@@ -55,7 +60,9 @@ pub fn welded_mesh_to_bevy_mesh(welded: WeldedMesh) -> Mesh {
     mesh
 }
 
-/// Decodes an in-memory `.png` byte buffer into an `Rgba8UnormSrgb` Bevy [`Image`].
+/// Decodes an in-memory `.png` byte buffer into an `Rgba8UnormSrgb` Bevy [`Image`],
+/// automatically downsampling images larger than [`MAX_VIEWER_TEXTURE_DIM`] (`2048x2048`)
+/// so 50+ MiB PNGs render cleanly in WebGL2 / WASM.
 pub fn decode_png_to_bevy_image(png_bytes: &[u8]) -> Result<Image, String> {
     let mut decoder = png::Decoder::new(Cursor::new(png_bytes));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
@@ -69,39 +76,68 @@ pub fn decode_png_to_bevy_image(png_bytes: &[u8]) -> Result<Image, String> {
         .map_err(|e| format!("Failed to decode PNG frame: {e}"))?;
 
     let raw = &buf[..info.buffer_size()];
-    let pixel_count = (info.width as usize) * (info.height as usize);
-    let mut rgba = Vec::with_capacity(pixel_count * 4);
+    let src_w = info.width as usize;
+    let src_h = info.height as usize;
 
-    match info.color_type {
-        png::ColorType::Rgba => {
-            rgba.extend_from_slice(raw);
-        }
-        png::ColorType::Rgb => {
-            for chunk in raw.chunks_exact(3) {
-                rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
-            }
-        }
-        png::ColorType::Grayscale => {
-            for &g in raw {
-                rgba.extend_from_slice(&[g, g, g, 255]);
-            }
-        }
-        png::ColorType::GrayscaleAlpha => {
-            for chunk in raw.chunks_exact(2) {
-                rgba.extend_from_slice(&[chunk[0], chunk[0], chunk[0], chunk[1]]);
-            }
-        }
-        png::ColorType::Indexed => {
-            for &b in raw {
-                rgba.extend_from_slice(&[b, b, b, 255]);
+    let scale = (info.width as f64 / MAX_VIEWER_TEXTURE_DIM as f64)
+        .max(info.height as f64 / MAX_VIEWER_TEXTURE_DIM as f64)
+        .max(1.0);
+    let out_w = ((info.width as f64 / scale).round() as u32).clamp(1, MAX_VIEWER_TEXTURE_DIM);
+    let out_h = ((info.height as f64 / scale).round() as u32).clamp(1, MAX_VIEWER_TEXTURE_DIM);
+
+    let bpp = match info.color_type {
+        png::ColorType::Rgba => 4usize,
+        png::ColorType::Rgb => 3usize,
+        png::ColorType::GrayscaleAlpha => 2usize,
+        png::ColorType::Grayscale | png::ColorType::Indexed => 1usize,
+    };
+
+    let mut rgba = Vec::with_capacity((out_w as usize) * (out_h as usize) * 4);
+    let max_r = src_h.saturating_sub(1);
+    let max_c = src_w.saturating_sub(1);
+
+    for or in 0..(out_h as usize) {
+        let sr = if out_h <= 1 {
+            0
+        } else if or + 1 == out_h as usize {
+            max_r
+        } else {
+            (or * max_r) / ((out_h as usize) - 1)
+        };
+        let row_base = sr * src_w;
+        for oc in 0..(out_w as usize) {
+            let sc = if out_w <= 1 {
+                0
+            } else if oc + 1 == out_w as usize {
+                max_c
+            } else {
+                (oc * max_c) / ((out_w as usize) - 1)
+            };
+            let idx = (row_base + sc) * bpp;
+            match info.color_type {
+                png::ColorType::Rgba => {
+                    rgba.extend_from_slice(&raw[idx..idx + 4]);
+                }
+                png::ColorType::Rgb => {
+                    rgba.extend_from_slice(&[raw[idx], raw[idx + 1], raw[idx + 2], 255]);
+                }
+                png::ColorType::GrayscaleAlpha => {
+                    let g = raw[idx];
+                    let a = raw[idx + 1];
+                    rgba.extend_from_slice(&[g, g, g, a]);
+                }
+                png::ColorType::Grayscale | png::ColorType::Indexed => {
+                    let g = raw[idx];
+                    rgba.extend_from_slice(&[g, g, g, 255]);
+                }
             }
         }
     }
 
     Ok(Image::new(
         Extent3d {
-            width: info.width,
-            height: info.height,
+            width: out_w,
+            height: out_h,
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,

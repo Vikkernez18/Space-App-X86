@@ -3,11 +3,13 @@
 //!
 //! Provides:
 //! - [`models`]: Shared data structures (`Catalog`, `SiteMetadata`, `DemExtent`, `Body`, `MeshFormat`, `WeightsConfig`).
-//! - [`stl`]: Custom binary STL parser with vertex welding, Z-up to Bevy Y-up conversion,
-//!   and `DemExtent`-driven planar UV mapping.
+//! - [`stl`]: Custom binary STL parser with vertex welding, automatic deterministic mesh simplification
+//!   (`<= 50,000` triangles), Z-up to Bevy Y-up conversion, and `DemExtent`-driven planar UV mapping.
 //! - [`tiff_dem`]: In-memory TIFF/GeoTIFF DEM elevation raster parser (`u16`, `i16`, `f32`)
 //!   with automatic decimation (`<= 50,000` triangles) returning [`stl::WeldedMesh`].
 //! - [`scoring`]: Dynamic weighted-sum recalculation over pre-normalized `[0.0, 1.0]` feature scores.
+//! - [`terrain_analysis`]: Morphometric, differential-geometric, and 0D Persistent Homology (TDA)
+//!   engine with `<= 1024x1024` DEM subsampling and RFC 7578 `multipart/form-data` binary transport.
 
 pub mod models;
 pub mod scoring;
@@ -19,11 +21,14 @@ pub use models::{
     Body, Catalog, DemExtent, MeshFormat, RecalculateRequest, RecalculateResponse, ScoredSite,
     SiteMetadata, WeightsConfig,
 };
-pub use stl::{WeldedMesh, parse_and_weld_stl};
+pub use stl::{
+    WeldedMesh, parse_and_weld_stl, parse_and_weld_stl_with_stats, read_stl_triangle_count,
+};
 pub use terrain_analysis::{
-    AnalogProposal, MorphometryMetrics, ProcessedSiteBundle, TerrainAnalysisReport,
-    TopologyMetrics, UploadSiteRequest, UploadSiteResponse, analyze_and_build_site_bundle,
-    base64_decode, base64_encode,
+    AnalogProposal, MAX_TDA_GRID_DIM, MorphometryMetrics, ProcessedSiteBundle,
+    TerrainAnalysisReport, TopologyMetrics, UploadSiteRequest, UploadSiteResponse,
+    analyze_and_build_site_bundle, base64_decode, base64_encode, decode_multipart_upload_request,
+    encode_multipart_upload_request, subsample_grid_max_dim,
 };
 pub use tiff_dem::parse_dem_tiff;
 
@@ -34,7 +39,8 @@ mod tests {
     use crate::models::{Body, Catalog, DemExtent, MeshFormat, SiteMetadata};
     use crate::scoring::{compute_weighted_score, recalculate_catalog};
     use crate::stl::{
-        MAX_TRIANGLES, StlError, encode_binary_stl, parse_and_weld_stl, stl_to_bevy_position,
+        MAX_TRIANGLES, StlError, encode_binary_stl, parse_and_weld_stl,
+        parse_and_weld_stl_with_stats, stl_to_bevy_position,
     };
     use crate::tiff_dem::{
         compute_decimation_step, encode_uncompressed_f32_tiff, encode_uncompressed_i16_tiff,
@@ -111,8 +117,10 @@ mod tests {
     }
 
     #[test]
-    fn test_triangle_budget_enforced() {
-        let extent = DemExtent::new(0.0, 10.0, 0.0, 10.0);
+    fn test_large_stl_automatic_simplification_and_truncated_buffer_rejection() {
+        let extent = DemExtent::new(0.0, 1000.0, 0.0, 1000.0);
+
+        // 1. A truncated 84-byte buffer claiming 50,001 triangles is rejected with UnexpectedBufferLength.
         let mut fake_header = vec![0u8; 80];
         let over_budget: u32 = MAX_TRIANGLES + 1;
         fake_header.extend_from_slice(&over_budget.to_le_bytes());
@@ -120,11 +128,43 @@ mod tests {
         let err = parse_and_weld_stl(&fake_header, &extent).unwrap_err();
         assert_eq!(
             err,
-            StlError::TriangleBudgetExceeded {
-                count: MAX_TRIANGLES + 1,
-                max: MAX_TRIANGLES
+            StlError::UnexpectedBufferLength {
+                expected: 84 + ((MAX_TRIANGLES as usize + 1) * 50),
+                actual: 84,
             }
         );
+
+        // 2. A valid binary STL exceeding 50,000 triangles (165 x 165 cells * 2 = 54,450 triangles)
+        // is automatically simplified to <= 50,000 triangles while preserving corners and relief.
+        let grid_cells = 165usize;
+        let dx = 1000.0 / (grid_cells as f32);
+        let dy = 1000.0 / (grid_cells as f32);
+        let mut tris = Vec::with_capacity(grid_cells * grid_cells * 2);
+        for iy in 0..grid_cells {
+            let y0 = (iy as f32) * dy;
+            let y1 = ((iy + 1) as f32) * dy;
+            for ix in 0..grid_cells {
+                let x0 = (ix as f32) * dx;
+                let x1 = ((ix + 1) as f32) * dx;
+                let z = ((ix + iy) as f32) * 0.5;
+                tris.push([[x0, y0, z], [x1, y0, z], [x1, y1, z]]);
+                tris.push([[x0, y0, z], [x1, y1, z], [x0, y1, z]]);
+            }
+        }
+        assert_eq!(tris.len(), 54_450);
+        let large_stl_bytes = encode_binary_stl(&tris);
+
+        let (welded, orig_tris) = parse_and_weld_stl_with_stats(&large_stl_bytes, &extent)
+            .expect("large valid STL should automatically simplify and weld");
+        assert_eq!(orig_tris, 54_450);
+        assert!(welded.triangle_count <= MAX_TRIANGLES);
+        assert_eq!(welded.triangle_count, 49_928);
+
+        // Verify NW corner (0, 0) and SE corner (1, 1) UVs are preserved after simplification
+        let nw_uv = welded.uvs.first().copied().unwrap();
+        let se_uv = welded.uvs.last().copied().unwrap();
+        assert!((nw_uv[0] - 0.0).abs() < 1e-6 && (nw_uv[1] - 0.0).abs() < 1e-6);
+        assert!((se_uv[0] - 1.0).abs() < 1e-6 && (se_uv[1] - 1.0).abs() < 1e-6);
     }
 
     #[test]
@@ -307,7 +347,8 @@ mod tests {
     #[test]
     fn test_terrain_analysis_morphometry_persistent_homology_and_euler_on_test_site() {
         use crate::terrain_analysis::{
-            UploadSiteRequest, analyze_and_build_site_bundle, base64_encode,
+            UploadSiteRequest, analyze_and_build_site_bundle, decode_multipart_upload_request,
+            encode_multipart_upload_request, subsample_grid_max_dim,
         };
 
         let stl_bytes = include_bytes!("../../../data/processed/test_site/terrain.stl");
@@ -347,26 +388,44 @@ mod tests {
             generated_by: None,
         };
 
-        let req = UploadSiteRequest {
+        // Verify binary multipart/form-data round-trip without Base64
+        let raw_req = UploadSiteRequest {
             site_id: "test_site_tda".to_string(),
             site_name: "Synthetic Crater TDA Test".to_string(),
             body: None,
             description: "Topological & morphometric verification".to_string(),
             dem_extent: Some(extent),
-            stl_base64: Some(base64_encode(stl_bytes)),
+            stl_base64: None,
             tiff_base64: None,
             png_base64: None,
+            stl_bytes: Some(stl_bytes.to_vec()),
+            tiff_bytes: None,
+            png_bytes: None,
         };
 
-        let bundle = analyze_and_build_site_bundle(&req, &catalog)
+        let (content_type, multipart_body) = encode_multipart_upload_request(&raw_req);
+        let decoded_req = decode_multipart_upload_request(&content_type, &multipart_body)
+            .expect("multipart/form-data payload should decode cleanly");
+        assert_eq!(decoded_req.site_id, "test_site_tda");
+        assert_eq!(decoded_req.stl_bytes.as_deref(), Some(stl_bytes.as_slice()));
+
+        let bundle = analyze_and_build_site_bundle(&decoded_req, &catalog)
             .expect("analyze_and_build_site_bundle should succeed on test_site STL");
 
         // Verify triangle budget & STL/TIFF/PNG generation
         assert!(bundle.report.generated_site_metadata.triangle_count <= MAX_TRIANGLES);
         assert_eq!(bundle.report.generated_site_metadata.triangle_count, 2048);
+        assert_eq!(bundle.report.original_triangle_count, 2048);
+        assert_eq!(bundle.report.simplified_triangle_count, 2048);
         assert!(!bundle.stl_bytes.is_empty());
         assert!(!bundle.tiff_bytes.is_empty());
         assert!(bundle.png_bytes.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]));
+
+        // Verify dense grid subsampling helper caps to <= 1024x1024
+        let dense = vec![10.0_f32; 1500 * 1200];
+        let (sw, sh, sgrid) = subsample_grid_max_dim(1500, 1200, &dense, 1024);
+        assert!(sw <= 1024 && sh <= 1024);
+        assert_eq!(sgrid.len(), sw * sh);
 
         // Verify morphometry metrics (slope, TRI, hypsometric integral, tortuosity)
         let morph = &bundle.report.morphometry;

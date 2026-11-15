@@ -10,15 +10,23 @@
 //!    - Strahler Hypsometric Integral $HI = (\mu_z - z_{\min}) / (z_{\max} - z_{\min})$.
 //!    - 3D surface area to 2D planar area ratio (topographic tortuosity).
 //! 2. **Topological Data Analysis (0D Persistent Homology & Simplicial Topology)**:
+//!    - Automatic grid subsampling (`<= 1024x1024` cells) for dense `.tif` DEM rasters so TDA
+//!      completes in a few seconds.
 //!    - Sublevel-set filtration ($\beta_0$ basins/craters) and superlevel-set filtration
 //!      ($\beta_0$ peaks/domes) via Union-Find with the Elder Rule.
+//!    - Automatic deterministic mesh simplification for `.stl` files exceeding `50,000` triangles,
+//!      persisting the optimized `<= 50,000`-triangle `.stl` and reporting both original and
+//!      simplified triangle counts.
 //!    - Simplicial complex invariants on the welded triangle mesh: Euler characteristic
 //!      $\chi = V - E + F$, connected components $C$, boundary edges, and genus estimate.
-//! 3. **Automatic Planetary Analog Proposal**:
+//! 3. **Automatic Planetary Analog Proposal & Binary `multipart/form-data` Transport**:
 //!    - Projects morphometric and topological invariants into normalized `[0.0, 1.0]`
 //!      catalog feature space, computes `analog_score`, identifies the closest analog site
 //!      and planetary body (`Moon`, `Mars`, `Earth`), and generates quantitative justification.
+//!    - Zero-Base64 RFC 7578 `multipart/form-data` binary encoder and decoder for `.stl`, `.tif`,
+//!      and `.png` uploads up to 512 MiB.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
 
@@ -29,9 +37,13 @@ use crate::models::{Body, Catalog, DemExtent, MeshFormat, SiteMetadata};
 use crate::scoring::compute_weighted_score;
 use crate::stl::{
     MAX_TRIANGLES, STL_HEADER_BYTES, STL_TRIANGLE_BYTES, WeldedMesh, encode_binary_stl,
-    parse_and_weld_stl,
+    parse_and_weld_stl_with_stats,
 };
 use crate::tiff_dem::{encode_uncompressed_f32_tiff, parse_dem_tiff};
+
+/// Maximum grid dimension per axis (`1024x1024` cells) before running 0D Persistent Homology
+/// and morphometric analysis on dense GeoTIFF DEMs so TDA completes in a few seconds.
+pub const MAX_TDA_GRID_DIM: usize = 1024;
 
 /// Differential-geometric and morphometric descriptors of a terrain surface.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -79,6 +91,12 @@ pub struct TopologyMetrics {
     pub mean_persistence_m: f64,
     /// Persistence significance threshold $\tau$ in meters ($5\%$ of total relief).
     pub persistence_threshold_m: f64,
+    /// Original triangle count of the uploaded mesh prior to automatic simplification.
+    #[serde(default)]
+    pub original_triangle_count: usize,
+    /// Simplified triangle count (`<= 50,000`) persisted to `terrain.stl`.
+    #[serde(default)]
+    pub simplified_triangle_count: usize,
     /// Number of unique welded vertices $V$ in the simplicial mesh.
     pub vertex_count: usize,
     /// Number of unique undirected edges $E$ in the simplicial mesh.
@@ -124,6 +142,12 @@ pub struct TerrainAnalysisReport {
     pub site_id: String,
     pub site_name: String,
     pub dem_extent: DemExtent,
+    /// Original triangle count of the uploaded `.stl` before automatic simplification.
+    #[serde(default)]
+    pub original_triangle_count: u32,
+    /// Final simplified triangle count (`<= 50,000`) saved to `data/processed/<site_id>/terrain.stl`.
+    #[serde(default)]
+    pub simplified_triangle_count: u32,
     pub morphometry: MorphometryMetrics,
     pub topology: TopologyMetrics,
     pub proposal: AnalogProposal,
@@ -132,7 +156,7 @@ pub struct TerrainAnalysisReport {
 }
 
 /// Complete output bundle produced by [`analyze_and_build_site_bundle`], including
-/// normalized binary `.stl`, `.tif`, and `.png` buffers ready to be saved to disk.
+/// normalized binary `.stl` (`<= 50,000` triangles), `.tif`, and `.png` buffers ready to be saved to disk.
 #[derive(Debug, Clone)]
 pub struct ProcessedSiteBundle {
     pub report: TerrainAnalysisReport,
@@ -141,13 +165,17 @@ pub struct ProcessedSiteBundle {
     pub png_bytes: Vec<u8>,
 }
 
-/// Request payload for `POST /api/sites/upload` (compatible with `ehttp` in WASM and native).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Request payload for `POST /api/sites/upload`.
+///
+/// Supports both binary `multipart/form-data` transport (`stl_bytes`, `tiff_bytes`, `png_bytes`,
+/// zero Base64 overhead) and legacy JSON Base64 fallback (`stl_base64`, `tiff_base64`, `png_base64`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UploadSiteRequest {
     /// Optional slug ID (auto-generated from `site_name` if empty).
     #[serde(default)]
     pub site_id: String,
     /// Human-readable site name.
+    #[serde(default)]
     pub site_name: String,
     /// Optional explicit body override (`moon`, `mars`, `earth`). If `None`, uses the TDA/morphometric proposal.
     #[serde(default)]
@@ -158,15 +186,38 @@ pub struct UploadSiteRequest {
     /// Optional explicit `DemExtent`. If omitted, inferred from the STL bounding box or raster dimensions.
     #[serde(default)]
     pub dem_extent: Option<DemExtent>,
-    /// Optional Base64-encoded binary `.stl` file bytes.
+    /// Optional Base64-encoded binary `.stl` file bytes (JSON fallback).
     #[serde(default)]
     pub stl_base64: Option<String>,
-    /// Optional Base64-encoded `.tif`/`.tiff` DEM file bytes.
+    /// Optional Base64-encoded `.tif`/`.tiff` DEM file bytes (JSON fallback).
     #[serde(default)]
     pub tiff_base64: Option<String>,
-    /// Optional Base64-encoded `.png` surface albedo texture bytes.
+    /// Optional Base64-encoded `.png` surface albedo texture bytes (JSON fallback).
     #[serde(default)]
     pub png_base64: Option<String>,
+    /// Raw binary `.stl` file bytes sent via `multipart/form-data` (no Base64).
+    #[serde(skip)]
+    pub stl_bytes: Option<Vec<u8>>,
+    /// Raw binary `.tif`/`.tiff` file bytes sent via `multipart/form-data` (no Base64).
+    #[serde(skip)]
+    pub tiff_bytes: Option<Vec<u8>>,
+    /// Raw binary `.png` file bytes sent via `multipart/form-data` (no Base64).
+    #[serde(skip)]
+    pub png_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MultipartUploadMetadata {
+    #[serde(default)]
+    pub site_id: String,
+    #[serde(default)]
+    pub site_name: String,
+    #[serde(default)]
+    pub body: Option<Body>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub dem_extent: Option<DemExtent>,
 }
 
 /// Response payload returned by `POST /api/sites/upload`.
@@ -276,7 +327,275 @@ pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+#[inline]
+fn find_subslice(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
+    if needle.is_empty() || start.saturating_add(needle.len()) > haystack.len() {
+        return None;
+    }
+    let first = needle[0];
+    let max_pos = haystack.len() - needle.len();
+    let mut pos = start;
+    while pos <= max_pos {
+        let offset = haystack[pos..=max_pos].iter().position(|&b| b == first)?;
+        let candidate = pos + offset;
+        if &haystack[candidate..candidate + needle.len()] == needle {
+            return Some(candidate);
+        }
+        pos = candidate + 1;
+    }
+    None
+}
+
+/// Encodes an [`UploadSiteRequest`] into an RFC 7578 `multipart/form-data` binary payload
+/// `(content_type_header, body_bytes)` without Base64 expansion.
+pub fn encode_multipart_upload_request(req: &UploadSiteRequest) -> (String, Vec<u8>) {
+    let mut boundary = "----SpaceAppX86MultipartBoundary9f8e7d6c5b4a3f2e".to_string();
+    let check_slices: [&[u8]; 3] = [
+        req.stl_bytes.as_deref().unwrap_or(&[]),
+        req.tiff_bytes.as_deref().unwrap_or(&[]),
+        req.png_bytes.as_deref().unwrap_or(&[]),
+    ];
+    let mut suffix = 0u32;
+    while check_slices
+        .iter()
+        .any(|s| find_subslice(s, boundary.as_bytes(), 0).is_some())
+    {
+        suffix += 1;
+        boundary = format!("----SpaceAppX86MultipartBoundary9f8e7d6c5b4a_{suffix}");
+    }
+
+    let meta = MultipartUploadMetadata {
+        site_id: req.site_id.clone(),
+        site_name: req.site_name.clone(),
+        body: req.body,
+        description: req.description.clone(),
+        dem_extent: req.dem_extent,
+    };
+    let meta_json = serde_json::to_vec(&meta).unwrap_or_default();
+
+    let stl_len = req.stl_bytes.as_ref().map_or(0, Vec::len);
+    let tiff_len = req.tiff_bytes.as_ref().map_or(0, Vec::len);
+    let png_len = req.png_bytes.as_ref().map_or(0, Vec::len);
+    let total_cap = meta_json.len() + stl_len + tiff_len + png_len + 1024;
+
+    let mut body = Vec::with_capacity(total_cap);
+
+    // Part 1: JSON metadata part
+    body.extend_from_slice(b"--");
+    body.extend_from_slice(boundary.as_bytes());
+    body.extend_from_slice(
+        b"\r\nContent-Disposition: form-data; name=\"metadata\"\r\nContent-Type: application/json\r\n\r\n",
+    );
+    body.extend_from_slice(&meta_json);
+    body.extend_from_slice(b"\r\n");
+
+    // Helper closure for binary file parts
+    let mut push_file_part = |field_name: &str, filename: &str, mime: &str, bytes: &[u8]| {
+        body.extend_from_slice(b"--");
+        body.extend_from_slice(boundary.as_bytes());
+        body.extend_from_slice(b"\r\nContent-Disposition: form-data; name=\"");
+        body.extend_from_slice(field_name.as_bytes());
+        body.extend_from_slice(b"\"; filename=\"");
+        body.extend_from_slice(filename.as_bytes());
+        body.extend_from_slice(b"\"\r\nContent-Type: ");
+        body.extend_from_slice(mime.as_bytes());
+        body.extend_from_slice(b"\r\n\r\n");
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    };
+
+    if let Some(ref stl) = req.stl_bytes
+        && !stl.is_empty()
+    {
+        push_file_part("stl", "terrain.stl", "application/octet-stream", stl);
+    }
+    if let Some(ref tiff) = req.tiff_bytes
+        && !tiff.is_empty()
+    {
+        push_file_part("tiff", "dem.tif", "image/tiff", tiff);
+    }
+    if let Some(ref png) = req.png_bytes
+        && !png.is_empty()
+    {
+        push_file_part("png", "albedo.png", "image/png", png);
+    }
+
+    body.extend_from_slice(b"--");
+    body.extend_from_slice(boundary.as_bytes());
+    body.extend_from_slice(b"--\r\n");
+
+    let content_type = format!("multipart/form-data; boundary={boundary}");
+    (content_type, body)
+}
+
+/// Parses an RFC 7578 `multipart/form-data` request body into an [`UploadSiteRequest`].
+pub fn decode_multipart_upload_request(
+    content_type: &str,
+    body: &[u8],
+) -> Result<UploadSiteRequest, String> {
+    let boundary = content_type
+        .split(';')
+        .skip(1)
+        .find_map(|param| {
+            let (k, v) = param.trim().split_once('=')?;
+            if k.trim().eq_ignore_ascii_case("boundary") {
+                Some(v.trim().trim_matches('"').to_string())
+            } else {
+                None
+            }
+        })
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| "Missing boundary parameter in multipart/form-data Content-Type".to_string())?;
+
+    let delimiter = format!("--{boundary}").into_bytes();
+    let Some(mut part_start) = find_subslice(body, &delimiter, 0) else {
+        return Err("Multipart body does not contain expected boundary delimiter".to_string());
+    };
+
+    let mut req = UploadSiteRequest {
+        site_name: "Uploaded Analog Site".to_string(),
+        ..Default::default()
+    };
+
+    loop {
+        let after_delim = part_start + delimiter.len();
+        if after_delim + 2 <= body.len() && &body[after_delim..after_delim + 2] == b"--" {
+            // Reached closing `--boundary--`
+            break;
+        }
+
+        // Advance past `\r\n` or `\n` following `--boundary`
+        let headers_start = if after_delim + 2 <= body.len()
+            && &body[after_delim..after_delim + 2] == b"\r\n"
+        {
+            after_delim + 2
+        } else if after_delim < body.len() && body[after_delim] == b'\n' {
+            after_delim + 1
+        } else {
+            after_delim
+        };
+
+        let Some(next_delim) = find_subslice(body, &delimiter, headers_start) else {
+            break;
+        };
+
+        // Locate end of part headers (`\r\n\r\n` or `\n\n`)
+        let part_slice = &body[headers_start..next_delim];
+        let (headers_bytes, raw_payload) =
+            if let Some(h_end) = find_subslice(part_slice, b"\r\n\r\n", 0) {
+                (&part_slice[..h_end], &part_slice[h_end + 4..])
+            } else if let Some(h_end) = find_subslice(part_slice, b"\n\n", 0) {
+                (&part_slice[..h_end], &part_slice[h_end + 2..])
+            } else {
+                part_start = next_delim;
+                continue;
+            };
+
+        // Strip trailing `\r\n` or `\n` that precedes `--boundary`
+        let payload = if raw_payload.ends_with(b"\r\n") {
+            &raw_payload[..raw_payload.len() - 2]
+        } else if raw_payload.ends_with(b"\n") {
+            &raw_payload[..raw_payload.len() - 1]
+        } else {
+            raw_payload
+        };
+
+        let headers_str = String::from_utf8_lossy(headers_bytes);
+        let mut field_name = String::new();
+        let mut file_name = String::new();
+
+        for line in headers_str.lines() {
+            if let Some((h_name, h_val)) = line.split_once(':')
+                && h_name.trim().eq_ignore_ascii_case("content-disposition")
+            {
+                for param in h_val.split(';') {
+                    if let Some((pk, pv)) = param.trim().split_once('=') {
+                        let clean_k = pk.trim();
+                        let clean_v = pv.trim().trim_matches('"');
+                        if clean_k.eq_ignore_ascii_case("name") {
+                            field_name = clean_v.to_ascii_lowercase();
+                        } else if clean_k.eq_ignore_ascii_case("filename") {
+                            file_name = clean_v.to_ascii_lowercase();
+                        }
+                    }
+                }
+            }
+        }
+
+        match field_name.as_str() {
+            "metadata" => {
+                let meta: MultipartUploadMetadata = serde_json::from_slice(payload)
+                    .map_err(|e| format!("Invalid multipart metadata JSON: {e}"))?;
+                if !meta.site_id.is_empty() {
+                    req.site_id = meta.site_id;
+                }
+                if !meta.site_name.is_empty() {
+                    req.site_name = meta.site_name;
+                }
+                if meta.body.is_some() {
+                    req.body = meta.body;
+                }
+                if !meta.description.is_empty() {
+                    req.description = meta.description;
+                }
+                if meta.dem_extent.is_some() {
+                    req.dem_extent = meta.dem_extent;
+                }
+            }
+            "site_id" => {
+                req.site_id = String::from_utf8_lossy(payload).trim().to_string();
+            }
+            "site_name" => {
+                req.site_name = String::from_utf8_lossy(payload).trim().to_string();
+            }
+            "description" => {
+                req.description = String::from_utf8_lossy(payload).trim().to_string();
+            }
+            "body" => {
+                let b_str = String::from_utf8_lossy(payload).trim().to_ascii_lowercase();
+                req.body = match b_str.as_str() {
+                    "moon" => Some(Body::Moon),
+                    "mars" => Some(Body::Mars),
+                    "earth" => Some(Body::Earth),
+                    _ => None,
+                };
+            }
+            "stl" => {
+                if !payload.is_empty() {
+                    req.stl_bytes = Some(payload.to_vec());
+                }
+            }
+            "tiff" | "tif" | "dem" => {
+                if !payload.is_empty() {
+                    req.tiff_bytes = Some(payload.to_vec());
+                }
+            }
+            "png" | "texture" | "albedo" => {
+                if !payload.is_empty() {
+                    req.png_bytes = Some(payload.to_vec());
+                }
+            }
+            _ => {
+                if !payload.is_empty() {
+                    if file_name.ends_with(".stl") {
+                        req.stl_bytes = Some(payload.to_vec());
+                    } else if file_name.ends_with(".tif") || file_name.ends_with(".tiff") {
+                        req.tiff_bytes = Some(payload.to_vec());
+                    } else if file_name.ends_with(".png") {
+                        req.png_bytes = Some(payload.to_vec());
+                    }
+                }
+            }
+        }
+
+        part_start = next_delim;
+    }
+
+    Ok(req)
+}
+
 /// Inspects raw binary STL bytes to infer horizontal `DemExtent` (`min_x`, `max_x`, `min_y`, `max_y`).
+/// Supports meshes of any size (including `> 50,000` triangles prior to simplification).
 pub fn infer_extent_from_stl_bytes(bytes: &[u8]) -> Result<DemExtent, String> {
     if bytes.len() < STL_HEADER_BYTES + 4 {
         return Err("STL buffer too short to infer DemExtent".to_string());
@@ -287,12 +606,12 @@ pub fn infer_extent_from_stl_bytes(bytes: &[u8]) -> Result<DemExtent, String> {
         bytes[STL_HEADER_BYTES + 2],
         bytes[STL_HEADER_BYTES + 3],
     ]);
-    if tri_count == 0 || tri_count > MAX_TRIANGLES {
-        return Err(format!(
-            "STL triangle count {tri_count} is outside allowed range [1, {MAX_TRIANGLES}]"
-        ));
+    if tri_count == 0 {
+        return Err("STL contains zero triangles".to_string());
     }
-    let expected = STL_HEADER_BYTES + 4 + (tri_count as usize) * STL_TRIANGLE_BYTES;
+    let expected = STL_HEADER_BYTES
+        .saturating_add(4)
+        .saturating_add((tri_count as usize).saturating_mul(STL_TRIANGLE_BYTES));
     if bytes.len() != expected {
         return Err(format!(
             "Binary STL byte length mismatch: expected {expected}, got {}",
@@ -337,7 +656,66 @@ pub fn infer_extent_from_stl_bytes(bytes: &[u8]) -> Result<DemExtent, String> {
     Ok(DemExtent::new(min_x, max_x, min_y, max_y))
 }
 
-/// Decodes a TIFF elevation grid into `(width, height, Vec<f32>)`.
+/// Subsamples a 2D elevation grid `(width, height)` so neither dimension exceeds `max_dim`
+/// (e.g. `1024x1024` for 0D Persistent Homology), preserving boundary rows/columns and
+/// global elevation extremes (`min_z`, `max_z`).
+pub fn subsample_grid_max_dim(
+    width: usize,
+    height: usize,
+    grid: &[f32],
+    max_dim: usize,
+) -> (usize, usize, Vec<f32>) {
+    let safe_max = max_dim.max(2);
+    if width <= safe_max && height <= safe_max {
+        return (width, height, grid.to_vec());
+    }
+
+    let scale = (width as f64 / safe_max as f64)
+        .max(height as f64 / safe_max as f64)
+        .max(1.0);
+    let out_w = ((width as f64 / scale).round() as usize).clamp(2, safe_max);
+    let out_h = ((height as f64 / scale).round() as usize).clamp(2, safe_max);
+
+    let mut out = Vec::with_capacity(out_w * out_h);
+    let max_r = height.saturating_sub(1);
+    let max_c = width.saturating_sub(1);
+
+    for or in 0..out_h {
+        let src_r = if or + 1 == out_h {
+            max_r
+        } else {
+            ((or * max_r) / (out_h - 1)).min(max_r)
+        };
+        let row_offset = src_r * width;
+        for oc in 0..out_w {
+            let src_c = if oc + 1 == out_w {
+                max_c
+            } else {
+                ((oc * max_c) / (out_w - 1)).min(max_c)
+            };
+            out.push(grid[row_offset + src_c]);
+        }
+    }
+
+    (out_w, out_h, out)
+}
+
+/// Reads only the `(width, height)` header from a TIFF byte buffer without decoding all pixels.
+fn read_tiff_dimensions(bytes: &[u8]) -> Result<(usize, usize), String> {
+    let mut decoder =
+        Decoder::new(Cursor::new(bytes)).map_err(|e| format!("TIFF decode error: {e}"))?;
+    let (w, h) = decoder
+        .dimensions()
+        .map_err(|e| format!("TIFF dimensions error: {e}"))?;
+    if w < 2 || h < 2 {
+        return Err(format!("TIFF dimensions {w}x{h} too small (need >= 2x2)"));
+    }
+    Ok((w as usize, h as usize))
+}
+
+/// Decodes a TIFF elevation grid into `(width, height, Vec<f32>)`, automatically subsampling
+/// dense rasters to at most [`MAX_TDA_GRID_DIM`] (`1024x1024`) cells in a single pass so
+/// TDA and morphometric calculations complete in a few seconds.
 fn decode_tiff_grid(bytes: &[u8]) -> Result<(usize, usize, Vec<f32>), String> {
     let mut decoder =
         Decoder::new(Cursor::new(bytes)).map_err(|e| format!("TIFF decode error: {e}"))?;
@@ -347,44 +725,75 @@ fn decode_tiff_grid(bytes: &[u8]) -> Result<(usize, usize, Vec<f32>), String> {
     if w < 2 || h < 2 {
         return Err(format!("TIFF dimensions {w}x{h} too small (need >= 2x2)"));
     }
-    let expected = (w as usize) * (h as usize);
+    let width = w as usize;
+    let height = h as usize;
+    let expected = width.saturating_mul(height);
     let decoded = decoder
         .read_image()
         .map_err(|e| format!("TIFF image read error: {e}"))?;
 
-    macro_rules! to_f32_vec {
+    let scale = (width as f64 / MAX_TDA_GRID_DIM as f64)
+        .max(height as f64 / MAX_TDA_GRID_DIM as f64)
+        .max(1.0);
+    let out_w = if width > MAX_TDA_GRID_DIM || height > MAX_TDA_GRID_DIM {
+        ((width as f64 / scale).round() as usize).clamp(2, MAX_TDA_GRID_DIM)
+    } else {
+        width
+    };
+    let out_h = if width > MAX_TDA_GRID_DIM || height > MAX_TDA_GRID_DIM {
+        ((height as f64 / scale).round() as usize).clamp(2, MAX_TDA_GRID_DIM)
+    } else {
+        height
+    };
+
+    macro_rules! extract_subsampled_f32 {
         ($vec:expr, $conv:expr) => {{
             if $vec.len() < expected {
                 return Err("Truncated TIFF raster band".to_string());
             }
             let spp = $vec.len() / expected;
-            let mut out = Vec::with_capacity(expected);
-            for i in 0..expected {
-                let v: f32 = $conv($vec[i * spp]);
-                out.push(if v.is_finite() && v.abs() < 1.0e15 {
-                    v
+            let mut out = Vec::with_capacity(out_w * out_h);
+            let max_r = height - 1;
+            let max_c = width - 1;
+            for or in 0..out_h {
+                let src_r = if or + 1 == out_h {
+                    max_r
                 } else {
-                    0.0
-                });
+                    ((or * max_r) / (out_h - 1)).min(max_r)
+                };
+                let row_base = src_r * width;
+                for oc in 0..out_w {
+                    let src_c = if oc + 1 == out_w {
+                        max_c
+                    } else {
+                        ((oc * max_c) / (out_w - 1)).min(max_c)
+                    };
+                    let v: f32 = $conv($vec[(row_base + src_c) * spp]);
+                    out.push(if v.is_finite() && v.abs() < 1.0e15 {
+                        v
+                    } else {
+                        0.0
+                    });
+                }
             }
             out
         }};
     }
 
     let grid = match decoded {
-        DecodingResult::F32(v) => to_f32_vec!(v, |x: f32| x),
-        DecodingResult::I16(v) => to_f32_vec!(v, |x: i16| f32::from(x)),
-        DecodingResult::U16(v) => to_f32_vec!(v, |x: u16| f32::from(x)),
-        DecodingResult::F64(v) => to_f32_vec!(v, |x: f64| x as f32),
-        DecodingResult::I32(v) => to_f32_vec!(v, |x: i32| x as f32),
-        DecodingResult::U32(v) => to_f32_vec!(v, |x: u32| x as f32),
-        DecodingResult::U8(v) => to_f32_vec!(v, |x: u8| f32::from(x)),
-        DecodingResult::I8(v) => to_f32_vec!(v, |x: i8| f32::from(x)),
-        DecodingResult::U64(v) => to_f32_vec!(v, |x: u64| x as f32),
-        DecodingResult::I64(v) => to_f32_vec!(v, |x: i64| x as f32),
+        DecodingResult::F32(v) => extract_subsampled_f32!(v, |x: f32| x),
+        DecodingResult::I16(v) => extract_subsampled_f32!(v, |x: i16| f32::from(x)),
+        DecodingResult::U16(v) => extract_subsampled_f32!(v, |x: u16| f32::from(x)),
+        DecodingResult::F64(v) => extract_subsampled_f32!(v, |x: f64| x as f32),
+        DecodingResult::I32(v) => extract_subsampled_f32!(v, |x: i32| x as f32),
+        DecodingResult::U32(v) => extract_subsampled_f32!(v, |x: u32| x as f32),
+        DecodingResult::U8(v) => extract_subsampled_f32!(v, |x: u8| f32::from(x)),
+        DecodingResult::I8(v) => extract_subsampled_f32!(v, |x: i8| f32::from(x)),
+        DecodingResult::U64(v) => extract_subsampled_f32!(v, |x: u64| x as f32),
+        DecodingResult::I64(v) => extract_subsampled_f32!(v, |x: i64| x as f32),
     };
 
-    Ok((w as usize, h as usize, grid))
+    Ok((out_w, out_h, grid))
 }
 
 /// Rasterizes/interpolates a [`WeldedMesh`] onto a regular `grid_w x grid_h` elevation grid
@@ -401,7 +810,7 @@ fn rasterize_welded_mesh_to_grid(
     let span_x = extent.width().max(1e-3);
     let span_y = extent.height().max(1e-3);
 
-    // Project every vertex and triangle centroid into its corresponding grid cell.
+    // Project every vertex into its corresponding grid cell.
     for pos in &mesh.positions {
         // Bevy Y-up back to STL Z-up: X_stl = pos[0], Y_stl = -pos[2], Z_stl = pos[1]
         let x_stl = pos[0];
@@ -772,6 +1181,9 @@ fn persistent_homology_0d_grid(width: usize, height: usize, grid: &[f32], invert
 }
 
 /// Computes 0D Persistent Homology and simplicial mesh topology metrics.
+///
+/// Automatically subsamples dense elevation grids to at most [`MAX_TDA_GRID_DIM`] (`1024x1024`)
+/// before running 0D Persistent Homology so TDA finishes in a few seconds.
 pub fn compute_topology_metrics(
     width: usize,
     height: usize,
@@ -779,11 +1191,42 @@ pub fn compute_topology_metrics(
     elevation_range_m: f64,
     mesh: &WeldedMesh,
 ) -> TopologyMetrics {
+    compute_topology_metrics_with_counts(
+        width,
+        height,
+        grid,
+        elevation_range_m,
+        mesh,
+        mesh.triangle_count,
+    )
+}
+
+/// Computes 0D Persistent Homology and simplicial mesh topology metrics while recording the
+/// `original_triangle_count` prior to automatic mesh simplification.
+pub fn compute_topology_metrics_with_counts(
+    width: usize,
+    height: usize,
+    grid: &[f32],
+    elevation_range_m: f64,
+    mesh: &WeldedMesh,
+    original_triangle_count: u32,
+) -> TopologyMetrics {
+    // Subsample dense grids to <= 1024x1024 cells before 0D Persistent Homology
+    let subsampled_owned;
+    let (ph_w, ph_h, ph_grid): (usize, usize, &[f32]) =
+        if width > MAX_TDA_GRID_DIM || height > MAX_TDA_GRID_DIM {
+            let (sw, sh, sg) = subsample_grid_max_dim(width, height, grid, MAX_TDA_GRID_DIM);
+            subsampled_owned = sg;
+            (sw, sh, &subsampled_owned)
+        } else {
+            (width, height, grid)
+        };
+
     // Significance threshold: 5% of total elevation relief (minimum 0.5 m)
     let threshold = (elevation_range_m * 0.05).max(0.5);
 
-    let sublevel_pairs = persistent_homology_0d_grid(width, height, grid, false);
-    let superlevel_pairs = persistent_homology_0d_grid(width, height, grid, true);
+    let sublevel_pairs = persistent_homology_0d_grid(ph_w, ph_h, ph_grid, false);
+    let superlevel_pairs = persistent_homology_0d_grid(ph_w, ph_h, ph_grid, true);
 
     let sig_basins: Vec<f64> = sublevel_pairs
         .into_iter()
@@ -899,6 +1342,8 @@ pub fn compute_topology_metrics(
         max_persistence_m: round4(max_persistence_m),
         mean_persistence_m: round4(mean_persistence_m),
         persistence_threshold_m: round4(threshold),
+        original_triangle_count: original_triangle_count as usize,
+        simplified_triangle_count: face_count,
         vertex_count,
         edge_count,
         face_count,
@@ -919,17 +1364,12 @@ pub fn propose_planetary_analog(
     body_override: Option<Body>,
 ) -> AnalogProposal {
     // 1. Normalize physical & topological invariants to [0.0, 1.0]
-    // Slope safety: high (near 1.0) for gentle slopes, decreases smoothly for steep P90 slopes
     let slope_safety = (-morph.slope_p90_deg / 28.0).exp().clamp(0.05, 0.99);
-    // Roughness similarity: smooth-to-moderate regolith roughness in [0.0, 1.0]
     let roughness_similarity = (1.0 / (1.0 + morph.tri_mean_m / 14.0)).clamp(0.05, 0.99);
-    // Elevation relief: normalized relief combined with hypsometric balance
     let relief_factor = (morph.elevation_range_m / 350.0).clamp(0.08, 1.0);
     let hi_balance = 1.0 - (morph.hypsometric_integral - 0.48).abs().min(0.45);
     let elevation_relief = (0.65 * relief_factor + 0.35 * hi_balance).clamp(0.05, 0.99);
 
-    // Geomorphology / topological complexity score from persistent homology (β0 basins + peaks)
-    // and surface tortuosity
     let total_persistent = (topo.persistent_basins_b0 + topo.persistent_peaks_b0) as f64;
     let tda_score = (1.0 - (-total_persistent / 6.0).exp()).clamp(0.10, 0.98);
     let tortuosity_score =
@@ -947,7 +1387,6 @@ pub fn propose_planetary_analog(
         "geomorphology_match".to_string(),
         round4(geomorphology_match),
     );
-    // Also populate any extra custom keys configured in `catalog.default_weights`
     for key in catalog.default_weights.keys() {
         if !normalized_features.contains_key(key) {
             let mapped = match key.as_str() {
@@ -1007,7 +1446,6 @@ pub fn propose_planetary_analog(
         }
     }
 
-    // Infer planetary regime from TDA basin-to-peak ratio, hypsometric integral, and roughness
     let inferred_body = body_override.unwrap_or_else(|| {
         if topo.persistent_basins_b0 > topo.persistent_peaks_b0
             && morph.hypsometric_integral < 0.48
@@ -1020,9 +1458,21 @@ pub fn propose_planetary_analog(
         }
     });
 
+    let decimation_note = if topo.original_triangle_count > topo.simplified_triangle_count {
+        format!(
+            "Mesh decimated from {} to {} triangles (<= {} budget). ",
+            topo.original_triangle_count, topo.simplified_triangle_count, MAX_TRIANGLES
+        )
+    } else {
+        format!(
+            "Mesh triangles: {} (within {} budget). ",
+            topo.simplified_triangle_count, MAX_TRIANGLES
+        )
+    };
+
     let justification = format!(
         "Morphometric & TDA classification -> Proposed Body: {} (Analog Score: {:.4}, Similarity to '{}' [{}]: {:.1}%). \
-         Differential geometry shows mean slope {:.2}° (P90 = {:.2}°), TRI roughness {:.2} m, and Hypsometric Integral HI = {:.3}. \
+         {}Differential geometry shows mean slope {:.2}° (P90 = {:.2}°), TRI roughness {:.2} m, and Hypsometric Integral HI = {:.3}. \
          0D Persistent Homology detects β0 = {} persistent basins/craters and β0 = {} persistent peaks/domes (max persistence {:.1} m). \
          Simplicial mesh topology: χ = V({}) - E({}) + F({}) = {}, {} connected component(s), manifold={}.",
         inferred_body.as_str().to_uppercase(),
@@ -1030,6 +1480,7 @@ pub fn propose_planetary_analog(
         best_site_name,
         best_site_body.as_str().to_uppercase(),
         best_similarity * 100.0,
+        decimation_note,
         morph.slope_mean_deg,
         morph.slope_p90_deg,
         morph.tri_mean_m,
@@ -1060,11 +1511,18 @@ pub fn propose_planetary_analog(
 /// Generates a valid PNG image visualizing hypsometric elevation + hillshade relief
 /// aligned 1:1 with `DemExtent` (`NW = (0,0)`, `SE = (1,1)`), used when no `.png` is uploaded.
 pub fn generate_shaded_hypsometric_png(width: usize, height: usize, grid: &[f32]) -> Vec<u8> {
-    let w = width.max(2);
-    let h = height.max(2);
+    let sub_owned;
+    let (w, h, active_grid): (usize, usize, &[f32]) = if width > 512 || height > 512 {
+        let (sw, sh, sg) = subsample_grid_max_dim(width, height, grid, 512);
+        sub_owned = sg;
+        (sw.max(2), sh.max(2), &sub_owned)
+    } else {
+        (width.max(2), height.max(2), grid)
+    };
+
     let mut min_z = f32::INFINITY;
     let mut max_z = f32::NEG_INFINITY;
-    for &z in grid.iter().take(w * h) {
+    for &z in active_grid.iter().take(w * h) {
         if z.is_finite() {
             min_z = min_z.min(z);
             max_z = max_z.max(z);
@@ -1085,12 +1543,12 @@ pub fn generate_shaded_hypsometric_png(width: usize, height: usize, grid: &[f32]
         for c in 0..w {
             let c_prev = c.saturating_sub(1);
             let c_next = (c + 1).min(w - 1);
-            let z = grid[r * w + c];
+            let z = active_grid[r * w + c];
             let t = ((z - min_z) / span_z).clamp(0.0, 1.0);
 
             // Azimuthal hillshade from NW
-            let dz_x = grid[r * w + c_next] - grid[r * w + c_prev];
-            let dz_y = grid[r_prev * w + c] - grid[r_next * w + c];
+            let dz_x = active_grid[r * w + c_next] - active_grid[r * w + c_prev];
+            let dz_y = active_grid[r_prev * w + c] - active_grid[r_next * w + c];
             let shade = (0.72 + (-0.015 * dz_x + 0.015 * dz_y)).clamp(0.35, 1.25);
 
             // Planetary hypsometric color ramp (deep basalt -> ochre -> highland ivory)
@@ -1176,8 +1634,9 @@ fn encode_uncompressed_rgb_png(width: u32, height: u32, raw_scanlines: &[u8]) ->
 }
 
 /// High-level pipeline that takes an [`UploadSiteRequest`] and the existing [`Catalog`],
-/// validates/parses `.stl` and/or `.tif`/`.tiff` bytes, runs the full morphometric + TDA
-/// analysis, and returns a [`ProcessedSiteBundle`] ready for storage and 3D rendering.
+/// validates/parses `.stl` and/or `.tif`/`.tiff` bytes, automatically simplifies meshes exceeding
+/// `50,000` triangles, subsamples dense DEM grids (`<= 1024x1024`) before running 0D Persistent
+/// Homology, and returns a [`ProcessedSiteBundle`] ready for storage and 3D rendering.
 pub fn analyze_and_build_site_bundle(
     req: &UploadSiteRequest,
     catalog: &Catalog,
@@ -1193,17 +1652,27 @@ pub fn analyze_and_build_site_bundle(
         slugify_site_id(&req.site_id)
     };
 
-    let raw_stl = match req.stl_base64.as_deref().filter(|s| !s.trim().is_empty()) {
-        Some(b64) => Some(base64_decode(b64)?),
-        None => None,
+    let raw_stl: Option<Cow<'_, [u8]>> = match req.stl_bytes.as_deref().filter(|b| !b.is_empty()) {
+        Some(bytes) => Some(Cow::Borrowed(bytes)),
+        None => match req.stl_base64.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(b64) => Some(Cow::Owned(base64_decode(b64)?)),
+            None => None,
+        },
     };
-    let raw_tiff = match req.tiff_base64.as_deref().filter(|s| !s.trim().is_empty()) {
-        Some(b64) => Some(base64_decode(b64)?),
-        None => None,
-    };
-    let raw_png = match req.png_base64.as_deref().filter(|s| !s.trim().is_empty()) {
-        Some(b64) => Some(base64_decode(b64)?),
-        None => None,
+    let raw_tiff: Option<Cow<'_, [u8]>> =
+        match req.tiff_bytes.as_deref().filter(|b| !b.is_empty()) {
+            Some(bytes) => Some(Cow::Borrowed(bytes)),
+            None => match req.tiff_base64.as_deref().filter(|s| !s.trim().is_empty()) {
+                Some(b64) => Some(Cow::Owned(base64_decode(b64)?)),
+                None => None,
+            },
+        };
+    let raw_png: Option<Cow<'_, [u8]>> = match req.png_bytes.as_deref().filter(|b| !b.is_empty()) {
+        Some(bytes) => Some(Cow::Borrowed(bytes)),
+        None => match req.png_base64.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(b64) => Some(Cow::Owned(base64_decode(b64)?)),
+            None => None,
+        },
     };
 
     if raw_stl.is_none() && raw_tiff.is_none() {
@@ -1213,7 +1682,7 @@ pub fn analyze_and_build_site_bundle(
         );
     }
 
-    // 1. Resolve DemExtent (explicit -> inferred from STL -> default 2km x 2km local box)
+    // 1. Resolve DemExtent (explicit -> inferred from STL -> inferred from TIFF dimensions -> default 2km x 2km)
     let extent = if let Some(ext) = req.dem_extent {
         if !ext.is_valid() {
             return Err("Provided DemExtent is invalid (require min_x < max_x and min_y < max_y)."
@@ -1223,7 +1692,7 @@ pub fn analyze_and_build_site_bundle(
     } else if let Some(ref stl_bytes) = raw_stl {
         infer_extent_from_stl_bytes(stl_bytes)?
     } else if let Some(ref tiff_bytes) = raw_tiff {
-        let (w, h, _) = decode_tiff_grid(tiff_bytes)?;
+        let (w, h) = read_tiff_dimensions(tiff_bytes)?;
         let half_w = (w as f32) * 10.0;
         let half_h = (h as f32) * 10.0;
         DemExtent::new(-half_w, half_w, -half_h, half_h)
@@ -1231,49 +1700,90 @@ pub fn analyze_and_build_site_bundle(
         DemExtent::new(-1000.0, 1000.0, -1000.0, 1000.0)
     };
 
-    // 2. Build both WeldedMesh (<= 50,000 triangles) and 2D elevation grid
-    let (welded_mesh, grid_w, grid_h, elevation_grid, final_stl_bytes, final_tiff_bytes) =
-        match (raw_stl, raw_tiff) {
-            (Some(stl_bytes), Some(tiff_bytes)) => {
-                let mesh = parse_and_weld_stl(&stl_bytes, &extent)
-                    .map_err(|e| format!("Invalid binary STL: {e}"))?;
-                let (w, h, grid) = decode_tiff_grid(&tiff_bytes)?;
-                (mesh, w, h, grid, stl_bytes, tiff_bytes)
-            }
-            (Some(stl_bytes), None) => {
-                let mesh = parse_and_weld_stl(&stl_bytes, &extent)
-                    .map_err(|e| format!("Invalid binary STL: {e}"))?;
-                let w = 64_usize;
-                let h = 64_usize;
-                let grid = rasterize_welded_mesh_to_grid(&mesh, &extent, w, h);
-                let tiff_bytes = encode_uncompressed_f32_tiff(w as u32, h as u32, &grid);
-                (mesh, w, h, grid, stl_bytes, tiff_bytes)
-            }
-            (None, Some(tiff_bytes)) => {
-                let mesh = parse_dem_tiff(&tiff_bytes, &extent, 1.0)
-                    .map_err(|e| format!("Invalid DEM TIFF: {e}"))?;
-                let (w, h, grid) = decode_tiff_grid(&tiff_bytes)?;
-                let stl_bytes = welded_mesh_to_binary_stl(&mesh);
-                (mesh, w, h, grid, stl_bytes, tiff_bytes)
-            }
-            (None, None) => unreachable!(),
-        };
+    // 2. Build both WeldedMesh (<= 50,000 triangles) and subsampled 2D elevation grid (<= 1024x1024)
+    let (
+        welded_mesh,
+        original_tri_count,
+        grid_w,
+        grid_h,
+        elevation_grid,
+        final_stl_bytes,
+        final_tiff_bytes,
+    ) = match (raw_stl, raw_tiff) {
+        (Some(stl_bytes), Some(tiff_bytes)) => {
+            let (mesh, orig_tris) = parse_and_weld_stl_with_stats(&stl_bytes, &extent)
+                .map_err(|e| format!("Invalid binary STL: {e}"))?;
+            // If the uploaded .stl exceeded MAX_TRIANGLES (50,000), save the decimated .stl to disk.
+            let out_stl = if orig_tris > MAX_TRIANGLES || mesh.triangle_count < orig_tris {
+                welded_mesh_to_binary_stl(&mesh)
+            } else {
+                stl_bytes.into_owned()
+            };
+            // Decode (and automatically subsample if > 1024x1024) the DEM TIFF; fall back to
+            // rasterizing the welded mesh if the GeoTIFF uses an unsupported tag/compression.
+            let (w, h, grid) = match decode_tiff_grid(&tiff_bytes) {
+                Ok(res) => res,
+                Err(_) => {
+                    let rw = 256_usize;
+                    let rh = 256_usize;
+                    let rgrid = rasterize_welded_mesh_to_grid(&mesh, &extent, rw, rh);
+                    (rw, rh, rgrid)
+                }
+            };
+            (mesh, orig_tris, w, h, grid, out_stl, tiff_bytes.into_owned())
+        }
+        (Some(stl_bytes), None) => {
+            let (mesh, orig_tris) = parse_and_weld_stl_with_stats(&stl_bytes, &extent)
+                .map_err(|e| format!("Invalid binary STL: {e}"))?;
+            let out_stl = if orig_tris > MAX_TRIANGLES || mesh.triangle_count < orig_tris {
+                welded_mesh_to_binary_stl(&mesh)
+            } else {
+                stl_bytes.into_owned()
+            };
+            let w = if orig_tris > 10_000 { 160_usize } else { 64_usize };
+            let h = if orig_tris > 10_000 { 160_usize } else { 64_usize };
+            let grid = rasterize_welded_mesh_to_grid(&mesh, &extent, w, h);
+            let tiff_bytes = encode_uncompressed_f32_tiff(w as u32, h as u32, &grid);
+            (mesh, orig_tris, w, h, grid, out_stl, tiff_bytes)
+        }
+        (None, Some(tiff_bytes)) => {
+            let (orig_w, orig_h) = read_tiff_dimensions(&tiff_bytes)?;
+            let orig_tris =
+                (2_u64 * (orig_w.saturating_sub(1) as u64) * (orig_h.saturating_sub(1) as u64))
+                    .min(u64::from(u32::MAX)) as u32;
+            let mesh = parse_dem_tiff(&tiff_bytes, &extent, 1.0)
+                .map_err(|e| format!("Invalid DEM TIFF: {e}"))?;
+            let (w, h, grid) = decode_tiff_grid(&tiff_bytes)?;
+            let stl_bytes = welded_mesh_to_binary_stl(&mesh);
+            (
+                mesh,
+                orig_tris,
+                w,
+                h,
+                grid,
+                stl_bytes,
+                tiff_bytes.into_owned(),
+            )
+        }
+        (None, None) => unreachable!(),
+    };
 
     // 3. Generate shaded hypsometric PNG texture if no .png was provided
     let final_png_bytes = match raw_png {
-        Some(png) if png.starts_with(b"\x89PNG\r\n\x1a\n") => png,
+        Some(png) if png.starts_with(b"\x89PNG\r\n\x1a\n") => png.into_owned(),
         _ => generate_shaded_hypsometric_png(grid_w, grid_h, &elevation_grid),
     };
 
     // 4. Compute Morphometry, Differential Geometry, and 0D Persistent Homology (TDA)
     let morphometry =
         compute_morphometry_metrics(grid_w, grid_h, &elevation_grid, &extent, &welded_mesh);
-    let topology = compute_topology_metrics(
+    let topology = compute_topology_metrics_with_counts(
         grid_w,
         grid_h,
         &elevation_grid,
         morphometry.elevation_range_m,
         &welded_mesh,
+        original_tri_count,
     );
     let proposal = propose_planetary_analog(&morphometry, &topology, catalog, req.body);
 
@@ -1287,6 +1797,8 @@ pub fn analyze_and_build_site_bundle(
         )
     };
 
+    let simplified_tri_count = welded_mesh.triangle_count;
+
     let metadata = SiteMetadata {
         id: site_id.clone(),
         name: site_name.clone(),
@@ -1298,7 +1810,7 @@ pub fn analyze_and_build_site_bundle(
             morphometry.min_elevation_m as f32,
             morphometry.max_elevation_m as f32,
         ]),
-        triangle_count: welded_mesh.triangle_count,
+        triangle_count: simplified_tri_count,
         mesh_path: format!("{site_id}/terrain.stl"),
         mesh_format: Some(MeshFormat::Stl),
         texture_path: format!("{site_id}/albedo.png"),
@@ -1311,6 +1823,8 @@ pub fn analyze_and_build_site_bundle(
         site_id,
         site_name,
         dem_extent: extent,
+        original_triangle_count: original_tri_count,
+        simplified_triangle_count: simplified_tri_count,
         morphometry,
         topology,
         proposal,

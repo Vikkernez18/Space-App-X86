@@ -1,7 +1,7 @@
 // AI-assisted
 //! Axum router and HTTP handlers for Public Demo Mode, Argon2id Researcher Auth,
-//! protected catalog/weight management, 3D/DEM terrain upload & topological analysis,
-//! and static WASM/asset serving.
+//! protected catalog/weight management, 512 MiB binary `multipart/form-data` 3D/DEM terrain
+//! upload & topological analysis, and static WASM/asset serving.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -10,8 +10,10 @@ use analog_core::scoring::{compute_weighted_score, normalize_weights, recalculat
 use analog_core::stl::MAX_TRIANGLES;
 use analog_core::terrain_analysis::{
     UploadSiteRequest, UploadSiteResponse, analyze_and_build_site_bundle,
+    decode_multipart_upload_request,
 };
 use analog_core::{Catalog, RecalculateRequest, RecalculateResponse, SiteMetadata};
+use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -29,8 +31,9 @@ use crate::auth::{
 };
 use crate::state::AppState;
 
-/// Maximum JSON request body size for `/api/sites/upload` (64 MiB to accommodate binary `.stl`, `.tif`, `.png`).
-pub const MAX_UPLOAD_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum request body size for `/api/sites/upload` (512 MiB to accommodate full batches of
+/// 50–100+ MiB real `.stl`, `.tif`/`.tiff`, and `.png` files via binary `multipart/form-data`).
+pub const MAX_UPLOAD_BODY_BYTES: usize = 512 * 1024 * 1024;
 
 /// Standard JSON error payload (always in English per `AGENTS.md` §4.3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -378,16 +381,38 @@ async fn update_weights_handler(
     Ok(Json(updated_catalog))
 }
 
-/// `POST /api/sites/upload` — Authenticated researcher endpoint to upload binary `.stl`,
-/// `.tif`/`.tiff` DEM, and/or `.png` texture files, execute full mathematical, differential-geometric,
-/// and topological data analysis (0D Persistent Homology + Euler-Poincaré characteristic),
-/// persist the site assets to `data/processed/<site_id>/`, and register the site in `catalog.json`.
+/// `POST /api/sites/upload` — Authenticated researcher endpoint accepting binary `multipart/form-data`
+/// (up to 512 MiB, zero Base64 overhead) or `application/json` to upload `.stl`, `.tif`/`.tiff`,
+/// and/or `.png` files, automatically simplify meshes exceeding `50,000` triangles, execute
+/// morphometric + 0D Persistent Homology TDA, persist the optimized assets to `data/processed/<site_id>/`,
+/// and register the site in `catalog.json`.
 async fn upload_and_analyze_site_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(req): Json<UploadSiteRequest>,
+    body: Bytes,
 ) -> Result<Json<UploadSiteResponse>, Response> {
     let researcher = require_researcher(&headers, &state)?;
+
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let req: UploadSiteRequest = if content_type
+        .to_ascii_lowercase()
+        .contains("multipart/form-data")
+    {
+        decode_multipart_upload_request(&content_type, &body)
+            .map_err(|e| json_error(StatusCode::BAD_REQUEST, e))?
+    } else {
+        serde_json::from_slice::<UploadSiteRequest>(&body).map_err(|e| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid upload payload (expected multipart/form-data or JSON): {e}"),
+            )
+        })?
+    };
 
     let current_catalog = state
         .catalog
@@ -395,13 +420,23 @@ async fn upload_and_analyze_site_handler(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
 
-    let bundle = analyze_and_build_site_bundle(&req, &current_catalog)
-        .map_err(|e| json_error(StatusCode::BAD_REQUEST, e))?;
+    let bundle = tokio::task::spawn_blocking(move || {
+        analyze_and_build_site_bundle(&req, &current_catalog)
+    })
+    .await
+    .map_err(|e| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Terrain analysis worker panicked: {e}"),
+        )
+    })?
+    .map_err(|e| json_error(StatusCode::BAD_REQUEST, e))?;
 
     let site_id = bundle.report.site_id.clone();
     let site_metadata = bundle.report.generated_site_metadata.clone();
 
-    // Persist terrain.stl, dem.tif, albedo.png, and metadata.json under data/processed/<site_id>/
+    // Persist optimized terrain.stl (<= 50,000 triangles), dem.tif, albedo.png, and metadata.json
+    // under data/processed/<site_id>/
     let site_dir = state.config.data_dir.join(&site_id);
     if let Err(e) = fs::create_dir_all(&site_dir) {
         return Err(json_error(
@@ -443,10 +478,11 @@ async fn upload_and_analyze_site_handler(
     }
 
     info!(
-        "Researcher '{}' uploaded & analyzed site '{}' (triangles={}, analog_score={:.4}, closest='{}')",
+        "Researcher '{}' uploaded & analyzed site '{}' (triangles: {} -> {}, analog_score={:.4}, closest='{}')",
         researcher,
         site_id,
-        site_metadata.triangle_count,
+        bundle.report.original_triangle_count,
+        bundle.report.simplified_triangle_count,
         bundle.report.proposal.analog_score,
         bundle.report.proposal.closest_site_id
     );

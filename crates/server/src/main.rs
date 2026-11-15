@@ -7,7 +7,8 @@
 //! - Researcher authentication (`POST /api/login`, `POST /api/logout`, `GET /api/me`) using Argon2id,
 //!   signed `HttpOnly; SameSite=Lax` session cookies, `X-Analog-Session` header token support, and login rate limiting.
 //! - Protected researcher endpoints (`PUT /api/weights`, `POST /api/sites`, `PUT /api/sites/{id}`, `POST /api/sites/upload`)
-//!   to update canonical scoring weights, site metadata, and upload/analyze 3D `.stl`/`.tif`/`.png` terrains.
+//!   to update canonical scoring weights, site metadata, and upload/analyze 3D `.stl`/`.tif`/`.png` terrains
+//!   up to 512 MiB via binary `multipart/form-data`.
 
 pub mod auth;
 pub mod config;
@@ -99,7 +100,9 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    use analog_core::terrain_analysis::{UploadSiteRequest, UploadSiteResponse, base64_encode};
+    use analog_core::terrain_analysis::{
+        UploadSiteRequest, UploadSiteResponse, encode_multipart_upload_request,
+    };
     use analog_core::tiff_dem::encode_uncompressed_f32_tiff;
     use analog_core::{Body, Catalog, DemExtent, RecalculateResponse, SiteMetadata};
     use axum::body::{Body as AxumBody, to_bytes};
@@ -215,7 +218,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_argon2_login_cookie_header_and_upload_analysis() {
+    async fn test_argon2_login_cookie_header_and_multipart_upload_analysis() {
         let (state, password) = sample_test_state(5);
         let app = build_router(state);
 
@@ -297,7 +300,8 @@ mod tests {
         assert!(me_status.authenticated);
         assert_eq!(me_status.mode, "researcher");
 
-        // 4. Authenticated POST /api/sites/upload analyzes a DEM TIFF and returns TDA report
+        // 4. Authenticated POST /api/sites/upload via binary multipart/form-data (no Base64)
+        //    analyzes a DEM TIFF and returns TDA report
         let mut samples = Vec::with_capacity(16 * 16);
         for r in 0..16 {
             for c in 0..16 {
@@ -312,12 +316,16 @@ mod tests {
             site_id: "uploaded_crater".to_string(),
             site_name: "Uploaded Crater Bowl".to_string(),
             body: None,
-            description: "Uploaded via integration test".to_string(),
+            description: "Uploaded via binary multipart/form-data integration test".to_string(),
             dem_extent: Some(DemExtent::new(-500.0, 500.0, -500.0, 500.0)),
             stl_base64: None,
-            tiff_base64: Some(base64_encode(&tiff_bytes)),
+            tiff_base64: None,
             png_base64: None,
+            stl_bytes: None,
+            tiff_bytes: Some(tiff_bytes),
+            png_bytes: None,
         };
+        let (multipart_ct, multipart_body) = encode_multipart_upload_request(&upload_req);
 
         let upload_resp = app
             .clone()
@@ -325,9 +333,9 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/api/sites/upload")
-                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::CONTENT_TYPE, multipart_ct)
                     .header(SESSION_HEADER_NAME, &session_token)
-                    .body(AxumBody::from(serde_json::to_string(&upload_req).unwrap()))
+                    .body(AxumBody::from(multipart_body))
                     .unwrap(),
             )
             .await

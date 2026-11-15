@@ -8,11 +8,14 @@
 //! - Argon2id Researcher Authentication (`POST /api/login`, `POST /api/logout`, `GET /api/me`)
 //!   with both `HttpOnly; SameSite=Lax` cookies and `X-Analog-Session` token header support
 //! - Protected Researcher Actions (`PUT /api/weights`, `POST /api/sites`, `POST /api/sites/upload`)
+//!   using raw binary `multipart/form-data` transport (zero Base64 in memory).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use analog_core::terrain_analysis::{UploadSiteRequest, UploadSiteResponse};
+use analog_core::terrain_analysis::{
+    UploadSiteRequest, UploadSiteResponse, encode_multipart_upload_request,
+};
 use analog_core::{
     Body, Catalog, DemExtent, RecalculateRequest, RecalculateResponse, SiteMetadata,
 };
@@ -26,12 +29,13 @@ pub enum TerrainSlot {
     Comparison,
 }
 
-/// File selected via browser `<input type="file">` or HTML5 drag-and-drop.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// File selected via browser `<input type="file">`, HTML5 drag-and-drop, or native file drop.
+/// Stores raw binary `Vec<u8>` bytes directly without Base64 expansion.
+#[derive(Debug, Clone)]
 pub struct BrowserSelectedFile {
     pub name: String,
     pub size: usize,
-    pub base64: String,
+    pub bytes: Vec<u8>,
 }
 
 /// Events produced by asynchronous HTTP / asset callbacks and consumed by Bevy `Update` systems.
@@ -470,13 +474,15 @@ impl NetBridge {
         });
     }
 
-    /// Sends `POST /api/sites/upload` (authenticated researcher only) to upload `.stl`, `.tif`/`.tiff`,
-    /// and/or `.png` files, run morphometric + topological data analysis (0D Persistent Homology + Euler characteristic),
+    /// Sends `POST /api/sites/upload` (authenticated researcher only) using raw binary
+    /// `multipart/form-data` (zero Base64 encoding) to upload `.stl`, `.tif`/`.tiff`,
+    /// and/or `.png` files, automatically decimate large meshes (`> 50,000` triangles),
+    /// run morphometric + topological data analysis (0D Persistent Homology + Euler characteristic),
     /// and register the new site in `data/processed/`.
     pub fn upload_and_analyze_site(&self, upload_req: UploadSiteRequest) {
-        let body = serde_json::to_vec(&upload_req).unwrap_or_default();
+        let (content_type, body) = encode_multipart_upload_request(&upload_req);
         let mut req = ehttp::Request::post(self.api_url("api/sites/upload"), body);
-        req.headers.insert("Content-Type", "application/json");
+        req.headers.insert("Content-Type", content_type);
         self.attach_auth(&mut req);
 
         let queue = Arc::clone(&self.queue);
@@ -590,6 +596,8 @@ impl NetBridge {
 }
 
 /// Installs an HTML5 drag-and-drop file reader on `window` when running in WebAssembly.
+/// Uses `FileReader.readAsArrayBuffer` + `Uint8Array` so 50–100+ MiB files are read as raw
+/// binary bytes without Base64 string expansion or JSON serialization overhead.
 pub fn install_browser_file_drop_listener() {
     #[cfg(target_arch = "wasm32")]
     {
@@ -604,16 +612,16 @@ pub fn install_browser_file_drop_listener() {
                     const f = fileList[i];
                     const reader = new FileReader();
                     reader.onload = function(evt) {
-                        const res = evt.target && evt.target.result ? String(evt.target.result) : "";
-                        const comma = res.indexOf(",");
-                        const b64 = comma >= 0 ? res.slice(comma + 1) : res;
+                        const buf = (evt.target && evt.target.result)
+                            ? new Uint8Array(evt.target.result)
+                            : new Uint8Array(0);
                         window.__space_app_uploads.push({
-                            name: f.name,
-                            size: f.size,
-                            base64: b64
+                            name: String(f.name || "uploaded.bin"),
+                            size: Number(f.size || buf.byteLength || 0),
+                            bytes: buf
                         });
                     };
-                    reader.readAsDataURL(f);
+                    reader.readAsArrayBuffer(f);
                 }
             };
             window.addEventListener("dragover", function(e) {
@@ -661,20 +669,53 @@ pub fn open_browser_file_dialog(accept: &str) {
     }
 }
 
-/// Drains any files selected or dropped in the browser since the last frame.
+/// Drains any files selected or dropped in the browser since the last frame, transferring raw
+/// `Uint8Array` buffers into Rust `Vec<u8>` via `js_sys::Uint8Array` without Base64/JSON.
 pub fn poll_browser_uploaded_files() -> Vec<BrowserSelectedFile> {
     #[cfg(target_arch = "wasm32")]
     {
-        if let Ok(val) = js_sys::eval(
-            "window.__space_app_uploads && window.__space_app_uploads.length > 0 ? JSON.stringify(window.__space_app_uploads.splice(0)) : ''",
-        ) && let Some(json_str) = val.as_string()
-            && !json_str.is_empty()
-            && let Ok(files) = serde_json::from_str::<Vec<BrowserSelectedFile>>(&json_str)
-        {
-            return files;
+        let mut out = Vec::new();
+        loop {
+            let has_next = js_sys::eval(
+                "Boolean(window.__space_app_uploads && window.__space_app_uploads.length > 0)",
+            )
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+            if !has_next {
+                break;
+            }
+
+            let _ = js_sys::eval(
+                "window.__space_app_current_file = window.__space_app_uploads.shift();",
+            );
+            let name = js_sys::eval(
+                "window.__space_app_current_file ? String(window.__space_app_current_file.name || '') : ''",
+            )
+            .ok()
+            .and_then(|v| v.as_string())
+            .unwrap_or_default();
+
+            let bytes = js_sys::eval(
+                "window.__space_app_current_file && window.__space_app_current_file.bytes ? window.__space_app_current_file.bytes : new Uint8Array(0)",
+            )
+            .ok()
+            .map(|val| js_sys::Uint8Array::from(val).to_vec())
+            .unwrap_or_default();
+
+            let _ = js_sys::eval("window.__space_app_current_file = null;");
+
+            if !name.is_empty() {
+                let size = bytes.len();
+                out.push(BrowserSelectedFile { name, size, bytes });
+            }
         }
+        return out;
     }
-    Vec::new()
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Vec::new()
+    }
 }
 
 /// Built-in synthetic fallback catalog containing `test_site` so the viewer works

@@ -1,6 +1,6 @@
 // AI-assisted
-//! Custom binary STL parser with vertex welding, Z-up to Y-up coordinate conversion,
-//! and `DemExtent`-based planar UV mapping.
+//! Custom binary STL parser with vertex welding, automatic deterministic mesh simplification
+//! (`<= 50,000` triangles), Z-up to Y-up coordinate conversion, and `DemExtent`-based planar UV mapping.
 //!
 //! Mandatory laws from `AGENTS.md`:
 //! 1. Blender / JMARS exports binary STL meshes in **Z-up** (`+X` = East, `+Y` = North, `+Z` = Up).
@@ -10,6 +10,9 @@
 //!    `u = (X_stl - min_x) / (max_x - min_x)`
 //!    `v = (max_y - Y_stl) / (max_y - min_y)`
 //! 4. Maximum **50,000 triangles** per site; always use `u32` vertex indices.
+//!    If an uploaded or loaded binary STL exceeds `50,000` triangles (e.g. 1M+ triangles),
+//!    it is automatically decimated via deterministic spatial vertex clustering into `<= 50,000`
+//!    triangles while preserving exterior boundaries and elevation extremes.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -93,7 +96,7 @@ pub struct WeldedMesh {
     pub uvs: Vec<[f32; 2]>,
     /// Triangle vertex indices (`3 * triangle_count` entries, `u32`).
     pub indices: Vec<u32>,
-    /// Original number of triangles parsed from the binary STL.
+    /// Number of triangles in this welded (and if needed, simplified) mesh (`<= 50,000`).
     pub triangle_count: u32,
 }
 
@@ -124,13 +127,8 @@ fn read_f32_le(bytes: &[u8], offset: usize) -> f32 {
     f32::from_le_bytes(arr)
 }
 
-/// Parses a binary STL byte slice, welds shared vertices, transforms coordinates from
-/// Z-up to Bevy Y-up, and computes planar UV coordinates strictly against `extent`.
-pub fn parse_and_weld_stl(bytes: &[u8], extent: &DemExtent) -> Result<WeldedMesh, StlError> {
-    if !extent.is_valid() {
-        return Err(StlError::InvalidDemExtent);
-    }
-
+/// Reads and validates the raw triangle count from a binary STL byte slice.
+pub fn read_stl_triangle_count(bytes: &[u8]) -> Result<u32, StlError> {
     if bytes.len() < STL_HEADER_BYTES + 4 {
         if bytes.starts_with(b"solid") {
             return Err(StlError::AsciiFormatNotSupported);
@@ -151,21 +149,12 @@ pub fn parse_and_weld_stl(bytes: &[u8], extent: &DemExtent) -> Result<WeldedMesh
         .saturating_add(4)
         .saturating_add((triangle_count as usize).saturating_mul(STL_TRIANGLE_BYTES));
 
-    // If the file starts with "solid " and its length does not match the binary STL formula,
-    // report an explicit ASCII STL error before checking triangle count bounds.
     if bytes.starts_with(b"solid ") && bytes.len() != expected_len {
         return Err(StlError::AsciiFormatNotSupported);
     }
 
     if triangle_count == 0 {
         return Err(StlError::EmptyMesh);
-    }
-
-    if triangle_count > MAX_TRIANGLES {
-        return Err(StlError::TriangleBudgetExceeded {
-            count: triangle_count,
-            max: MAX_TRIANGLES,
-        });
     }
 
     if bytes.len() != expected_len {
@@ -175,16 +164,49 @@ pub fn parse_and_weld_stl(bytes: &[u8], extent: &DemExtent) -> Result<WeldedMesh
         });
     }
 
-    let est_vertices = (triangle_count as usize).div_ceil(2).max(3);
+    Ok(triangle_count)
+}
+
+/// Parses a binary STL byte slice, welds shared vertices, transforms coordinates from
+/// Z-up to Bevy Y-up, and computes planar UV coordinates strictly against `extent`.
+///
+/// If the input mesh exceeds [`MAX_TRIANGLES`] (`50,000`), it is automatically simplified
+/// via deterministic spatial vertex clustering so the output mesh has `<= 50,000` triangles.
+pub fn parse_and_weld_stl(bytes: &[u8], extent: &DemExtent) -> Result<WeldedMesh, StlError> {
+    parse_and_weld_stl_with_stats(bytes, extent).map(|(mesh, _)| mesh)
+}
+
+/// Parses a binary STL byte slice and returns `(welded_mesh, original_triangle_count)`.
+///
+/// When `original_triangle_count > MAX_TRIANGLES` (`50,000`), automatically applies
+/// deterministic spatial vertex clustering to simplify the mesh down to `<= 50,000` triangles
+/// while preserving horizontal boundaries and elevation extremes.
+pub fn parse_and_weld_stl_with_stats(
+    bytes: &[u8],
+    extent: &DemExtent,
+) -> Result<(WeldedMesh, u32), StlError> {
+    if !extent.is_valid() {
+        return Err(StlError::InvalidDemExtent);
+    }
+
+    let original_triangle_count = read_stl_triangle_count(bytes)?;
+
+    if original_triangle_count > MAX_TRIANGLES {
+        let simplified =
+            simplify_and_weld_large_stl(bytes, original_triangle_count, extent, MAX_TRIANGLES)?;
+        return Ok((simplified, original_triangle_count));
+    }
+
+    let est_vertices = (original_triangle_count as usize).div_ceil(2).max(3);
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(est_vertices);
     let mut normals: Vec<[f32; 3]> = Vec::with_capacity(est_vertices);
     let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(est_vertices);
-    let mut indices: Vec<u32> = Vec::with_capacity((triangle_count as usize) * 3);
+    let mut indices: Vec<u32> = Vec::with_capacity((original_triangle_count as usize) * 3);
     let mut weld_map: HashMap<(i64, i64, i64), u32> = HashMap::with_capacity(est_vertices);
 
     let mut cursor = STL_HEADER_BYTES + 4;
 
-    for tri_idx in 0..triangle_count {
+    for tri_idx in 0..original_triangle_count {
         // Bytes 0..12 of the triangle record are the facet normal in Z-up STL space.
         // We compute area-weighted smooth normals directly from the welded Bevy Y-up vertices,
         // using the STL facet normal as a fallback if a triangle is degenerate.
@@ -266,20 +288,310 @@ pub fn parse_and_weld_stl(bytes: &[u8], extent: &DemExtent) -> Result<WeldedMesh
         }
     }
 
+    Ok((
+        WeldedMesh {
+            positions,
+            normals,
+            uvs,
+            indices,
+            triangle_count: original_triangle_count,
+        },
+        original_triangle_count,
+    ))
+}
+
+/// Deterministic spatial vertex clustering decimation for large binary STL terrain meshes
+/// (`triangle_count > MAX_TRIANGLES`, e.g., 1,000,000+ triangles / ~56 MiB).
+///
+/// Clusters vertices onto a 2.5D spatial grid sized to produce `<= max_triangles` triangles
+/// (`<= 158x158` cells = `49,928` triangles for a square terrain), preserving:
+/// - Exact horizontal bounding box (`min_x`, `max_x`, `min_y`, `max_y`) and border alignment,
+/// - Global minimum and maximum elevation (`min_z`, `max_z`),
+/// - Smooth area-weighted normals in Bevy Y-up space and planar `DemExtent` UVs,
+/// - 2-manifold simplicial topology ($\chi = V - E + F = 1$).
+fn simplify_and_weld_large_stl(
+    bytes: &[u8],
+    original_triangle_count: u32,
+    extent: &DemExtent,
+    max_triangles: u32,
+) -> Result<WeldedMesh, StlError> {
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    let mut min_z = f32::INFINITY;
+    let mut max_z = f32::NEG_INFINITY;
+
+    // Pass 1: Validate finite vertices and find exact 3D bounding box of the mesh.
+    let mut cursor = STL_HEADER_BYTES + 4;
+    for tri_idx in 0..original_triangle_count {
+        for v_slot in 0..3 {
+            let v_offset = cursor + 12 + v_slot * 12;
+            let x = read_f32_le(bytes, v_offset);
+            let y = read_f32_le(bytes, v_offset + 4);
+            let z = read_f32_le(bytes, v_offset + 8);
+            if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                return Err(StlError::NonFiniteVertex {
+                    triangle_index: tri_idx,
+                });
+            }
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+            min_z = min_z.min(z);
+            max_z = max_z.max(z);
+        }
+        cursor += STL_TRIANGLE_BYTES;
+    }
+
+    let (box_min_x, box_max_x) = if max_x > min_x {
+        (min_x, max_x)
+    } else {
+        (extent.min_x, extent.max_x)
+    };
+    let (box_min_y, box_max_y) = if max_y > min_y {
+        (min_y, max_y)
+    } else {
+        (extent.min_y, extent.max_y)
+    };
+    let span_x = (box_max_x - box_min_x).max(1e-3);
+    let span_y = (box_max_y - box_min_y).max(1e-3);
+
+    // Compute aspect-aware grid cell dimensions (cells_x, cells_y) such that
+    // 2 * cells_x * cells_y <= max_triangles (<= 50,000).
+    let max_cells_total = (max_triangles / 2).max(4) as f64;
+    let aspect = (f64::from(span_x) / f64::from(span_y)).clamp(0.1, 10.0);
+    let mut cells_x = ((max_cells_total * aspect).sqrt().floor() as u32).max(2);
+    let mut cells_y = ((max_cells_total / aspect).sqrt().floor() as u32).max(2);
+    while 2 * u64::from(cells_x) * u64::from(cells_y) > u64::from(max_triangles) {
+        if cells_x >= cells_y && cells_x > 2 {
+            cells_x -= 1;
+        } else if cells_y > 2 {
+            cells_y -= 1;
+        } else {
+            break;
+        }
+    }
+
+    let verts_x = (cells_x + 1) as usize;
+    let verts_y = (cells_y + 1) as usize;
+    let total_vertices = verts_x * verts_y;
+    let simplified_triangle_count = 2 * cells_x * cells_y;
+    debug_assert!(simplified_triangle_count <= max_triangles);
+
+    let mut accum_z = vec![0.0_f64; total_vertices];
+    let mut counts = vec![0_u32; total_vertices];
+    let mut cell_min_z = vec![f32::INFINITY; total_vertices];
+    let mut cell_max_z = vec![f32::NEG_INFINITY; total_vertices];
+
+    // Pass 2: Cluster all STL vertices and triangle centroids into spatial grid cells.
+    // Row gy = 0 is North (box_max_y), row gy = cells_y is South (box_min_y).
+    // Col gx = 0 is West (box_min_x), col gx = cells_x is East (box_max_x).
+    let inv_span_x = (cells_x as f32) / span_x;
+    let inv_span_y = (cells_y as f32) / span_y;
+
+    let mut add_sample = |x: f32, y: f32, z: f32| {
+        let gx = (((x - box_min_x) * inv_span_x).round() as isize).clamp(0, cells_x as isize)
+            as usize;
+        let gy = (((box_max_y - y) * inv_span_y).round() as isize).clamp(0, cells_y as isize)
+            as usize;
+        let idx = gy * verts_x + gx;
+        accum_z[idx] += f64::from(z);
+        counts[idx] += 1;
+        cell_min_z[idx] = cell_min_z[idx].min(z);
+        cell_max_z[idx] = cell_max_z[idx].max(z);
+    };
+
+    cursor = STL_HEADER_BYTES + 4;
+    for _ in 0..original_triangle_count {
+        let x0 = read_f32_le(bytes, cursor + 12);
+        let y0 = read_f32_le(bytes, cursor + 16);
+        let z0 = read_f32_le(bytes, cursor + 20);
+
+        let x1 = read_f32_le(bytes, cursor + 24);
+        let y1 = read_f32_le(bytes, cursor + 28);
+        let z1 = read_f32_le(bytes, cursor + 32);
+
+        let x2 = read_f32_le(bytes, cursor + 36);
+        let y2 = read_f32_le(bytes, cursor + 40);
+        let z2 = read_f32_le(bytes, cursor + 44);
+
+        add_sample(x0, y0, z0);
+        add_sample(x1, y1, z1);
+        add_sample(x2, y2, z2);
+        // Also bin triangle centroid to prevent gaps across larger triangles
+        add_sample(
+            (x0 + x1 + x2) * (1.0 / 3.0),
+            (y0 + y1 + y2) * (1.0 / 3.0),
+            (z0 + z1 + z2) * (1.0 / 3.0),
+        );
+
+        cursor += STL_TRIANGLE_BYTES;
+    }
+
+    // Compute representative elevation per cluster, preserving global min_z and max_z extremes.
+    let mut grid_z = vec![f32::NAN; total_vertices];
+    let mut sum_valid = 0.0_f64;
+    let mut num_valid = 0_usize;
+    for i in 0..total_vertices {
+        if counts[i] > 0 {
+            let z = if (cell_min_z[i] - min_z).abs() <= 1e-4 {
+                min_z
+            } else if (cell_max_z[i] - max_z).abs() <= 1e-4 {
+                max_z
+            } else {
+                (accum_z[i] / f64::from(counts[i])) as f32
+            };
+            grid_z[i] = z;
+            sum_valid += f64::from(z);
+            num_valid += 1;
+        }
+    }
+    let fallback_mean = if num_valid > 0 {
+        (sum_valid / (num_valid as f64)) as f32
+    } else {
+        0.0
+    };
+
+    // Harmonic inpainting for any unoccupied grid nodes
+    for _pass in 0..10 {
+        let prev = grid_z.clone();
+        let mut any_nan = false;
+        for r in 0..verts_y {
+            for c in 0..verts_x {
+                let idx = r * verts_x + c;
+                if prev[idx].is_finite() {
+                    continue;
+                }
+                any_nan = true;
+                let mut n_sum = 0.0_f32;
+                let mut n_cnt = 0_u32;
+                for dr in -1_isize..=1 {
+                    for dc in -1_isize..=1 {
+                        if dr == 0 && dc == 0 {
+                            continue;
+                        }
+                        let nr = r as isize + dr;
+                        let nc = c as isize + dc;
+                        if nr >= 0
+                            && nr < (verts_y as isize)
+                            && nc >= 0
+                            && nc < (verts_x as isize)
+                        {
+                            let v = prev[(nr as usize) * verts_x + (nc as usize)];
+                            if v.is_finite() {
+                                n_sum += v;
+                                n_cnt += 1;
+                            }
+                        }
+                    }
+                }
+                if n_cnt > 0 {
+                    grid_z[idx] = n_sum / (n_cnt as f32);
+                }
+            }
+        }
+        if !any_nan {
+            break;
+        }
+    }
+    for val in &mut grid_z {
+        if !val.is_finite() {
+            *val = fallback_mean;
+        }
+    }
+
+    // Build welded vertex positions (in Bevy Y-up space) and planar UVs strictly from DemExtent.
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(total_vertices);
+    let mut normals: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0]; total_vertices];
+    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(total_vertices);
+    let mut indices: Vec<u32> = Vec::with_capacity((simplified_triangle_count as usize) * 3);
+
+    for gy in 0..=cells_y {
+        let y_stl = if gy == 0 {
+            box_max_y
+        } else if gy == cells_y {
+            box_min_y
+        } else {
+            box_max_y - (gy as f32 / cells_y as f32) * span_y
+        };
+
+        for gx in 0..=cells_x {
+            let x_stl = if gx == 0 {
+                box_min_x
+            } else if gx == cells_x {
+                box_max_x
+            } else {
+                box_min_x + (gx as f32 / cells_x as f32) * span_x
+            };
+
+            let z_stl = grid_z[(gy as usize) * verts_x + (gx as usize)];
+            positions.push(stl_to_bevy_position(x_stl, y_stl, z_stl));
+            uvs.push(extent.compute_uv(x_stl, y_stl));
+        }
+    }
+
+    for gy in 0..cells_y {
+        let row0 = (gy as usize) * verts_x;
+        let row1 = ((gy + 1) as usize) * verts_x;
+        for gx in 0..cells_x {
+            let col0 = gx as usize;
+            let col1 = col0 + 1;
+
+            let i00 = (row0 + col0) as u32; // NW
+            let i10 = (row0 + col1) as u32; // NE
+            let i01 = (row1 + col0) as u32; // SW
+            let i11 = (row1 + col1) as u32; // SE
+
+            for tri in [[i00, i01, i11], [i00, i11, i10]] {
+                indices.extend_from_slice(&tri);
+                let p0 = positions[tri[0] as usize];
+                let p1 = positions[tri[1] as usize];
+                let p2 = positions[tri[2] as usize];
+
+                let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+                let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+                let cx = e1[1] * e2[2] - e1[2] * e2[1];
+                let cy = e1[2] * e2[0] - e1[0] * e2[2];
+                let cz = e1[0] * e2[1] - e1[1] * e2[0];
+
+                for &vi in &tri {
+                    let n = &mut normals[vi as usize];
+                    n[0] += cx;
+                    n[1] += cy;
+                    n[2] += cz;
+                }
+            }
+        }
+    }
+
+    for n in &mut normals {
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        if len > 1e-10 {
+            n[0] /= len;
+            n[1] /= len;
+            n[2] /= len;
+        } else {
+            *n = [0.0, 1.0, 0.0];
+        }
+    }
+
     Ok(WeldedMesh {
         positions,
         normals,
         uvs,
         indices,
-        triangle_count,
+        triangle_count: simplified_triangle_count,
     })
 }
 
 /// Encodes a list of Z-up triangles (`[[x, y, z]; 3]`) into a valid binary STL byte buffer.
-/// Primarily used by unit tests and synthetic test-site verification.
+/// Primarily used by unit tests, mesh simplification persistence, and synthetic test-site verification.
 pub fn encode_binary_stl(triangles_z_up: &[[[f32; 3]; 3]]) -> Vec<u8> {
     let count = triangles_z_up.len() as u32;
-    let mut buf = Vec::with_capacity(STL_HEADER_BYTES + 4 + triangles_z_up.len() * STL_TRIANGLE_BYTES);
+    let mut buf =
+        Vec::with_capacity(STL_HEADER_BYTES + 4 + triangles_z_up.len() * STL_TRIANGLE_BYTES);
 
     let mut header = [0u8; STL_HEADER_BYTES];
     let tag = b"Space-App-X86 Binary STL (Z-up)";
@@ -307,7 +619,9 @@ pub fn encode_binary_stl(triangles_z_up: &[[[f32; 3]; 3]]) -> Vec<u8> {
             nz = 1.0;
         }
 
-        for f in [nx, ny, nz, v0[0], v0[1], v0[2], v1[0], v1[1], v1[2], v2[0], v2[1], v2[2]] {
+        for f in [
+            nx, ny, nz, v0[0], v0[1], v0[2], v1[0], v1[1], v1[2], v2[0], v2[1], v2[2],
+        ] {
             buf.extend_from_slice(&f.to_le_bytes());
         }
         buf.extend_from_slice(&0u16.to_le_bytes());

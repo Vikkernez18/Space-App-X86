@@ -9,7 +9,7 @@
 //!   `Transform.scale = Vec3::new(1.0, exaggeration, 1.0)`.
 //! - Includes the procedural 8x8 NW/SE UV verification checkerboard toggle.
 //! - Supports passwordless Public Demo Mode for judges and Argon2id Researcher Mode
-//!   with 3D/DEM terrain upload and Topological Data Analysis (TDA).
+//!   with binary `multipart/form-data` 3D/DEM terrain upload and Topological Data Analysis (TDA).
 
 pub mod camera;
 pub mod mesh_loader;
@@ -17,8 +17,6 @@ pub mod net;
 pub mod ui;
 
 use analog_core::scoring::recalculate_catalog;
-#[cfg(not(target_arch = "wasm32"))]
-use analog_core::terrain_analysis::base64_encode;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -232,7 +230,7 @@ fn process_net_events_system(
         }
     }
 
-    // 2. Poll native desktop drag-and-drop files
+    // 2. Poll native desktop drag-and-drop files (raw binary Vec<u8>, no Base64)
     #[cfg(not(target_arch = "wasm32"))]
     for ev in dnd_events.read() {
         if let FileDragAndDrop::DroppedFile { path_buf, .. } = ev {
@@ -242,11 +240,8 @@ fn process_net_events_system(
                     .and_then(|s| s.to_str())
                     .unwrap_or("dropped.stl")
                     .to_string();
-                let selected = BrowserSelectedFile {
-                    name,
-                    size: bytes.len(),
-                    base64: base64_encode(&bytes),
-                };
+                let size = bytes.len();
+                let selected = BrowserSelectedFile { name, size, bytes };
                 match app_state.upload_form.ingest_selected_file(selected) {
                     Ok(msg) => {
                         app_state.status_message = msg;
@@ -337,11 +332,12 @@ fn process_net_events_system(
                 app_state.error_message = None;
                 let new_site = uploaded.report.generated_site_metadata.clone();
                 app_state.status_message = format!(
-                    "Analyzed '{}': proposed {} analog (score={:.4}, closest='{}', χ={}, β₀ basins={}).",
+                    "Analyzed '{}': proposed {} analog (score={:.4}, tris: {}->{}, χ={}, β₀ basins={}).",
                     new_site.name,
                     uploaded.report.proposal.proposed_body.as_str().to_uppercase(),
                     uploaded.report.proposal.analog_score,
-                    uploaded.report.proposal.closest_site_id,
+                    uploaded.report.original_triangle_count,
+                    uploaded.report.simplified_triangle_count,
                     uploaded.report.topology.euler_characteristic,
                     uploaded.report.topology.persistent_basins_b0
                 );

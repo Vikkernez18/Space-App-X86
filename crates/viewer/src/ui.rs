@@ -8,17 +8,18 @@
 //! - Vertical exaggeration slider (`Transform.scale = Vec3::new(1.0, exaggeration, 1.0)`) and UV Checkerboard toggle.
 //! - Real-time scientific weight sliders (`POST /api/recalculate`) and comparative Analog Scores table.
 //! - Authenticated Researcher controls:
-//!   - **Upload & Analyze Terrain (`.stl` / `.tif` / `.png`)** (`POST /api/sites/upload`) with browser file picker
-//!     and drag-and-drop support, displaying the full morphometric ($\nabla z$, TRI, $HI$), 0D persistent homology
-//!     ($\beta_0$ basins/peaks), and Euler characteristic ($\chi = V - E + F$) report.
+//!   - **Upload & Analyze Terrain (`.stl` / `.tif` / `.png`)** (`POST /api/sites/upload`) using binary
+//!     `multipart/form-data` (zero Base64 in memory), displaying exact file sizes in MiB before uploading,
+//!     automatic simplification of meshes `> 50,000` triangles, and the full morphometric ($\nabla z$, TRI, $HI$),
+//!     0D persistent homology ($\beta_0$ basins/peaks), and Euler characteristic ($\chi = V - E + F$) report.
 //!   - Canonical weight persistence (`PUT /api/weights`) and manual site metadata editor (`POST /api/sites`).
 
 use std::collections::BTreeMap;
 
 use analog_core::scoring::recalculate_catalog;
-use analog_core::stl::encode_binary_stl;
+use analog_core::stl::{MAX_TRIANGLES, encode_binary_stl, read_stl_triangle_count};
 use analog_core::terrain_analysis::{
-    TerrainAnalysisReport, UploadSiteRequest, base64_encode,
+    TerrainAnalysisReport, UploadSiteRequest, infer_extent_from_stl_bytes,
 };
 use analog_core::{Body, Catalog, DemExtent, ScoredSite, SiteMetadata};
 use bevy::prelude::*;
@@ -30,6 +31,11 @@ use crate::net::{
     BrowserSelectedFile, NetBridge, TerrainSlot, fallback_synthetic_catalog,
     open_browser_file_dialog,
 };
+
+#[inline]
+fn bytes_to_mib(bytes: usize) -> f64 {
+    (bytes as f64) / (1024.0 * 1024.0)
+}
 
 /// Filter for the planetary body selector in the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +57,8 @@ impl BodyFilter {
     }
 }
 
-/// Editable form state for uploading and analyzing `.stl` / `.tif` / `.png` terrain files (`POST /api/sites/upload`).
+/// Editable form state for uploading and analyzing `.stl` / `.tif` / `.png` terrain files
+/// via binary `multipart/form-data` (`POST /api/sites/upload`, zero Base64).
 #[derive(Debug, Clone)]
 pub struct TerrainUploadForm {
     pub id: String,
@@ -65,13 +72,14 @@ pub struct TerrainUploadForm {
     pub max_y: f32,
     pub stl_filename: Option<String>,
     pub stl_size_bytes: usize,
-    pub stl_base64: Option<String>,
+    pub stl_detected_triangles: Option<u32>,
+    pub stl_bytes: Option<Vec<u8>>,
     pub tiff_filename: Option<String>,
     pub tiff_size_bytes: usize,
-    pub tiff_base64: Option<String>,
+    pub tiff_bytes: Option<Vec<u8>>,
     pub png_filename: Option<String>,
     pub png_size_bytes: usize,
-    pub png_base64: Option<String>,
+    pub png_bytes: Option<Vec<u8>>,
     pub is_uploading: bool,
 }
 
@@ -88,20 +96,21 @@ impl Default for TerrainUploadForm {
             max_y: 1000.0,
             stl_filename: None,
             stl_size_bytes: 0,
-            stl_base64: None,
+            stl_detected_triangles: None,
+            stl_bytes: None,
             tiff_filename: None,
             tiff_size_bytes: 0,
-            tiff_base64: None,
+            tiff_bytes: None,
             png_filename: None,
             png_size_bytes: 0,
-            png_base64: None,
+            png_bytes: None,
             is_uploading: false,
         }
     }
 }
 
 impl TerrainUploadForm {
-    /// Assigns a selected or dropped file to the `.stl`, `.tif`/`.tiff`, or `.png` slot based on extension.
+    /// Assigns a selected or dropped binary file to the `.stl`, `.tif`/`.tiff`, or `.png` slot.
     pub fn ingest_selected_file(&mut self, file: BrowserSelectedFile) -> Result<String, String> {
         let lower = file.name.to_ascii_lowercase();
         if self.name.trim().is_empty() || self.name == "Uploaded Candidate Terrain" {
@@ -112,31 +121,49 @@ impl TerrainUploadForm {
             }
         }
 
+        let mib = bytes_to_mib(file.size);
+
         if lower.ends_with(".stl") {
-            let msg = format!("Staged STL mesh '{}' ({} KB)", file.name, file.size / 1024);
+            let tri_count = read_stl_triangle_count(&file.bytes).ok();
+            if let Ok(ext) = infer_extent_from_stl_bytes(&file.bytes) {
+                self.min_x = ext.min_x;
+                self.max_x = ext.max_x;
+                self.min_y = ext.min_y;
+                self.max_y = ext.max_y;
+            }
+            let tri_note = match tri_count {
+                Some(c) if c > MAX_TRIANGLES => {
+                    format!(", {c} triangles -> will auto-simplify to <= {MAX_TRIANGLES}")
+                }
+                Some(c) => format!(", {c} triangles"),
+                None => String::new(),
+            };
+            let msg = format!(
+                "Staged STL mesh '{}' ({:.2} MiB{tri_note})",
+                file.name, mib
+            );
             self.stl_filename = Some(file.name);
             self.stl_size_bytes = file.size;
-            self.stl_base64 = Some(file.base64);
+            self.stl_detected_triangles = tri_count;
+            self.stl_bytes = Some(file.bytes);
             Ok(msg)
         } else if lower.ends_with(".tif") || lower.ends_with(".tiff") {
             let msg = format!(
-                "Staged GeoTIFF DEM '{}' ({} KB)",
-                file.name,
-                file.size / 1024
+                "Staged GeoTIFF DEM '{}' ({:.2} MiB)",
+                file.name, mib
             );
             self.tiff_filename = Some(file.name);
             self.tiff_size_bytes = file.size;
-            self.tiff_base64 = Some(file.base64);
+            self.tiff_bytes = Some(file.bytes);
             Ok(msg)
         } else if lower.ends_with(".png") {
             let msg = format!(
-                "Staged PNG texture '{}' ({} KB)",
-                file.name,
-                file.size / 1024
+                "Staged PNG texture '{}' ({:.2} MiB)",
+                file.name, mib
             );
             self.png_filename = Some(file.name);
             self.png_size_bytes = file.size;
-            self.png_base64 = Some(file.base64);
+            self.png_bytes = Some(file.bytes);
             Ok(msg)
         } else {
             Err(format!(
@@ -147,19 +174,24 @@ impl TerrainUploadForm {
     }
 
     pub fn has_elevation_source(&self) -> bool {
-        self.stl_base64.is_some() || self.tiff_base64.is_some()
+        self.stl_bytes.is_some() || self.tiff_bytes.is_some()
+    }
+
+    pub fn total_staged_bytes(&self) -> usize {
+        self.stl_size_bytes + self.tiff_size_bytes + self.png_size_bytes
     }
 
     pub fn clear_files(&mut self) {
         self.stl_filename = None;
         self.stl_size_bytes = 0;
-        self.stl_base64 = None;
+        self.stl_detected_triangles = None;
+        self.stl_bytes = None;
         self.tiff_filename = None;
         self.tiff_size_bytes = 0;
-        self.tiff_base64 = None;
+        self.tiff_bytes = None;
         self.png_filename = None;
         self.png_size_bytes = 0;
-        self.png_base64 = None;
+        self.png_bytes = None;
         self.is_uploading = false;
     }
 
@@ -183,7 +215,8 @@ impl TerrainUploadForm {
         let stl_bytes = encode_binary_stl(&tris);
         self.stl_filename = Some("synthetic_crater_ridge.stl".to_string());
         self.stl_size_bytes = stl_bytes.len();
-        self.stl_base64 = Some(base64_encode(&stl_bytes));
+        self.stl_detected_triangles = Some(tris.len() as u32);
+        self.stl_bytes = Some(stl_bytes);
         if self.name.trim().is_empty() {
             self.name = "Synthetic Crater Candidate".to_string();
         }
@@ -198,9 +231,12 @@ impl TerrainUploadForm {
             dem_extent: Some(DemExtent::new(
                 self.min_x, self.max_x, self.min_y, self.max_y,
             )),
-            stl_base64: self.stl_base64.clone(),
-            tiff_base64: self.tiff_base64.clone(),
-            png_base64: self.png_base64.clone(),
+            stl_base64: None,
+            tiff_base64: None,
+            png_base64: None,
+            stl_bytes: self.stl_bytes.clone(),
+            tiff_bytes: self.tiff_bytes.clone(),
+            png_bytes: self.png_bytes.clone(),
         }
     }
 }
@@ -510,8 +546,8 @@ pub fn viewer_ui_system(
 
     // 2. Left Side Panel
     egui::SidePanel::left("analog_control_panel")
-        .default_width(420.0)
-        .width_range(350.0..=560.0)
+        .default_width(430.0)
+        .width_range(350.0..=580.0)
         .resizable(true)
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -907,7 +943,7 @@ pub fn viewer_ui_system(
                     .show(ui, |ui| {
                         ui.label(
                             egui::RichText::new(
-                                "Select or drag-and-drop binary .stl (3D mesh), .tif/.tiff (DEM elevation), and/or .png (surface texture) to compute slope ∇z, TRI, Hypsometric Integral HI, 0D Persistent Homology (β₀), and Euler characteristic χ = V - E + F:",
+                                "Select or drag-and-drop binary .stl (3D mesh), .tif/.tiff (DEM elevation), and/or .png (surface texture). Sent as raw binary multipart/form-data (up to 512 MiB, zero Base64). Meshes > 50,000 triangles are automatically decimated:",
                             )
                             .small(),
                         );
@@ -941,50 +977,60 @@ pub fn viewer_ui_system(
                             }
                         });
 
-                        // Staged files summary box
+                        // Staged files summary box showing exact size in MiB before uploading
                         ui.group(|ui| {
                             let stl_status = app_state
                                 .upload_form
                                 .stl_filename
                                 .as_deref()
                                 .map(|n| {
-                                    format!(
-                                        "{} ({:.1} KB)",
-                                        n,
-                                        app_state.upload_form.stl_size_bytes as f64 / 1024.0
-                                    )
+                                    let mib = bytes_to_mib(app_state.upload_form.stl_size_bytes);
+                                    let tri_info = match app_state.upload_form.stl_detected_triangles
+                                    {
+                                        Some(t) if t > MAX_TRIANGLES => {
+                                            format!(" | {t} tris -> auto-decimates <= {MAX_TRIANGLES}")
+                                        }
+                                        Some(t) => format!(" | {t} tris"),
+                                        None => String::new(),
+                                    };
+                                    format!("{n} ({mib:.2} MiB{tri_info})")
                                 })
-                                .unwrap_or_else(|| "None (auto-generated if .tif provided)".to_string());
+                                .unwrap_or_else(|| {
+                                    "None (0.00 MiB — auto-generated if .tif provided)".to_string()
+                                });
                             let tiff_status = app_state
                                 .upload_form
                                 .tiff_filename
                                 .as_deref()
                                 .map(|n| {
-                                    format!(
-                                        "{} ({:.1} KB)",
-                                        n,
-                                        app_state.upload_form.tiff_size_bytes as f64 / 1024.0
-                                    )
+                                    let mib = bytes_to_mib(app_state.upload_form.tiff_size_bytes);
+                                    format!("{n} ({mib:.2} MiB)")
                                 })
-                                .unwrap_or_else(|| "None (auto-rasterized if .stl provided)".to_string());
+                                .unwrap_or_else(|| {
+                                    "None (0.00 MiB — auto-rasterized if .stl provided)".to_string()
+                                });
                             let png_status = app_state
                                 .upload_form
                                 .png_filename
                                 .as_deref()
                                 .map(|n| {
-                                    format!(
-                                        "{} ({:.1} KB)",
-                                        n,
-                                        app_state.upload_form.png_size_bytes as f64 / 1024.0
-                                    )
+                                    let mib = bytes_to_mib(app_state.upload_form.png_size_bytes);
+                                    format!("{n} ({mib:.2} MiB)")
                                 })
                                 .unwrap_or_else(|| {
-                                    "None (shaded hypsometric relief PNG auto-generated)".to_string()
+                                    "None (0.00 MiB — shaded hypsometric PNG auto-generated)"
+                                        .to_string()
                                 });
 
-                            ui.monospace(format!("STL Mesh : {stl_status}"));
-                            ui.monospace(format!("DEM TIFF : {tiff_status}"));
+                            let total_mib =
+                                bytes_to_mib(app_state.upload_form.total_staged_bytes());
+
+                            ui.monospace(format!("STL Mesh  : {stl_status}"));
+                            ui.monospace(format!("DEM TIFF  : {tiff_status}"));
                             ui.monospace(format!("Albedo PNG: {png_status}"));
+                            ui.monospace(format!(
+                                "Total Size: {total_mib:.2} MiB / 512.00 MiB (multipart/form-data)"
+                            ));
                         });
 
                         egui::Grid::new("upload_terrain_meta_grid")
@@ -1071,11 +1117,13 @@ pub fn viewer_ui_system(
                         .min_size(egui::Vec2::new(360.0, 32.0));
 
                         if ui.add_enabled(can_analyze, analyze_btn).clicked() {
+                            let total_mib =
+                                bytes_to_mib(app_state.upload_form.total_staged_bytes());
                             let req = app_state.upload_form.to_upload_request();
                             app_state.upload_form.is_uploading = true;
                             app_state.error_message = None;
                             app_state.status_message = format!(
-                                "Uploading '{}' & computing morphometry + 0D persistent homology...",
+                                "Uploading '{}' ({total_mib:.2} MiB binary multipart/form-data) & running TDA...",
                                 req.site_name
                             );
                             net.upload_and_analyze_site(req);
@@ -1145,12 +1193,17 @@ pub fn viewer_ui_system(
                                 ));
                             });
 
-                            // 3. Topological Data Analysis (0D Persistent Homology + Euler Characteristic)
+                            // 3. Topological Data Analysis (0D Persistent Homology + Euler Characteristic + Mesh Decimation)
                             ui.group(|ui| {
                                 ui.strong(
                                     "Topological Data Analysis (0D Persistent Homology & χ)",
                                 );
                                 let t = &report.topology;
+                                let orig_tris = t.original_triangle_count.max(t.face_count);
+                                let simp_tris = t.simplified_triangle_count.max(t.face_count);
+                                ui.monospace(format!(
+                                    "Mesh Triangles    : {orig_tris} original -> {simp_tris} simplified (<= 50,000)"
+                                ));
                                 ui.monospace(format!(
                                     "β₀ Sublevel Basins: {} craters/depressions",
                                     t.persistent_basins_b0
