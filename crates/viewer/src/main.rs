@@ -19,13 +19,14 @@ pub mod ui;
 use analog_core::scoring::recalculate_catalog;
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::prelude::*;
+use bevy::render::view::NoFrustumCulling;
 #[cfg(not(target_arch = "wasm32"))]
 use bevy::window::FileDragAndDrop;
 use bevy_egui::EguiPlugin;
 
 use camera::{OrbitCamera, orbit_camera_system};
 use mesh_loader::{
-    build_checkerboard_bevy_image, decode_png_to_bevy_image,
+    build_checkerboard_bevy_image, compute_mesh_bounding_radius, decode_png_to_bevy_image,
     generate_synthetic_test_site_welded_mesh, parse_site_terrain_bytes, welded_mesh_to_bevy_mesh,
 };
 #[cfg(not(target_arch = "wasm32"))]
@@ -126,11 +127,23 @@ fn setup_scene_system(
         ..default()
     });
 
-    // Orbital 3D camera
-    let orbit_cam = OrbitCamera::default();
+    // Initial synthetic test_site terrain mesh (centered at origin)
+    let default_extent = app_state
+        .primary_site()
+        .map(|s| s.dem_extent)
+        .unwrap_or_else(|| analog_core::DemExtent::new(-1000.0, 1000.0, -1000.0, 1000.0));
+    let initial_welded = generate_synthetic_test_site_welded_mesh(&default_extent);
+    let initial_bounding_radius = compute_mesh_bounding_radius(&initial_welded);
+
+    // Orbital 3D camera framed to the initial mesh bounding sphere with dynamic near/far clip planes
+    let mut orbit_cam = OrbitCamera::default();
+    orbit_cam.frame_terrain(Vec3::ZERO, initial_bounding_radius);
     let cam_transform = orbit_cam.compute_transform();
+    let mut cam_projection = Projection::Perspective(PerspectiveProjection::default());
+    orbit_cam.apply_perspective_clip_planes(&mut cam_projection);
     commands.spawn((
         Camera3dBundle {
+            projection: cam_projection,
             transform: cam_transform,
             tonemapping: Tonemapping::None,
             ..default()
@@ -142,12 +155,6 @@ fn setup_scene_system(
     let checker_img = build_checkerboard_bevy_image(512, 512, 8);
     let checker_handle = images.add(checker_img);
 
-    // Initial synthetic test_site terrain mesh
-    let default_extent = app_state
-        .primary_site()
-        .map(|s| s.dem_extent)
-        .unwrap_or_else(|| analog_core::DemExtent::new(-1000.0, 1000.0, -1000.0, 1000.0));
-    let initial_welded = generate_synthetic_test_site_welded_mesh(&default_extent);
     let primary_mesh_handle = meshes.add(welded_mesh_to_bevy_mesh(initial_welded.clone()));
     let comparison_mesh_handle = meshes.add(welded_mesh_to_bevy_mesh(initial_welded));
 
@@ -174,6 +181,7 @@ fn setup_scene_system(
             transform: Transform::from_scale(Vec3::new(1.0, app_state.vertical_exaggeration, 1.0)),
             ..default()
         },
+        NoFrustumCulling,
         PrimaryTerrain,
     ));
 
@@ -186,6 +194,7 @@ fn setup_scene_system(
             visibility: Visibility::Hidden,
             ..default()
         },
+        NoFrustumCulling,
         ComparisonTerrain,
     ));
 
@@ -214,7 +223,7 @@ fn process_net_events_system(
     mut handles: ResMut<TerrainSceneHandles>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
-    mut cam_query: Query<&mut OrbitCamera>,
+    mut cam_query: Query<(&mut OrbitCamera, &mut Projection)>,
     #[cfg(not(target_arch = "wasm32"))] mut dnd_events: EventReader<FileDragAndDrop>,
 ) {
     // 1. Poll files selected or dropped in the browser (WASM)
@@ -367,6 +376,7 @@ fn process_net_events_system(
                 match parse_site_terrain_bytes(&bytes, &site) {
                     Ok(welded) => {
                         let tri_count = welded.triangle_count;
+                        let bounding_radius = compute_mesh_bounding_radius(&welded);
                         let bevy_mesh = welded_mesh_to_bevy_mesh(welded);
                         match slot {
                             TerrainSlot::Primary => {
@@ -374,13 +384,14 @@ fn process_net_events_system(
                                     *m = bevy_mesh;
                                 }
                                 app_state.loaded_primary_triangles = tri_count;
+                                app_state.loaded_primary_bounding_radius = bounding_radius;
                                 app_state.status_message = format!(
-                                    "Loaded 3D mesh for '{}' ({} triangles, DemExtent UV mapped).",
-                                    site.name, tri_count
+                                    "Loaded 3D mesh for '{}' ({} triangles, centered at origin, R={:.1}m).",
+                                    site.name, tri_count, bounding_radius
                                 );
-                                let span = site.dem_extent.width().max(site.dem_extent.height());
-                                for mut cam in &mut cam_query {
-                                    cam.frame_terrain(Vec3::ZERO, span);
+                                for (mut cam, mut proj) in &mut cam_query {
+                                    cam.frame_terrain(Vec3::ZERO, bounding_radius);
+                                    cam.apply_perspective_clip_planes(&mut proj);
                                 }
                             }
                             TerrainSlot::Comparison => {

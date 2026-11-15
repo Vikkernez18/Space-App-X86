@@ -22,7 +22,8 @@ pub use models::{
     SiteMetadata, WeightsConfig,
 };
 pub use stl::{
-    WeldedMesh, parse_and_weld_stl, parse_and_weld_stl_with_stats, read_stl_triangle_count,
+    WeldedMesh, compute_centered_dem_extent_from_stl, parse_and_weld_stl,
+    parse_and_weld_stl_with_stats, read_stl_triangle_count,
 };
 pub use terrain_analysis::{
     AnalogProposal, MAX_TDA_GRID_DIM, MorphometryMetrics, ProcessedSiteBundle,
@@ -165,6 +166,36 @@ mod tests {
         let se_uv = welded.uvs.last().copied().unwrap();
         assert!((nw_uv[0] - 0.0).abs() < 1e-6 && (nw_uv[1] - 0.0).abs() < 1e-6);
         assert!((se_uv[0] - 1.0).abs() < 1e-6 && (se_uv[1] - 1.0).abs() < 1e-6);
+
+        // 3. Verify that a JMARS planetocentric STL displaced by millions of meters is
+        //    automatically centered at (0.0, 0.0, 0.0) in f64 before casting to f32.
+        let jmars_tris = [
+            [
+                [2_499_000.0, -1_801_000.0, 1_737_300.0],
+                [2_501_000.0, -1_801_000.0, 1_737_300.0],
+                [2_501_000.0, -1_799_000.0, 1_737_500.0],
+            ],
+            [
+                [2_499_000.0, -1_801_000.0, 1_737_300.0],
+                [2_501_000.0, -1_799_000.0, 1_737_500.0],
+                [2_499_000.0, -1_799_000.0, 1_737_500.0],
+            ],
+        ];
+        let jmars_bytes = encode_binary_stl(&jmars_tris);
+        let centered_ext = crate::stl::compute_centered_dem_extent_from_stl(&jmars_bytes)
+            .expect("JMARS centered DemExtent should compute");
+        assert!((centered_ext.min_x - (-1000.0)).abs() < 1e-3);
+        assert!((centered_ext.max_x - 1000.0).abs() < 1e-3);
+        assert!((centered_ext.min_y - (-1000.0)).abs() < 1e-3);
+        assert!((centered_ext.max_y - 1000.0).abs() < 1e-3);
+
+        let jmars_mesh = parse_and_weld_stl(&jmars_bytes, &centered_ext)
+            .expect("JMARS displaced STL should center at origin");
+        for pos in &jmars_mesh.positions {
+            assert!(pos[0].abs() <= 1000.5);
+            assert!(pos[1].abs() <= 100.5);
+            assert!(pos[2].abs() <= 1000.5);
+        }
     }
 
     #[test]

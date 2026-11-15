@@ -37,7 +37,35 @@
       },
       "canonical_score": 0.8485,
       "generated_by": "AI-assisted (Gemini 4 Argon via Antigravity)"
+    },
+    {
+      "id": "polo_sur",
+      "name": "polo sur",
+      "body": "mars",
+      "description": "Morphometric & TDA classification -> Proposed Body: MARS (Analog Score: 0.3327, Similarity to 'polo sur' [MARS]: 79.8%). Mesh decimated from 157972738 to 49042 triangles (<= 50000 budget). Differential geometry shows mean slope 80.73° (P90 = 88.91°), TRI roughness 88.33 m, and Hypsometric Integral HI = 0.739. 0D Persistent Homology detects β0 = 17591 persistent basins/craters and β0 = 6444 persistent peaks/domes (max persistence 255.0 m). Simplicial mesh topology: χ = V(24852) - E(73893) + F(49042) = 1, 1 connected component(s), manifold=true.",
+      "dem_extent": {
+        "min_x": 1030.001,
+        "max_x": 2060.001,
+        "min_y": 1030.001,
+        "max_y": 1597.001
+      },
+      "elevation_range_m": [
+        0.0,
+        255.0
+      ],
+      "triangle_count": 49042,
+      "mesh_path": "polo_sur/terrain.stl",
+      "mesh_format": "stl",
+      "texture_path": "polo_sur/albedo.png",
+      "feature_scores": {
+        "elevation_relief": 0.733,
+        "geomorphology_match": 0.672,
+        "roughness_similarity": 0.1368,
+        "slope_safety": 0.05
+      },
+      "canonical_score": 0.3327,
+      "generated_by": "analog_core::terrain_analysis"
     }
   ],
-  "generated_by": "analog_server (authenticated researcher)"
+  "generated_by": "analog_server (uploaded & analyzed by equipo_analog)"
 }

@@ -1,14 +1,17 @@
 // AI-assisted
-//! Custom binary STL parser with vertex welding, automatic deterministic mesh simplification
-//! (`<= 50,000` triangles), Z-up to Y-up coordinate conversion, and `DemExtent`-based planar UV mapping.
+//! Custom binary STL parser with vertex welding, automatic double-precision (`f64`) origin centering,
+//! deterministic mesh simplification (`<= 50,000` triangles), Z-up to Y-up coordinate conversion,
+//! and `DemExtent`-based planar UV mapping.
 //!
 //! Mandatory laws from `AGENTS.md`:
 //! 1. Blender / JMARS exports binary STL meshes in **Z-up** (`+X` = East, `+Y` = North, `+Z` = Up).
-//! 2. On load, `parse_and_weld_stl` converts vertices to Bevy's right-handed **Y-up** space:
-//!    `X_bevy = X_stl`, `Y_bevy = Z_stl`, `Z_bevy = -Y_stl`.
-//! 3. Planar UVs are computed **only** from `(X_stl, Y_stl)` against `DemExtent`:
-//!    `u = (X_stl - min_x) / (max_x - min_x)`
-//!    `v = (max_y - Y_stl) / (max_y - min_y)`
+//! 2. On load, `parse_and_weld_stl` computes the 3D bounding-box centroid `(center_x, center_y, center_z)`
+//!    in double precision (`f64`), translates all vertices so the mesh is centered at `(0.0, 0.0, 0.0)`
+//!    before converting to `f32`, and transforms to Bevy's right-handed **Y-up** space:
+//!    `X_bevy = X_stl_local`, `Y_bevy = Z_stl_local`, `Z_bevy = -Y_stl_local`.
+//! 3. Planar UVs are computed strictly from horizontal STL coordinates against `DemExtent`:
+//!    `u = (X - min_x) / (max_x - min_x)`
+//!    `v = (max_y - Y) / (max_y - min_y)`
 //! 4. Maximum **50,000 triangles** per site; always use `u32` vertex indices.
 //!    If an uploaded or loaded binary STL exceeds `50,000` triangles (e.g. 1M+ triangles),
 //!    it is automatically decimated via deterministic spatial vertex clustering into `<= 50,000`
@@ -85,10 +88,10 @@ impl fmt::Display for StlError {
 
 impl std::error::Error for StlError {}
 
-/// Welded triangle mesh ready for direct upload into Bevy (`Indices::U32`).
+/// Welded triangle mesh ready for direct upload into Bevy (`Indices::U32`), centered at `(0.0, 0.0, 0.0)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WeldedMesh {
-    /// Vertex positions in Bevy right-handed Y-up space (`[X_stl, Z_stl, -Y_stl]`).
+    /// Vertex positions in Bevy right-handed Y-up space (`[X_stl, Z_stl, -Y_stl]`), centered at `(0, 0, 0)`.
     pub positions: Vec<[f32; 3]>,
     /// Smooth unit vertex normals in Bevy right-handed Y-up space.
     pub normals: Vec<[f32; 3]>,
@@ -167,8 +170,63 @@ pub fn read_stl_triangle_count(bytes: &[u8]) -> Result<u32, StlError> {
     Ok(triangle_count)
 }
 
-/// Parses a binary STL byte slice, welds shared vertices, transforms coordinates from
-/// Z-up to Bevy Y-up, and computes planar UV coordinates strictly against `extent`.
+/// Computes the exact 3D bounding box `([min_x, min_y, min_z], [max_x, max_y, max_z])` of a
+/// binary STL in double precision (`f64`) while validating that all vertex coordinates are finite.
+fn compute_stl_bbox_f64(
+    bytes: &[u8],
+    triangle_count: u32,
+) -> Result<([f64; 3], [f64; 3]), StlError> {
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut min_z = f64::INFINITY;
+    let mut max_z = f64::NEG_INFINITY;
+
+    let mut cursor = STL_HEADER_BYTES + 4;
+    for tri_idx in 0..triangle_count {
+        for v_slot in 0..3 {
+            let v_offset = cursor + 12 + v_slot * 12;
+            let x = read_f32_le(bytes, v_offset);
+            let y = read_f32_le(bytes, v_offset + 4);
+            let z = read_f32_le(bytes, v_offset + 8);
+            if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+                return Err(StlError::NonFiniteVertex {
+                    triangle_index: tri_idx,
+                });
+            }
+            let xf = f64::from(x);
+            let yf = f64::from(y);
+            let zf = f64::from(z);
+            min_x = min_x.min(xf);
+            max_x = max_x.max(xf);
+            min_y = min_y.min(yf);
+            max_y = max_y.max(yf);
+            min_z = min_z.min(zf);
+            max_z = max_z.max(zf);
+        }
+        cursor += STL_TRIANGLE_BYTES;
+    }
+
+    Ok(([min_x, min_y, min_z], [max_x, max_y, max_z]))
+}
+
+/// Computes the origin-centered local [`DemExtent`] (`[-half_w, half_w]`, `[-half_h, half_h]`)
+/// of a binary STL in double precision (`f64`).
+pub fn compute_centered_dem_extent_from_stl(bytes: &[u8]) -> Result<DemExtent, StlError> {
+    let tri_count = read_stl_triangle_count(bytes)?;
+    let ([min_x, min_y, _], [max_x, max_y, _]) = compute_stl_bbox_f64(bytes, tri_count)?;
+    if !(max_x > min_x && max_y > min_y) {
+        return Err(StlError::InvalidDemExtent);
+    }
+    let half_w = (0.5 * (max_x - min_x)).max(0.5) as f32;
+    let half_h = (0.5 * (max_y - min_y)).max(0.5) as f32;
+    Ok(DemExtent::new(-half_w, half_w, -half_h, half_h))
+}
+
+/// Parses a binary STL byte slice, centers all vertices around `(0.0, 0.0, 0.0)` using a
+/// double-precision (`f64`) bounding-box centroid, welds shared vertices, transforms coordinates
+/// from Z-up to Bevy Y-up, and computes planar UV coordinates strictly against `extent`.
 ///
 /// If the input mesh exceeds [`MAX_TRIANGLES`] (`50,000`), it is automatically simplified
 /// via deterministic spatial vertex clustering so the output mesh has `<= 50,000` triangles.
@@ -176,7 +234,8 @@ pub fn parse_and_weld_stl(bytes: &[u8], extent: &DemExtent) -> Result<WeldedMesh
     parse_and_weld_stl_with_stats(bytes, extent).map(|(mesh, _)| mesh)
 }
 
-/// Parses a binary STL byte slice and returns `(welded_mesh, original_triangle_count)`.
+/// Parses a binary STL byte slice, centers vertices at `(0.0, 0.0, 0.0)` in `f64` before `f32`
+/// conversion, and returns `(welded_mesh, original_triangle_count)`.
 ///
 /// When `original_triangle_count > MAX_TRIANGLES` (`50,000`), automatically applies
 /// deterministic spatial vertex clustering to simplify the mesh down to `<= 50,000` triangles
@@ -190,12 +249,39 @@ pub fn parse_and_weld_stl_with_stats(
     }
 
     let original_triangle_count = read_stl_triangle_count(bytes)?;
+    let (bbox_min, bbox_max) = compute_stl_bbox_f64(bytes, original_triangle_count)?;
 
     if original_triangle_count > MAX_TRIANGLES {
-        let simplified =
-            simplify_and_weld_large_stl(bytes, original_triangle_count, extent, MAX_TRIANGLES)?;
+        let simplified = simplify_and_weld_large_stl(
+            bytes,
+            original_triangle_count,
+            bbox_min,
+            bbox_max,
+            extent,
+            MAX_TRIANGLES,
+        )?;
         return Ok((simplified, original_triangle_count));
     }
+
+    let [min_x, min_y, min_z] = bbox_min;
+    let [max_x, max_y, max_z] = bbox_max;
+    let center_x = 0.5 * (min_x + max_x);
+    let center_y = 0.5 * (min_y + max_y);
+    let center_z = 0.5 * (min_z + max_z);
+
+    let half_w = (0.5 * (max_x - min_x)).max(0.5) as f32;
+    let half_h = (0.5 * (max_y - min_y)).max(0.5) as f32;
+    let centered_extent = DemExtent::new(-half_w, half_w, -half_h, half_h);
+
+    // Check if the raw STL coordinates already lie within the caller-supplied `extent`
+    // (e.g. for sub-region UV tests or already-centered meshes). If the STL is in displaced
+    // planetocentric JMARS coordinates outside `extent`, compute UVs from the centered coordinates.
+    let tol_x = f64::from(extent.width()) * 0.01;
+    let tol_y = f64::from(extent.height()) * 0.01;
+    let raw_inside_extent = min_x >= f64::from(extent.min_x) - tol_x
+        && max_x <= f64::from(extent.max_x) + tol_x
+        && min_y >= f64::from(extent.min_y) - tol_y
+        && max_y <= f64::from(extent.max_y) + tol_y;
 
     let est_vertices = (original_triangle_count as usize).div_ceil(2).max(3);
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(est_vertices);
@@ -206,10 +292,7 @@ pub fn parse_and_weld_stl_with_stats(
 
     let mut cursor = STL_HEADER_BYTES + 4;
 
-    for tri_idx in 0..original_triangle_count {
-        // Bytes 0..12 of the triangle record are the facet normal in Z-up STL space.
-        // We compute area-weighted smooth normals directly from the welded Bevy Y-up vertices,
-        // using the STL facet normal as a fallback if a triangle is degenerate.
+    for _tri_idx in 0..original_triangle_count {
         let nx_stl = read_f32_le(bytes, cursor);
         let ny_stl = read_f32_le(bytes, cursor + 4);
         let nz_stl = read_f32_le(bytes, cursor + 8);
@@ -221,20 +304,24 @@ pub fn parse_and_weld_stl_with_stats(
             let y_stl = read_f32_le(bytes, v_offset + 4);
             let z_stl = read_f32_le(bytes, v_offset + 8);
 
-            if !x_stl.is_finite() || !y_stl.is_finite() || !z_stl.is_finite() {
-                return Err(StlError::NonFiniteVertex {
-                    triangle_index: tri_idx,
-                });
-            }
+            // Translate to origin (0.0, 0.0, 0.0) in double precision (f64) before f32 cast
+            let local_x = (f64::from(x_stl) - center_x) as f32;
+            let local_y = (f64::from(y_stl) - center_y) as f32;
+            let local_z = (f64::from(z_stl) - center_z) as f32;
 
-            let key = quantize_vertex(x_stl, y_stl, z_stl);
+            let key = quantize_vertex(local_x, local_y, local_z);
             let idx = if let Some(&existing_idx) = weld_map.get(&key) {
                 existing_idx
             } else {
                 let new_idx = positions.len() as u32;
-                positions.push(stl_to_bevy_position(x_stl, y_stl, z_stl));
+                positions.push(stl_to_bevy_position(local_x, local_y, local_z));
                 normals.push([0.0, 0.0, 0.0]);
-                uvs.push(extent.compute_uv(x_stl, y_stl));
+                let uv = if raw_inside_extent {
+                    extent.compute_uv(x_stl, y_stl)
+                } else {
+                    centered_extent.compute_uv(local_x, local_y)
+                };
+                uvs.push(uv);
                 weld_map.insert(key, new_idx);
                 new_idx
             };
@@ -301,67 +388,33 @@ pub fn parse_and_weld_stl_with_stats(
 }
 
 /// Deterministic spatial vertex clustering decimation for large binary STL terrain meshes
-/// (`triangle_count > MAX_TRIANGLES`, e.g., 1,000,000+ triangles / ~56 MiB).
-///
-/// Clusters vertices onto a 2.5D spatial grid sized to produce `<= max_triangles` triangles
-/// (`<= 158x158` cells = `49,928` triangles for a square terrain), preserving:
-/// - Exact horizontal bounding box (`min_x`, `max_x`, `min_y`, `max_y`) and border alignment,
-/// - Global minimum and maximum elevation (`min_z`, `max_z`),
-/// - Smooth area-weighted normals in Bevy Y-up space and planar `DemExtent` UVs,
-/// - 2-manifold simplicial topology ($\chi = V - E + F = 1$).
+/// (`triangle_count > MAX_TRIANGLES`, e.g., 1,000,000+ triangles / ~56 MiB), with double-precision
+/// (`f64`) centroid translation so the resulting mesh is centered at `(0.0, 0.0, 0.0)`.
 fn simplify_and_weld_large_stl(
     bytes: &[u8],
     original_triangle_count: u32,
-    extent: &DemExtent,
+    bbox_min: [f64; 3],
+    bbox_max: [f64; 3],
+    _extent: &DemExtent,
     max_triangles: u32,
 ) -> Result<WeldedMesh, StlError> {
-    let mut min_x = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
-    let mut min_z = f32::INFINITY;
-    let mut max_z = f32::NEG_INFINITY;
+    let [min_x, min_y, min_z] = bbox_min;
+    let [max_x, max_y, max_z] = bbox_max;
 
-    // Pass 1: Validate finite vertices and find exact 3D bounding box of the mesh.
-    let mut cursor = STL_HEADER_BYTES + 4;
-    for tri_idx in 0..original_triangle_count {
-        for v_slot in 0..3 {
-            let v_offset = cursor + 12 + v_slot * 12;
-            let x = read_f32_le(bytes, v_offset);
-            let y = read_f32_le(bytes, v_offset + 4);
-            let z = read_f32_le(bytes, v_offset + 8);
-            if !x.is_finite() || !y.is_finite() || !z.is_finite() {
-                return Err(StlError::NonFiniteVertex {
-                    triangle_index: tri_idx,
-                });
-            }
-            min_x = min_x.min(x);
-            max_x = max_x.max(x);
-            min_y = min_y.min(y);
-            max_y = max_y.max(y);
-            min_z = min_z.min(z);
-            max_z = max_z.max(z);
-        }
-        cursor += STL_TRIANGLE_BYTES;
-    }
+    let center_z = 0.5 * (min_z + max_z);
+    let span_x_f64 = (max_x - min_x).max(1.0);
+    let span_y_f64 = (max_y - min_y).max(1.0);
+    let half_w = (0.5 * span_x_f64) as f32;
+    let half_h = (0.5 * span_y_f64) as f32;
+    let centered_extent = DemExtent::new(-half_w, half_w, -half_h, half_h);
 
-    let (box_min_x, box_max_x) = if max_x > min_x {
-        (min_x, max_x)
-    } else {
-        (extent.min_x, extent.max_x)
-    };
-    let (box_min_y, box_max_y) = if max_y > min_y {
-        (min_y, max_y)
-    } else {
-        (extent.min_y, extent.max_y)
-    };
-    let span_x = (box_max_x - box_min_x).max(1e-3);
-    let span_y = (box_max_y - box_min_y).max(1e-3);
+    let local_min_z = (min_z - center_z) as f32;
+    let local_max_z = (max_z - center_z) as f32;
 
     // Compute aspect-aware grid cell dimensions (cells_x, cells_y) such that
     // 2 * cells_x * cells_y <= max_triangles (<= 50,000).
     let max_cells_total = (max_triangles / 2).max(4) as f64;
-    let aspect = (f64::from(span_x) / f64::from(span_y)).clamp(0.1, 10.0);
+    let aspect = (span_x_f64 / span_y_f64).clamp(0.1, 10.0);
     let mut cells_x = ((max_cells_total * aspect).sqrt().floor() as u32).max(2);
     let mut cells_y = ((max_cells_total / aspect).sqrt().floor() as u32).max(2);
     while 2 * u64::from(cells_x) * u64::from(cells_y) > u64::from(max_triangles) {
@@ -385,42 +438,38 @@ fn simplify_and_weld_large_stl(
     let mut cell_min_z = vec![f32::INFINITY; total_vertices];
     let mut cell_max_z = vec![f32::NEG_INFINITY; total_vertices];
 
-    // Pass 2: Cluster all STL vertices and triangle centroids into spatial grid cells.
-    // Row gy = 0 is North (box_max_y), row gy = cells_y is South (box_min_y).
-    // Col gx = 0 is West (box_min_x), col gx = cells_x is East (box_max_x).
-    let inv_span_x = (cells_x as f32) / span_x;
-    let inv_span_y = (cells_y as f32) / span_y;
+    let inv_span_x = (cells_x as f64) / span_x_f64;
+    let inv_span_y = (cells_y as f64) / span_y_f64;
 
-    let mut add_sample = |x: f32, y: f32, z: f32| {
-        let gx = (((x - box_min_x) * inv_span_x).round() as isize).clamp(0, cells_x as isize)
-            as usize;
-        let gy = (((box_max_y - y) * inv_span_y).round() as isize).clamp(0, cells_y as isize)
-            as usize;
+    let mut add_sample = |x: f64, y: f64, z: f64| {
+        let gx = (((x - min_x) * inv_span_x).round() as isize).clamp(0, cells_x as isize) as usize;
+        let gy = (((max_y - y) * inv_span_y).round() as isize).clamp(0, cells_y as isize) as usize;
         let idx = gy * verts_x + gx;
-        accum_z[idx] += f64::from(z);
+        let lz = z - center_z;
+        let lz_f32 = lz as f32;
+        accum_z[idx] += lz;
         counts[idx] += 1;
-        cell_min_z[idx] = cell_min_z[idx].min(z);
-        cell_max_z[idx] = cell_max_z[idx].max(z);
+        cell_min_z[idx] = cell_min_z[idx].min(lz_f32);
+        cell_max_z[idx] = cell_max_z[idx].max(lz_f32);
     };
 
-    cursor = STL_HEADER_BYTES + 4;
+    let mut cursor = STL_HEADER_BYTES + 4;
     for _ in 0..original_triangle_count {
-        let x0 = read_f32_le(bytes, cursor + 12);
-        let y0 = read_f32_le(bytes, cursor + 16);
-        let z0 = read_f32_le(bytes, cursor + 20);
+        let x0 = f64::from(read_f32_le(bytes, cursor + 12));
+        let y0 = f64::from(read_f32_le(bytes, cursor + 16));
+        let z0 = f64::from(read_f32_le(bytes, cursor + 20));
 
-        let x1 = read_f32_le(bytes, cursor + 24);
-        let y1 = read_f32_le(bytes, cursor + 28);
-        let z1 = read_f32_le(bytes, cursor + 32);
+        let x1 = f64::from(read_f32_le(bytes, cursor + 24));
+        let y1 = f64::from(read_f32_le(bytes, cursor + 28));
+        let z1 = f64::from(read_f32_le(bytes, cursor + 32));
 
-        let x2 = read_f32_le(bytes, cursor + 36);
-        let y2 = read_f32_le(bytes, cursor + 40);
-        let z2 = read_f32_le(bytes, cursor + 44);
+        let x2 = f64::from(read_f32_le(bytes, cursor + 36));
+        let y2 = f64::from(read_f32_le(bytes, cursor + 40));
+        let z2 = f64::from(read_f32_le(bytes, cursor + 44));
 
         add_sample(x0, y0, z0);
         add_sample(x1, y1, z1);
         add_sample(x2, y2, z2);
-        // Also bin triangle centroid to prevent gaps across larger triangles
         add_sample(
             (x0 + x1 + x2) * (1.0 / 3.0),
             (y0 + y1 + y2) * (1.0 / 3.0),
@@ -430,16 +479,16 @@ fn simplify_and_weld_large_stl(
         cursor += STL_TRIANGLE_BYTES;
     }
 
-    // Compute representative elevation per cluster, preserving global min_z and max_z extremes.
+    // Compute representative elevation per cluster around Y = 0, preserving global min/max extremes.
     let mut grid_z = vec![f32::NAN; total_vertices];
     let mut sum_valid = 0.0_f64;
     let mut num_valid = 0_usize;
     for i in 0..total_vertices {
         if counts[i] > 0 {
-            let z = if (cell_min_z[i] - min_z).abs() <= 1e-4 {
-                min_z
-            } else if (cell_max_z[i] - max_z).abs() <= 1e-4 {
-                max_z
+            let z = if (cell_min_z[i] - local_min_z).abs() <= 1e-4 {
+                local_min_z
+            } else if (cell_max_z[i] - local_max_z).abs() <= 1e-4 {
+                local_max_z
             } else {
                 (accum_z[i] / f64::from(counts[i])) as f32
             };
@@ -502,33 +551,37 @@ fn simplify_and_weld_large_stl(
         }
     }
 
-    // Build welded vertex positions (in Bevy Y-up space) and planar UVs strictly from DemExtent.
+    // Build welded vertex positions centered at (0.0, 0.0, 0.0) in Bevy Y-up space
+    // and planar UVs strictly from centered_extent.
     let mut positions: Vec<[f32; 3]> = Vec::with_capacity(total_vertices);
     let mut normals: Vec<[f32; 3]> = vec![[0.0, 0.0, 0.0]; total_vertices];
     let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(total_vertices);
     let mut indices: Vec<u32> = Vec::with_capacity((simplified_triangle_count as usize) * 3);
 
+    let span_x_f32 = 2.0 * half_w;
+    let span_y_f32 = 2.0 * half_h;
+
     for gy in 0..=cells_y {
-        let y_stl = if gy == 0 {
-            box_max_y
+        let local_y = if gy == 0 {
+            half_h
         } else if gy == cells_y {
-            box_min_y
+            -half_h
         } else {
-            box_max_y - (gy as f32 / cells_y as f32) * span_y
+            half_h - (gy as f32 / cells_y as f32) * span_y_f32
         };
 
         for gx in 0..=cells_x {
-            let x_stl = if gx == 0 {
-                box_min_x
+            let local_x = if gx == 0 {
+                -half_w
             } else if gx == cells_x {
-                box_max_x
+                half_w
             } else {
-                box_min_x + (gx as f32 / cells_x as f32) * span_x
+                -half_w + (gx as f32 / cells_x as f32) * span_x_f32
             };
 
-            let z_stl = grid_z[(gy as usize) * verts_x + (gx as usize)];
-            positions.push(stl_to_bevy_position(x_stl, y_stl, z_stl));
-            uvs.push(extent.compute_uv(x_stl, y_stl));
+            let local_z = grid_z[(gy as usize) * verts_x + (gx as usize)];
+            positions.push(stl_to_bevy_position(local_x, local_y, local_z));
+            uvs.push(centered_extent.compute_uv(local_x, local_y));
         }
     }
 

@@ -26,6 +26,7 @@
 //!    - Zero-Base64 RFC 7578 `multipart/form-data` binary encoder and decoder for `.stl`, `.tif`,
 //!      and `.png` uploads up to 512 MiB.
 
+use crate::stl::MAX_TRIANGLES;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Cursor;
@@ -36,7 +37,7 @@ use tiff::decoder::{Decoder, DecodingResult};
 use crate::models::{Body, Catalog, DemExtent, MeshFormat, SiteMetadata};
 use crate::scoring::compute_weighted_score;
 use crate::stl::{
-    MAX_TRIANGLES, STL_HEADER_BYTES, STL_TRIANGLE_BYTES, WeldedMesh, encode_binary_stl,
+    STL_HEADER_BYTES, STL_TRIANGLE_BYTES, WeldedMesh, encode_binary_stl,
     parse_and_weld_stl_with_stats,
 };
 use crate::tiff_dem::{encode_uncompressed_f32_tiff, parse_dem_tiff};
@@ -594,8 +595,9 @@ pub fn decode_multipart_upload_request(
     Ok(req)
 }
 
-/// Inspects raw binary STL bytes to infer horizontal `DemExtent` (`min_x`, `max_x`, `min_y`, `max_y`).
-/// Supports meshes of any size (including `> 50,000` triangles prior to simplification).
+/// Inspects raw binary STL bytes in double precision (`f64`) to infer the centered local
+/// horizontal `DemExtent` (`[-half_w, half_w]`, `[-half_h, half_h]`).
+/// Supports meshes of any size (including `> 50,000` triangles and JMARS planetocentric coordinates).
 pub fn infer_extent_from_stl_bytes(bytes: &[u8]) -> Result<DemExtent, String> {
     if bytes.len() < STL_HEADER_BYTES + 4 {
         return Err("STL buffer too short to infer DemExtent".to_string());
@@ -619,27 +621,27 @@ pub fn infer_extent_from_stl_bytes(bytes: &[u8]) -> Result<DemExtent, String> {
         ));
     }
 
-    let mut min_x = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut min_y = f32::INFINITY;
-    let mut max_y = f32::NEG_INFINITY;
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
 
     let mut offset = STL_HEADER_BYTES + 4;
     for _ in 0..tri_count {
         for v in 0..3 {
             let base = offset + 12 + v * 12;
-            let x = f32::from_le_bytes([
+            let x = f64::from(f32::from_le_bytes([
                 bytes[base],
                 bytes[base + 1],
                 bytes[base + 2],
                 bytes[base + 3],
-            ]);
-            let y = f32::from_le_bytes([
+            ]));
+            let y = f64::from(f32::from_le_bytes([
                 bytes[base + 4],
                 bytes[base + 5],
                 bytes[base + 6],
                 bytes[base + 7],
-            ]);
+            ]));
             if x.is_finite() && y.is_finite() {
                 min_x = min_x.min(x);
                 max_x = max_x.max(x);
@@ -653,7 +655,9 @@ pub fn infer_extent_from_stl_bytes(bytes: &[u8]) -> Result<DemExtent, String> {
     if !(max_x > min_x && max_y > min_y) {
         return Err("Degenerate horizontal extent in STL vertices".to_string());
     }
-    Ok(DemExtent::new(min_x, max_x, min_y, max_y))
+    let half_w = (0.5 * (max_x - min_x)).max(0.5) as f32;
+    let half_h = (0.5 * (max_y - min_y)).max(0.5) as f32;
+    Ok(DemExtent::new(-half_w, half_w, -half_h, half_h))
 }
 
 /// Subsamples a 2D elevation grid `(width, height)` so neither dimension exceeds `max_dim`
@@ -1682,15 +1686,18 @@ pub fn analyze_and_build_site_bundle(
         );
     }
 
-    // 1. Resolve DemExtent (explicit -> inferred from STL -> inferred from TIFF dimensions -> default 2km x 2km)
-    let extent = if let Some(ext) = req.dem_extent {
+    // 1. Resolve centered local DemExtent ([-half_w, half_w], [-half_h, half_h]) so planar UV
+    //    mapping matches the centered 3D mesh (even when JMARS exports planetocentric coordinates).
+    let extent = if let Some(ref stl_bytes) = raw_stl {
+        infer_extent_from_stl_bytes(stl_bytes)?
+    } else if let Some(ext) = req.dem_extent {
         if !ext.is_valid() {
             return Err("Provided DemExtent is invalid (require min_x < max_x and min_y < max_y)."
                 .to_string());
         }
-        ext
-    } else if let Some(ref stl_bytes) = raw_stl {
-        infer_extent_from_stl_bytes(stl_bytes)?
+        let half_w = (0.5 * f64::from(ext.width())).max(0.5) as f32;
+        let half_h = (0.5 * f64::from(ext.height())).max(0.5) as f32;
+        DemExtent::new(-half_w, half_w, -half_h, half_h)
     } else if let Some(ref tiff_bytes) = raw_tiff {
         let (w, h) = read_tiff_dimensions(tiff_bytes)?;
         let half_w = (w as f32) * 10.0;
@@ -1700,7 +1707,7 @@ pub fn analyze_and_build_site_bundle(
         DemExtent::new(-1000.0, 1000.0, -1000.0, 1000.0)
     };
 
-    // 2. Build both WeldedMesh (<= 50,000 triangles) and subsampled 2D elevation grid (<= 1024x1024)
+    // 2. Build both centered WeldedMesh (<= 50,000 triangles) and subsampled 2D elevation grid (<= 1024x1024)
     let (
         welded_mesh,
         original_tri_count,
@@ -1713,12 +1720,9 @@ pub fn analyze_and_build_site_bundle(
         (Some(stl_bytes), Some(tiff_bytes)) => {
             let (mesh, orig_tris) = parse_and_weld_stl_with_stats(&stl_bytes, &extent)
                 .map_err(|e| format!("Invalid binary STL: {e}"))?;
-            // If the uploaded .stl exceeded MAX_TRIANGLES (50,000), save the decimated .stl to disk.
-            let out_stl = if orig_tris > MAX_TRIANGLES || mesh.triangle_count < orig_tris {
-                welded_mesh_to_binary_stl(&mesh)
-            } else {
-                stl_bytes.into_owned()
-            };
+            // Always serialize the centered (and simplified if > 50,000 triangles) mesh so
+            // data/processed/<site_id>/terrain.stl is centered at (0.0, 0.0, 0.0) and matches DemExtent.
+            let out_stl = welded_mesh_to_binary_stl(&mesh);
             // Decode (and automatically subsample if > 1024x1024) the DEM TIFF; fall back to
             // rasterizing the welded mesh if the GeoTIFF uses an unsupported tag/compression.
             let (w, h, grid) = match decode_tiff_grid(&tiff_bytes) {
@@ -1735,11 +1739,7 @@ pub fn analyze_and_build_site_bundle(
         (Some(stl_bytes), None) => {
             let (mesh, orig_tris) = parse_and_weld_stl_with_stats(&stl_bytes, &extent)
                 .map_err(|e| format!("Invalid binary STL: {e}"))?;
-            let out_stl = if orig_tris > MAX_TRIANGLES || mesh.triangle_count < orig_tris {
-                welded_mesh_to_binary_stl(&mesh)
-            } else {
-                stl_bytes.into_owned()
-            };
+            let out_stl = welded_mesh_to_binary_stl(&mesh);
             let w = if orig_tris > 10_000 { 160_usize } else { 64_usize };
             let h = if orig_tris > 10_000 { 160_usize } else { 64_usize };
             let grid = rasterize_welded_mesh_to_grid(&mesh, &extent, w, h);

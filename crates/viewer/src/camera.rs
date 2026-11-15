@@ -13,6 +13,8 @@ use bevy_egui::EguiContexts;
 pub struct OrbitCamera {
     /// World-space target focal point (`Vec3`).
     pub focus: Vec3,
+    /// Bounding sphere radius of the currently loaded terrain mesh in meters.
+    pub bounding_radius: f32,
     /// Target yaw angle in radians around Bevy's `+Y` up axis.
     pub target_yaw: f32,
     /// Target pitch angle in radians above the horizontal `XZ` plane.
@@ -36,11 +38,13 @@ pub struct OrbitCamera {
 impl Default for OrbitCamera {
     fn default() -> Self {
         let focus = Vec3::ZERO;
+        let bounding_radius = 1415.0_f32;
         let yaw = 0.55_f32;
         let pitch = 0.62_f32;
-        let radius = 2400.0_f32;
+        let radius = bounding_radius * 1.8;
         Self {
             focus,
+            bounding_radius,
             target_yaw: yaw,
             target_pitch: pitch,
             target_radius: radius,
@@ -48,20 +52,36 @@ impl Default for OrbitCamera {
             current_yaw: yaw,
             current_pitch: pitch,
             current_radius: radius,
-            min_radius: 80.0,
-            max_radius: 50_000.0,
+            min_radius: (bounding_radius * 0.02).max(1.0),
+            max_radius: (bounding_radius * 25.0).max(50_000.0),
         }
     }
 }
 
 impl OrbitCamera {
-    /// Resets the camera to frame a terrain of horizontal span `span_meters` centered at `center`.
-    pub fn frame_terrain(&mut self, center: Vec3, span_meters: f32) {
-        let safe_span = span_meters.max(200.0);
+    /// Resets the camera to frame a terrain of bounding sphere radius `bounding_radius`
+    /// centered at `center` (`(0.0, 0.0, 0.0)`) at a proportional distance (`~1.8 * bounding_radius`).
+    pub fn frame_terrain(&mut self, center: Vec3, bounding_radius: f32) {
+        let safe_radius = bounding_radius.max(10.0);
+        self.bounding_radius = safe_radius;
         self.focus = center;
+        self.current_focus = center;
         self.target_yaw = 0.55;
         self.target_pitch = 0.62;
-        self.target_radius = (safe_span * 1.25).clamp(self.min_radius, self.max_radius);
+        self.min_radius = (safe_radius * 0.02).max(1.0);
+        self.max_radius = (safe_radius * 25.0).max(50_000.0);
+        self.target_radius = (safe_radius * 1.8).clamp(self.min_radius, self.max_radius);
+        self.current_radius = self.target_radius;
+    }
+
+    /// Dynamically updates `Projection::Perspective` `near` and `far` clip planes from
+    /// `self.bounding_radius` so large or small terrains never clip when zooming or rotating.
+    pub fn apply_perspective_clip_planes(&self, projection: &mut Projection) {
+        let br = self.bounding_radius.max(10.0);
+        if let Projection::Perspective(ref mut persp) = *projection {
+            persp.near = (br * 0.001).max(0.1);
+            persp.far = (br * 50.0).max(100_000.0);
+        }
     }
 
     /// Computes the camera `Transform` from the current smoothed spherical coordinates.
@@ -81,7 +101,8 @@ impl OrbitCamera {
     }
 }
 
-/// System that processes mouse drag, scroll wheel, and keyboard shortcuts to update [`OrbitCamera`].
+/// System that processes mouse drag, scroll wheel, and keyboard shortcuts to update [`OrbitCamera`]
+/// and synchronize `Projection::Perspective` `near`/`far` clip planes.
 pub fn orbit_camera_system(
     time: Res<Time>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
@@ -89,7 +110,7 @@ pub fn orbit_camera_system(
     mut motion_evr: EventReader<MouseMotion>,
     mut scroll_evr: EventReader<MouseWheel>,
     mut egui_contexts: EguiContexts,
-    mut query: Query<(&mut OrbitCamera, &mut Transform)>,
+    mut query: Query<(&mut OrbitCamera, &mut Transform, &mut Projection)>,
 ) {
     let ctx = egui_contexts.ctx_mut();
     let pointer_captured = ctx.wants_pointer_input() || ctx.is_pointer_over_area();
@@ -112,7 +133,7 @@ pub fn orbit_camera_system(
     let dt = time.delta_seconds().clamp(0.001, 0.1);
     let smooth_t = (12.0 * dt).clamp(0.05, 1.0);
 
-    for (mut cam, mut transform) in &mut query {
+    for (mut cam, mut transform, mut projection) in &mut query {
         if !pointer_captured {
             let shift_held =
                 keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
@@ -142,8 +163,11 @@ pub fn orbit_camera_system(
         }
 
         if !keyboard_captured && keys.just_pressed(KeyCode::KeyR) {
-            cam.frame_terrain(Vec3::ZERO, 2000.0);
+            let br = cam.bounding_radius;
+            cam.frame_terrain(Vec3::ZERO, br);
         }
+
+        cam.apply_perspective_clip_planes(&mut projection);
 
         cam.current_yaw += (cam.target_yaw - cam.current_yaw) * smooth_t;
         cam.current_pitch += (cam.target_pitch - cam.current_pitch) * smooth_t;

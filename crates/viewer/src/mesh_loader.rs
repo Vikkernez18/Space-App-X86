@@ -22,8 +22,80 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 /// `.png` textures never exceed WebGL2 `MAX_TEXTURE_SIZE` or exhaust WASM memory.
 pub const MAX_VIEWER_TEXTURE_DIM: u32 = 2048;
 
+/// Centers all vertices of a [`WeldedMesh`] at the origin `(0.0, 0.0, 0.0)` in Bevy Y-up space
+/// by computing the 3D bounding-box centroid `(center_x, center_y, center_z)` in `f64` and
+/// translating every vertex so the terrain sits at `(0.0, 0.0, 0.0)` with its mid-elevation at `Y = 0`.
+pub fn center_welded_mesh_at_origin(mesh: &mut WeldedMesh) {
+    if mesh.positions.is_empty() {
+        return;
+    }
+
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut min_z = f64::INFINITY;
+    let mut max_z = f64::NEG_INFINITY;
+
+    for pos in &mesh.positions {
+        let x = f64::from(pos[0]);
+        let y = f64::from(pos[1]);
+        let z = f64::from(pos[2]);
+        if x.is_finite() && y.is_finite() && z.is_finite() {
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+            min_z = min_z.min(z);
+            max_z = max_z.max(z);
+        }
+    }
+
+    if !(min_x.is_finite() && min_y.is_finite() && min_z.is_finite()) {
+        return;
+    }
+
+    let center_x = 0.5 * (min_x + max_x);
+    let center_y = 0.5 * (min_y + max_y);
+    let center_z = 0.5 * (min_z + max_z);
+
+    if center_x.abs() > 1e-6 || center_y.abs() > 1e-6 || center_z.abs() > 1e-6 {
+        for pos in &mut mesh.positions {
+            pos[0] = (f64::from(pos[0]) - center_x) as f32;
+            pos[1] = (f64::from(pos[1]) - center_y) as f32;
+            pos[2] = (f64::from(pos[2]) - center_z) as f32;
+        }
+    }
+}
+
+/// Computes the bounding sphere radius (`bounding_radius`) in meters of a centered [`WeldedMesh`]
+/// in double precision (`f64`) around the origin `(0.0, 0.0, 0.0)`.
+pub fn compute_mesh_bounding_radius(mesh: &WeldedMesh) -> f32 {
+    if mesh.positions.is_empty() {
+        return 1000.0;
+    }
+
+    let mut max_r2 = 0.0_f64;
+    for pos in &mesh.positions {
+        let x = f64::from(pos[0]);
+        let y = f64::from(pos[1]);
+        let z = f64::from(pos[2]);
+        let r2 = x * x + y * y + z * z;
+        if r2.is_finite() && r2 > max_r2 {
+            max_r2 = r2;
+        }
+    }
+
+    let radius = max_r2.sqrt() as f32;
+    if radius.is_finite() && radius > 1.0 {
+        radius
+    } else {
+        1000.0
+    }
+}
+
 /// Parses either a binary `.stl` or a `.tif`/`.tiff` elevation DEM into a [`WeldedMesh`]
-/// in Bevy right-handed Y-up space with `DemExtent` planar UVs.
+/// in Bevy right-handed Y-up space centered at `(0.0, 0.0, 0.0)` with `DemExtent` planar UVs.
 ///
 /// Note: For `.tif`/`.tiff` DEMs, `vertical_exaggeration` is passed as `1.0` during mesh
 /// generation because Bevy scales the vertical axis dynamically via
@@ -39,12 +111,15 @@ pub fn parse_site_terrain_bytes(
         site.resolved_mesh_format()
     };
 
-    match format {
+    let mut welded = match format {
         MeshFormat::Stl => parse_and_weld_stl(bytes, &site.dem_extent)
-            .map_err(|e| format!("STL parse error for site '{}': {e}", site.id)),
+            .map_err(|e| format!("STL parse error for site '{}': {e}", site.id))?,
         MeshFormat::Tiff => parse_dem_tiff(bytes, &site.dem_extent, 1.0)
-            .map_err(|e| format!("DEM TIFF parse error for site '{}': {e}", site.id)),
-    }
+            .map_err(|e| format!("DEM TIFF parse error for site '{}': {e}", site.id))?,
+    };
+
+    center_welded_mesh_at_origin(&mut welded);
+    Ok(welded)
 }
 
 /// Converts an `analog_core::WeldedMesh` into a GPU-ready Bevy [`Mesh`] with `Indices::U32`.

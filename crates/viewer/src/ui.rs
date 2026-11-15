@@ -331,6 +331,8 @@ pub struct ViewerAppState {
     pub ranked_scores: Vec<ScoredSite>,
     /// Triangle count of the currently rendered primary 3D mesh.
     pub loaded_primary_triangles: u32,
+    /// Bounding sphere radius in meters of the currently rendered primary 3D mesh.
+    pub loaded_primary_bounding_radius: f32,
     /// Editable site form for authenticated researchers (`POST /api/sites`).
     pub site_editor: SiteEditorForm,
     /// Upload & TDA analysis form for `.stl` / `.tif` / `.png` files (`POST /api/sites/upload`).
@@ -380,6 +382,7 @@ impl Default for ViewerAppState {
             active_weights,
             ranked_scores: recalc.results,
             loaded_primary_triangles: first_site.triangle_count,
+            loaded_primary_bounding_radius: 1415.0,
             site_editor: SiteEditorForm::from_site(&first_site),
             upload_form: TerrainUploadForm::default(),
             last_analysis_report: None,
@@ -435,7 +438,7 @@ pub fn viewer_ui_system(
     mut contexts: EguiContexts,
     mut app_state: ResMut<ViewerAppState>,
     net: Res<NetBridge>,
-    mut cam_query: Query<&mut OrbitCamera>,
+    mut cam_query: Query<(&mut OrbitCamera, &mut Projection)>,
 ) {
     let ctx = contexts.ctx_mut();
 
@@ -755,12 +758,10 @@ pub fn viewer_ui_system(
 
                 ui.horizontal(|ui| {
                     if ui.button("Reset 3D Camera (R)").clicked() {
-                        let span = app_state
-                            .primary_site()
-                            .map(|s| s.dem_extent.width().max(s.dem_extent.height()))
-                            .unwrap_or(2000.0);
-                        for mut cam in &mut cam_query {
-                            cam.frame_terrain(Vec3::ZERO, span);
+                        let br = app_state.loaded_primary_bounding_radius.max(10.0);
+                        for (mut cam, mut proj) in &mut cam_query {
+                            cam.frame_terrain(Vec3::ZERO, br);
+                            cam.apply_perspective_clip_planes(&mut proj);
                         }
                     }
                     if ui.button("Re-fetch Site Mesh & PNG").clicked()
