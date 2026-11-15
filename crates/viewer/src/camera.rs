@@ -33,6 +33,8 @@ pub struct OrbitCamera {
     pub min_radius: f32,
     /// Maximum allowed zoom distance in meters.
     pub max_radius: f32,
+    /// When `true`, smoothly orbits the camera around the terrain while idle (`[Rotate]` / key `A`).
+    pub auto_rotate: bool,
 }
 
 impl Default for OrbitCamera {
@@ -54,6 +56,7 @@ impl Default for OrbitCamera {
             current_radius: radius,
             min_radius: (bounding_radius * 0.02).max(1.0),
             max_radius: (bounding_radius * 25.0).max(50_000.0),
+            auto_rotate: false,
         }
     }
 }
@@ -140,6 +143,7 @@ pub fn orbit_camera_system(
     let smooth_t = (12.0 * dt).clamp(0.05, 1.0);
 
     for (mut cam, mut transform, mut projection) in &mut query {
+        let mut user_dragging = false;
         if !pointer_captured {
             let shift_held =
                 keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
@@ -147,6 +151,10 @@ pub fn orbit_camera_system(
                 || mouse_buttons.pressed(MouseButton::Middle)
                 || (mouse_buttons.pressed(MouseButton::Left) && shift_held);
             let is_orbiting = mouse_buttons.pressed(MouseButton::Left) && !shift_held;
+
+            if is_orbiting || is_panning {
+                user_dragging = true;
+            }
 
             if is_orbiting && delta_drag.length_squared() > 0.0 {
                 cam.target_yaw -= delta_drag.x * 0.0065;
@@ -166,6 +174,10 @@ pub fn orbit_camera_system(
                 cam.target_radius =
                     (cam.target_radius * zoom_factor).clamp(cam.min_radius, cam.max_radius);
             }
+        }
+
+        if cam.auto_rotate && !user_dragging {
+            cam.target_yaw += 0.35 * dt;
         }
 
         if !keyboard_captured {
