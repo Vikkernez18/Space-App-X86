@@ -74,13 +74,19 @@ impl OrbitCamera {
         self.current_radius = self.target_radius;
     }
 
+    /// Adjusts `target_radius` by a multiplicative zoom `factor` (`< 1.0` zooms in, `> 1.0` zooms out).
+    pub fn zoom_by_factor(&mut self, factor: f32) {
+        self.target_radius =
+            (self.target_radius * factor).clamp(self.min_radius, self.max_radius);
+    }
+
     /// Dynamically updates `Projection::Perspective` `near` and `far` clip planes from
     /// `self.bounding_radius` so large or small terrains never clip when zooming or rotating.
     pub fn apply_perspective_clip_planes(&self, projection: &mut Projection) {
         let br = self.bounding_radius.max(10.0);
         if let Projection::Perspective(ref mut persp) = *projection {
-            persp.near = (br * 0.001).max(0.1);
-            persp.far = (br * 50.0).max(100_000.0);
+            persp.near = (br * 0.0005).max(0.05);
+            persp.far = (br * 60.0).max(100_000.0);
         }
     }
 
@@ -162,9 +168,22 @@ pub fn orbit_camera_system(
             }
         }
 
-        if !keyboard_captured && keys.just_pressed(KeyCode::KeyR) {
-            let br = cam.bounding_radius;
-            cam.frame_terrain(Vec3::ZERO, br);
+        if !keyboard_captured {
+            if keys.just_pressed(KeyCode::KeyR) {
+                let br = cam.bounding_radius;
+                cam.frame_terrain(Vec3::ZERO, br);
+            }
+
+            let zoom_in_pressed =
+                keys.pressed(KeyCode::Equal) || keys.pressed(KeyCode::NumpadAdd);
+            let zoom_out_pressed =
+                keys.pressed(KeyCode::Minus) || keys.pressed(KeyCode::NumpadSubtract);
+
+            if zoom_in_pressed && !zoom_out_pressed {
+                cam.zoom_by_factor((1.0 - 1.65 * dt).clamp(0.75, 0.995));
+            } else if zoom_out_pressed && !zoom_in_pressed {
+                cam.zoom_by_factor((1.0 + 1.65 * dt).clamp(1.005, 1.35));
+            }
         }
 
         cam.apply_perspective_clip_planes(&mut projection);

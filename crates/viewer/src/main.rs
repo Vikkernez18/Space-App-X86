@@ -27,7 +27,8 @@ use bevy_egui::EguiPlugin;
 use camera::{OrbitCamera, orbit_camera_system};
 use mesh_loader::{
     build_checkerboard_bevy_image, compute_mesh_bounding_radius, decode_png_to_bevy_image,
-    generate_synthetic_test_site_welded_mesh, parse_site_terrain_bytes, welded_mesh_to_bevy_mesh,
+    generate_synthetic_test_site_welded_mesh, parse_site_terrain_bytes, summarize_site_mesh,
+    welded_mesh_to_bevy_mesh,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use net::BrowserSelectedFile;
@@ -84,9 +85,10 @@ fn main() {
             (
                 process_net_events_system,
                 viewer_ui_system,
-                sync_terrain_visuals_system,
                 orbit_camera_system,
-            ),
+                sync_terrain_visuals_system,
+            )
+                .chain(),
         )
         .run();
 }
@@ -377,6 +379,7 @@ fn process_net_events_system(
                     Ok(welded) => {
                         let tri_count = welded.triangle_count;
                         let bounding_radius = compute_mesh_bounding_radius(&welded);
+                        let summary = summarize_site_mesh(&welded, &site);
                         let bevy_mesh = welded_mesh_to_bevy_mesh(welded);
                         match slot {
                             TerrainSlot::Primary => {
@@ -385,6 +388,7 @@ fn process_net_events_system(
                                 }
                                 app_state.loaded_primary_triangles = tri_count;
                                 app_state.loaded_primary_bounding_radius = bounding_radius;
+                                app_state.loaded_primary_summary = summary;
                                 app_state.status_message = format!(
                                     "Loaded 3D mesh for '{}' ({} triangles, centered at origin, R={:.1}m).",
                                     site.name, tri_count, bounding_radius
@@ -398,6 +402,9 @@ fn process_net_events_system(
                                 if let Some(m) = meshes.get_mut(&handles.comparison_mesh) {
                                     *m = bevy_mesh;
                                 }
+                                app_state.loaded_comparison_triangles = tri_count;
+                                app_state.loaded_comparison_bounding_radius = bounding_radius;
+                                app_state.loaded_comparison_summary = Some(summary);
                             }
                         }
                     }
@@ -439,40 +446,88 @@ fn process_net_events_system(
 }
 
 /// Synchronizes vertical exaggeration (`Transform.scale = Vec3::new(1.0, exaggeration, 1.0)`),
-/// side-by-side comparison placement, and active surface/checkerboard textures.
+/// synchronized Split-Screen 3D placement along the camera's left/right viewport rays,
+/// and active surface/checkerboard textures.
 fn sync_terrain_visuals_system(
     app_state: Res<ViewerAppState>,
     handles: Res<TerrainSceneHandles>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut primary_q: Query<&mut Transform, (With<PrimaryTerrain>, Without<ComparisonTerrain>)>,
+    cam_q: Query<
+        (&OrbitCamera, &Transform, &Projection),
+        (Without<PrimaryTerrain>, Without<ComparisonTerrain>),
+    >,
+    mut primary_q: Query<
+        &mut Transform,
+        (
+            With<PrimaryTerrain>,
+            Without<ComparisonTerrain>,
+            Without<OrbitCamera>,
+        ),
+    >,
     mut comp_q: Query<
         (&mut Transform, &mut Visibility),
-        (With<ComparisonTerrain>, Without<PrimaryTerrain>),
+        (
+            With<ComparisonTerrain>,
+            Without<PrimaryTerrain>,
+            Without<OrbitCamera>,
+        ),
     >,
 ) {
     let scale = Vec3::new(1.0, app_state.vertical_exaggeration, 1.0);
+    let split_active = app_state.comparison_site_id.is_some();
 
-    for mut transform in &mut primary_q {
-        transform.scale = scale;
-    }
+    if split_active
+        && let Ok((cam, cam_transform, cam_proj)) = cam_q.get_single()
+    {
+        let cam_pos = cam_transform.translation;
+        let cam_forward = cam_transform.forward().as_vec3();
+        let cam_right = cam_transform.right().as_vec3();
 
-    let primary_span_x = app_state
-        .primary_site()
-        .map(|s| s.dem_extent.width())
-        .unwrap_or(2000.0);
-    let comp_span_x = app_state
-        .comparison_site()
-        .map(|s| s.dem_extent.width())
-        .unwrap_or(2000.0);
-    let offset_x = (primary_span_x * 0.5 + comp_span_x * 0.5) * 1.25;
+        let (half_tan_x, _) = match cam_proj {
+            Projection::Perspective(persp) => {
+                let half_tan_y = (persp.fov * 0.5).tan();
+                let aspect = if persp.aspect_ratio.is_finite() && persp.aspect_ratio > 0.2 {
+                    persp.aspect_ratio
+                } else {
+                    1.6
+                };
+                (half_tan_y * aspect, half_tan_y)
+            }
+            _ => (0.68, 0.414),
+        };
 
-    for (mut transform, mut vis) in &mut comp_q {
-        transform.scale = scale;
-        transform.translation = Vec3::new(offset_x.max(500.0), 0.0, 0.0);
-        *vis = if app_state.comparison_site_id.is_some() {
-            Visibility::Visible
-        } else {
-            Visibility::Hidden
+        let f = app_state.viewport_left_fraction.clamp(0.0, 0.70);
+        let ndc_x_left = -0.5 + 1.5 * f;
+        let ndc_x_right = 0.5 + 0.5 * f;
+
+        let r_prim = app_state.loaded_primary_bounding_radius.max(10.0);
+        let r_comp = app_state.loaded_comparison_bounding_radius.max(10.0);
+
+        let d_prim = cam.current_radius.max(10.0) * 1.32;
+        let d_comp = d_prim * (r_comp / r_prim).clamp(0.05, 20.0);
+
+        let prim_pos =
+            cam_pos + cam_forward * d_prim + cam_right * (d_prim * half_tan_x * ndc_x_left);
+        let comp_pos =
+            cam_pos + cam_forward * d_comp + cam_right * (d_comp * half_tan_x * ndc_x_right);
+
+        for mut transform in &mut primary_q {
+            transform.translation = prim_pos;
+            transform.scale = scale;
+        }
+        for (mut transform, mut vis) in &mut comp_q {
+            transform.translation = comp_pos;
+            transform.scale = scale;
+            *vis = Visibility::Visible;
+        }
+    } else {
+        for mut transform in &mut primary_q {
+            transform.translation = Vec3::ZERO;
+            transform.scale = scale;
+        }
+        for (mut transform, mut vis) in &mut comp_q {
+            transform.scale = scale;
+            *vis = Visibility::Hidden;
         }
     }
 
