@@ -1,0 +1,9 @@
+{
+  "weights": {
+    "elevation_relief": 0.2,
+    "geomorphology_match": 0.2,
+    "roughness_similarity": 0.25,
+    "slope_safety": 0.35
+  },
+  "generated_by": "analog_server (authenticated researcher)"
+}

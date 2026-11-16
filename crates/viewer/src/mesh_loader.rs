@@ -1,0 +1,720 @@
+// AI-assisted
+//! Terrain mesh (`.stl` and `.tif`/`.tiff`) and surface texture (`.png` and procedural
+//! UV checkerboard) loader for the Bevy 3D viewer.
+//!
+//! Strictly enforces `AGENTS.md` §2:
+//! - Converts Z-up STL / DEM coordinates to Bevy's right-handed Y-up space via `analog_core`.
+//! - Uses planar UVs derived strictly from `DemExtent` (`min_x`, `max_x`, `min_y`, `max_y`).
+//! - Uses `Indices::U32` and enforces `<= 50,000` triangles per site (automatically simplifying
+//!   any `.stl` or `.tif` exceeding `50,000` triangles).
+
+use std::io::Cursor;
+
+use analog_core::models::{DemExtent, MeshFormat, SiteMetadata};
+use analog_core::stl::{WeldedMesh, encode_binary_stl, parse_and_weld_stl};
+use analog_core::terrain_analysis::compute_topology_metrics;
+use analog_core::tiff_dem::parse_dem_tiff;
+use bevy::prelude::*;
+use bevy::render::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
+use bevy::render::render_asset::RenderAssetUsages;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+
+/// Maximum GPU texture dimension per axis in the 3D viewer (`2048x2048`) so huge 50+ MiB
+/// `.png` textures never exceed WebGL2 `MAX_TEXTURE_SIZE` or exhaust WASM memory.
+pub const MAX_VIEWER_TEXTURE_DIM: u32 = 2048;
+
+/// Real-time 3D surface skin / scientific color palette modes (`Resource`).
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SurfaceSkinMode {
+    /// 1. Uses the uploaded `.png` JMARS / albedo texture or generated hypsometric texture.
+    #[default]
+    JmarsTexture,
+    /// 2. Lunar LOLA Hypsometric: dark basalt mare -> silver regolith -> golden crest.
+    LunarLolaHypsometric,
+    /// 3. Martian MOLA Relief: deep sienna/blue basin -> ferric oxide rust -> bright ochre.
+    MartianMolaRelief,
+    /// 4. Terrestrial Topo Analog: basin green -> slope ochre -> grey rock -> white summit.
+    TerrestrialTopoAnalog,
+    /// 5. Landing Slope Hazard (<5° / 15°): green `#22C55E` (<5°), amber `#F59E0B` (5°–15°), red `#EF4444` (>15°).
+    LandingSlopeHazard,
+    /// 6. Raw Clay Mesh (Untextured): classic neutral grey clay mesh.
+    RawClayMesh,
+}
+
+impl SurfaceSkinMode {
+    pub const ALL: [Self; 6] = [
+        Self::JmarsTexture,
+        Self::LunarLolaHypsometric,
+        Self::MartianMolaRelief,
+        Self::TerrestrialTopoAnalog,
+        Self::LandingSlopeHazard,
+        Self::RawClayMesh,
+    ];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::JmarsTexture => "1. JMARS / Albedo Texture",
+            Self::LunarLolaHypsometric => "2. Lunar LOLA Hypsometric",
+            Self::MartianMolaRelief => "3. Martian MOLA Relief",
+            Self::TerrestrialTopoAnalog => "4. Terrestrial Topo Analog",
+            Self::LandingSlopeHazard => "5. Landing Slope Hazard (<5° / 15°)",
+            Self::RawClayMesh => "6. Raw Clay Mesh (Untextured)",
+        }
+    }
+
+    pub fn short_label(&self) -> &'static str {
+        match self {
+            Self::JmarsTexture => "JMARS Texture",
+            Self::LunarLolaHypsometric => "Lunar LOLA",
+            Self::MartianMolaRelief => "Mars MOLA",
+            Self::TerrestrialTopoAnalog => "Earth Topo",
+            Self::LandingSlopeHazard => "Slope <5°/15°",
+            Self::RawClayMesh => "Raw Clay",
+        }
+    }
+
+    pub fn uses_surface_texture(&self) -> bool {
+        matches!(self, Self::JmarsTexture)
+    }
+}
+
+/// Summary of elevation bounds, landing slope safety metrics, and topological invariants
+/// (0D Persistent Homology $\beta_0$ and simplicial Euler characteristic $\chi = V - E + F$)
+/// for a terrain site.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SiteMeshSummary {
+    pub triangle_count: u32,
+    pub min_elevation_m: f32,
+    pub max_elevation_m: f32,
+    pub persistent_basins_b0: usize,
+    pub persistent_peaks_b0: usize,
+    pub euler_characteristic: i64,
+    /// Percentage of terrain surface with slope `< 15°` (safe for lander touchdown & rover traverse).
+    pub safe_landing_pct_under_15deg: f32,
+    /// Percentage of terrain surface with slope `< 5°` (optimal flat pad for habitat foundation).
+    pub optimal_pad_pct_under_5deg: f32,
+    /// Mean surface slope angle in degrees computed from mesh vertex normals.
+    pub mean_slope_deg: f32,
+}
+
+impl Default for SiteMeshSummary {
+    fn default() -> Self {
+        Self {
+            triangle_count: 2048,
+            min_elevation_m: -45.0_f32,
+            max_elevation_m: 120.0_f32,
+            persistent_basins_b0: 2,
+            persistent_peaks_b0: 2,
+            euler_characteristic: 1,
+            safe_landing_pct_under_15deg: 78.5_f32,
+            optimal_pad_pct_under_5deg: 34.2_f32,
+            mean_slope_deg: 8.4_f32,
+        }
+    }
+}
+
+/// Parses precomputed 0D Persistent Homology ($\beta_0$ basins/peaks) and Euler characteristic $\chi$
+/// from a `SiteMetadata::description` generated by `analog_core::terrain_analysis`, if present.
+pub fn extract_tda_from_description(desc: &str) -> Option<(usize, usize, i64)> {
+    let basins_marker = "detects β0 = ";
+    let b_start = desc.find(basins_marker)? + basins_marker.len();
+    let b_rest = &desc[b_start..];
+    let b_end = b_rest.find(' ')?;
+    let basins: usize = b_rest[..b_end].trim().parse().ok()?;
+
+    let peaks_marker = "and β0 = ";
+    let p_start = b_rest.find(peaks_marker)? + peaks_marker.len();
+    let p_rest = &b_rest[p_start..];
+    let p_end = p_rest.find(' ')?;
+    let peaks: usize = p_rest[..p_end].trim().parse().ok()?;
+
+    let euler = if let Some(topo_idx) = desc.find("Simplicial mesh topology:") {
+        let t_rest = &desc[topo_idx..];
+        if let Some(eq_idx) = t_rest.find(") = ") {
+            let after_eq = &t_rest[eq_idx + 4..];
+            let end_idx = after_eq.find(',').unwrap_or(after_eq.len());
+            after_eq[..end_idx].trim().parse::<i64>().unwrap_or(1)
+        } else {
+            1
+        }
+    } else {
+        1
+    };
+
+    Some((basins, peaks, euler))
+}
+
+/// Estimates [`SiteMeshSummary`] directly from [`SiteMetadata`] (used before a site's 3D mesh
+/// bytes have finished loading over HTTP).
+pub fn estimate_site_summary_from_metadata(site: &SiteMetadata) -> SiteMeshSummary {
+    let [min_elevation_m, max_elevation_m] =
+        site.elevation_range_m.unwrap_or([-50.0_f32, 50.0_f32]);
+    let slope_safety = site
+        .feature_scores
+        .get("slope_safety")
+        .copied()
+        .unwrap_or(0.75) as f32;
+    let safe_landing_pct_under_15deg = (slope_safety * 94.0_f32).clamp(5.0_f32, 99.0_f32);
+    let optimal_pad_pct_under_5deg = (slope_safety * 58.0_f32).clamp(2.0_f32, 92.0_f32);
+    let mean_slope_deg = ((1.0_f32 - slope_safety) * 24.0_f32).clamp(1.5_f32, 35.0_f32);
+
+    let (persistent_basins_b0, persistent_peaks_b0, euler_characteristic) =
+        extract_tda_from_description(&site.description).unwrap_or_else(|| {
+            let relief_score = site
+                .feature_scores
+                .get("elevation_relief")
+                .copied()
+                .unwrap_or(0.5);
+            let rough_score = site
+                .feature_scores
+                .get("roughness_similarity")
+                .copied()
+                .unwrap_or(0.5);
+            let est_basins = ((relief_score * 8.0 + rough_score * 6.0).round() as usize).max(1);
+            let est_peaks =
+                ((relief_score * 5.0 + (1.0 - rough_score) * 4.0).round() as usize).max(1);
+            (est_basins, est_peaks, 1)
+        });
+
+    SiteMeshSummary {
+        triangle_count: site.triangle_count,
+        min_elevation_m,
+        max_elevation_m,
+        persistent_basins_b0,
+        persistent_peaks_b0,
+        euler_characteristic,
+        safe_landing_pct_under_15deg,
+        optimal_pad_pct_under_5deg,
+        mean_slope_deg,
+    }
+}
+
+/// Computes landing slope percentages (`< 15°` safe area, `< 5°` optimal pad, and mean slope)
+/// directly from the Bevy Y-up vertex normals (`acos(|normal.y|)`).
+fn compute_landing_safety_from_normals(normals: &[[f32; 3]]) -> (f32, f32, f32) {
+    if normals.is_empty() {
+        return (75.0_f32, 30.0_f32, 9.0_f32);
+    }
+    let mut safe_15_count = 0usize;
+    let mut optimal_5_count = 0usize;
+    let mut slope_sum = 0.0_f32;
+
+    for n in normals {
+        let ny = n[1].abs().clamp(0.0_f32, 1.0_f32);
+        let slope_deg = ny.acos().to_degrees();
+        if slope_deg.is_finite() {
+            slope_sum += slope_deg;
+            if slope_deg < 15.0_f32 {
+                safe_15_count += 1;
+            }
+            if slope_deg < 5.0_f32 {
+                optimal_5_count += 1;
+            }
+        }
+    }
+
+    let total = (normals.len().max(1)) as f32;
+    let safe_15_pct = (safe_15_count as f32 / total * 100.0_f32).clamp(0.0_f32, 100.0_f32);
+    let optimal_5_pct = (optimal_5_count as f32 / total * 100.0_f32).clamp(0.0_f32, 100.0_f32);
+    let mean_slope = (slope_sum / total).clamp(0.0_f32, 90.0_f32);
+    (safe_15_pct, optimal_5_pct, mean_slope)
+}
+
+/// Computes an exact [`SiteMeshSummary`] from a loaded [`WeldedMesh`] and its [`SiteMetadata`].
+pub fn summarize_site_mesh(mesh: &WeldedMesh, site: &SiteMetadata) -> SiteMeshSummary {
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_z = f32::INFINITY;
+    let mut max_z = f32::NEG_INFINITY;
+
+    for p in &mesh.positions {
+        if p[1].is_finite() {
+            min_y = min_y.min(p[1]);
+            max_y = max_y.max(p[1]);
+        }
+        if p[0].is_finite() {
+            min_x = min_x.min(p[0]);
+            max_x = max_x.max(p[0]);
+        }
+        if p[2].is_finite() {
+            min_z = min_z.min(p[2]);
+            max_z = max_z.max(p[2]);
+        }
+    }
+
+    let (min_elevation_m, max_elevation_m) = if let Some([min_e, max_e]) = site.elevation_range_m {
+        (min_e, max_e)
+    } else if min_y.is_finite() && max_y.is_finite() {
+        (min_y, max_y)
+    } else {
+        (-50.0_f32, 50.0_f32)
+    };
+
+    let (safe_landing_pct_under_15deg, optimal_pad_pct_under_5deg, mean_slope_deg) =
+        compute_landing_safety_from_normals(&mesh.normals);
+
+    if let Some((basins, peaks, euler)) = extract_tda_from_description(&site.description) {
+        return SiteMeshSummary {
+            triangle_count: mesh.triangle_count,
+            min_elevation_m,
+            max_elevation_m,
+            persistent_basins_b0: basins,
+            persistent_peaks_b0: peaks,
+            euler_characteristic: euler,
+            safe_landing_pct_under_15deg,
+            optimal_pad_pct_under_5deg,
+            mean_slope_deg,
+        };
+    }
+
+    // Fast 48x48 elevation projection for live 0D Persistent Homology & simplicial Euler χ
+    let gw = 48usize;
+    let gh = 48usize;
+    let span_x = (max_x - min_x).max(1.0_f32);
+    let span_z = (max_z - min_z).max(1.0_f32);
+    let mut accum = vec![0.0_f32; gw * gh];
+    let mut counts = vec![0_u32; gw * gh];
+    for p in &mesh.positions {
+        let u = ((p[0] - min_x) / span_x).clamp(0.0_f32, 1.0_f32);
+        let v = ((p[2] - min_z) / span_z).clamp(0.0_f32, 1.0_f32);
+        let cx = ((u * ((gw - 1) as f32)).round() as usize).min(gw - 1);
+        let cy = ((v * ((gh - 1) as f32)).round() as usize).min(gh - 1);
+        let idx = cy * gw + cx;
+        accum[idx] += p[1];
+        counts[idx] += 1;
+    }
+    let mean_elev = 0.5_f32 * (min_y + max_y);
+    let mut grid = vec![mean_elev; gw * gh];
+    for i in 0..(gw * gh) {
+        if counts[i] > 0 {
+            grid[i] = accum[i] / (counts[i] as f32);
+        }
+    }
+    let elev_range = f64::from((max_elevation_m - min_elevation_m).abs().max(1.0_f32));
+    let topo = compute_topology_metrics(gw, gh, &grid, elev_range, mesh);
+
+    SiteMeshSummary {
+        triangle_count: mesh.triangle_count,
+        min_elevation_m,
+        max_elevation_m,
+        persistent_basins_b0: topo.persistent_basins_b0,
+        persistent_peaks_b0: topo.persistent_peaks_b0,
+        euler_characteristic: topo.euler_characteristic,
+        safe_landing_pct_under_15deg,
+        optimal_pad_pct_under_5deg,
+        mean_slope_deg,
+    }
+}
+
+/// Centers all vertices of a [`WeldedMesh`] at the origin `(0.0, 0.0, 0.0)` in Bevy Y-up space
+/// by computing the 3D bounding-box centroid `(center_x, center_y, center_z)` in `f64` and
+/// translating every vertex so the terrain sits at `(0.0, 0.0, 0.0)` with its mid-elevation at `Y = 0`.
+pub fn center_welded_mesh_at_origin(mesh: &mut WeldedMesh) {
+    if mesh.positions.is_empty() {
+        return;
+    }
+
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    let mut min_z = f64::INFINITY;
+    let mut max_z = f64::NEG_INFINITY;
+
+    for pos in &mesh.positions {
+        let x = f64::from(pos[0]);
+        let y = f64::from(pos[1]);
+        let z = f64::from(pos[2]);
+        if x.is_finite() && y.is_finite() && z.is_finite() {
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+            min_z = min_z.min(z);
+            max_z = max_z.max(z);
+        }
+    }
+
+    if !(min_x.is_finite() && min_y.is_finite() && min_z.is_finite()) {
+        return;
+    }
+
+    let center_x = 0.5 * (min_x + max_x);
+    let center_y = 0.5 * (min_y + max_y);
+    let center_z = 0.5 * (min_z + max_z);
+
+    if center_x.abs() > 1e-6 || center_y.abs() > 1e-6 || center_z.abs() > 1e-6 {
+        for pos in &mut mesh.positions {
+            pos[0] = (f64::from(pos[0]) - center_x) as f32;
+            pos[1] = (f64::from(pos[1]) - center_y) as f32;
+            pos[2] = (f64::from(pos[2]) - center_z) as f32;
+        }
+    }
+}
+
+/// Computes the bounding sphere radius (`bounding_radius`) in meters of a centered [`WeldedMesh`]
+/// in double precision (`f64`) around the origin `(0.0, 0.0, 0.0)`.
+pub fn compute_mesh_bounding_radius(mesh: &WeldedMesh) -> f32 {
+    if mesh.positions.is_empty() {
+        return 1000.0;
+    }
+
+    let mut max_r2 = 0.0_f64;
+    for pos in &mesh.positions {
+        let x = f64::from(pos[0]);
+        let y = f64::from(pos[1]);
+        let z = f64::from(pos[2]);
+        let r2 = x * x + y * y + z * z;
+        if r2.is_finite() && r2 > max_r2 {
+            max_r2 = r2;
+        }
+    }
+
+    let radius = max_r2.sqrt() as f32;
+    if radius.is_finite() && radius > 1.0 {
+        radius
+    } else {
+        1000.0
+    }
+}
+
+/// Parses either a binary `.stl` or a `.tif`/`.tiff` elevation DEM into a [`WeldedMesh`]
+/// in Bevy right-handed Y-up space centered at `(0.0, 0.0, 0.0)` with `DemExtent` planar UVs.
+///
+/// Note: For `.tif`/`.tiff` DEMs, `vertical_exaggeration` is passed as `1.0` during mesh
+/// generation because Bevy scales the vertical axis dynamically via
+/// `Transform.scale = Vec3::new(1.0, exaggeration, 1.0)` per `AGENTS.md` §2.3.
+pub fn parse_site_terrain_bytes(
+    bytes: &[u8],
+    site: &SiteMetadata,
+) -> Result<WeldedMesh, String> {
+    let is_tiff_magic = bytes.starts_with(b"II*\x00") || bytes.starts_with(b"MM\x00*");
+    let format = if is_tiff_magic {
+        MeshFormat::Tiff
+    } else {
+        site.resolved_mesh_format()
+    };
+
+    let mut welded = match format {
+        MeshFormat::Stl => parse_and_weld_stl(bytes, &site.dem_extent)
+            .map_err(|e| format!("STL parse error for site '{}': {e}", site.id))?,
+        MeshFormat::Tiff => parse_dem_tiff(bytes, &site.dem_extent, 1.0)
+            .map_err(|e| format!("DEM TIFF parse error for site '{}': {e}", site.id))?,
+    };
+
+    center_welded_mesh_at_origin(&mut welded);
+    Ok(welded)
+}
+
+/// Linearly interpolates between two RGB colors `[r, g, b]` in `[0.0, 1.0]`.
+#[inline]
+fn lerp_rgb(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 4] {
+    let tc = t.clamp(0.0_f32, 1.0_f32);
+    [
+        a[0] + (b[0] - a[0]) * tc,
+        a[1] + (b[1] - a[1]) * tc,
+        a[2] + (b[2] - a[2]) * tc,
+        1.0_f32,
+    ]
+}
+
+/// Dynamically computes and assigns `Mesh::ATTRIBUTE_COLOR` per vertex on `mesh` according to
+/// the active [`SurfaceSkinMode`] (normalized vertex elevation `y` or local slope angle `acos(|normal.y|)`).
+pub fn apply_surface_skin_to_bevy_mesh(mesh: &mut Mesh, skin: SurfaceSkinMode) {
+    let Some(VertexAttributeValues::Float32x3(positions)) =
+        mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+    else {
+        return;
+    };
+    let n_verts = positions.len();
+    if n_verts == 0 {
+        return;
+    }
+
+    if matches!(skin, SurfaceSkinMode::JmarsTexture) {
+        let white = vec![[1.0_f32, 1.0_f32, 1.0_f32, 1.0_f32]; n_verts];
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, white);
+        return;
+    }
+
+    if matches!(skin, SurfaceSkinMode::RawClayMesh) {
+        let clay = vec![[0.76_f32, 0.80_f32, 0.85_f32, 1.0_f32]; n_verts];
+        mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, clay);
+        return;
+    }
+
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for p in positions {
+        if p[1].is_finite() {
+            min_y = min_y.min(p[1]);
+            max_y = max_y.max(p[1]);
+        }
+    }
+    let span_y = (max_y - min_y).max(1e-3_f32);
+
+    let normals_opt = match mesh.attribute(Mesh::ATTRIBUTE_NORMAL) {
+        Some(VertexAttributeValues::Float32x3(norms)) => Some(norms.as_slice()),
+        _ => None,
+    };
+
+    let mut colors = Vec::with_capacity(n_verts);
+    for i in 0..n_verts {
+        let y = positions[i][1];
+        let t = ((y - min_y) / span_y).clamp(0.0_f32, 1.0_f32);
+        let ny = normals_opt
+            .and_then(|ns| ns.get(i))
+            .map(|n| n[1].abs().clamp(0.0_f32, 1.0_f32))
+            .unwrap_or(1.0_f32);
+        let slope_deg = ny.acos().to_degrees();
+
+        let rgba = match skin {
+            SurfaceSkinMode::JmarsTexture => [1.0_f32, 1.0_f32, 1.0_f32, 1.0_f32],
+            SurfaceSkinMode::RawClayMesh => [0.76_f32, 0.80_f32, 0.85_f32, 1.0_f32],
+            SurfaceSkinMode::LunarLolaHypsometric => {
+                // Dark basalt mare -> silver regolith -> golden crest
+                let mare = [0.12_f32, 0.14_f32, 0.19_f32];
+                let regolith = [0.58_f32, 0.64_f32, 0.72_f32];
+                let crest = [0.98_f32, 0.82_f32, 0.22_f32];
+                if t < 0.55_f32 {
+                    lerp_rgb(mare, regolith, t / 0.55_f32)
+                } else {
+                    lerp_rgb(regolith, crest, (t - 0.55_f32) / 0.45_f32)
+                }
+            }
+            SurfaceSkinMode::MartianMolaRelief => {
+                // Deep basin blue/sienna -> ferric oxide rust -> bright ochre
+                let basin = [0.16_f32, 0.23_f32, 0.36_f32];
+                let rust = [0.76_f32, 0.26_f32, 0.08_f32];
+                let ochre = [0.98_f32, 0.74_f32, 0.45_f32];
+                if t < 0.45_f32 {
+                    lerp_rgb(basin, rust, t / 0.45_f32)
+                } else {
+                    lerp_rgb(rust, ochre, (t - 0.45_f32) / 0.55_f32)
+                }
+            }
+            SurfaceSkinMode::TerrestrialTopoAnalog => {
+                // Basin green -> slope ochre -> grey rock -> white peak
+                let green = [0.09_f32, 0.50_f32, 0.24_f32];
+                let ochre = [0.79_f32, 0.54_f32, 0.04_f32];
+                let rock = [0.47_f32, 0.44_f32, 0.42_f32];
+                let snow = [0.96_f32, 0.98_f32, 0.99_f32];
+                if t < 0.35_f32 {
+                    lerp_rgb(green, ochre, t / 0.35_f32)
+                } else if t < 0.75_f32 {
+                    lerp_rgb(ochre, rock, (t - 0.35_f32) / 0.40_f32)
+                } else {
+                    lerp_rgb(rock, snow, (t - 0.75_f32) / 0.25_f32)
+                }
+            }
+            SurfaceSkinMode::LandingSlopeHazard => {
+                // Scientific landing safety map:
+                // < 5 deg: green #22C55E | 5-15 deg: amber #F59E0B | > 15 deg: red #EF4444
+                if slope_deg < 5.0_f32 {
+                    [0.133_f32, 0.773_f32, 0.369_f32, 1.0_f32]
+                } else if slope_deg <= 15.0_f32 {
+                    [0.961_f32, 0.620_f32, 0.043_f32, 1.0_f32]
+                } else {
+                    [0.937_f32, 0.267_f32, 0.267_f32, 1.0_f32]
+                }
+            }
+        };
+        colors.push(rgba);
+    }
+
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+}
+
+/// Converts an `analog_core::WeldedMesh` into a GPU-ready Bevy [`Mesh`] with `Indices::U32`.
+pub fn welded_mesh_to_bevy_mesh(welded: WeldedMesh) -> Mesh {
+    let n_verts = welded.positions.len();
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, welded.positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, welded.normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, welded.uvs);
+    mesh.insert_attribute(
+        Mesh::ATTRIBUTE_COLOR,
+        vec![[1.0_f32, 1.0_f32, 1.0_f32, 1.0_f32]; n_verts],
+    );
+    mesh.insert_indices(Indices::U32(welded.indices));
+    mesh
+}
+
+/// Decodes an in-memory `.png` byte buffer into an `Rgba8UnormSrgb` Bevy [`Image`],
+/// automatically downsampling images larger than [`MAX_VIEWER_TEXTURE_DIM`] (`2048x2048`)
+/// so 50+ MiB PNGs render cleanly in WebGL2 / WASM.
+pub fn decode_png_to_bevy_image(png_bytes: &[u8]) -> Result<Image, String> {
+    let mut decoder = png::Decoder::new(Cursor::new(png_bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("Failed to read PNG header: {e}"))?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| format!("Failed to decode PNG frame: {e}"))?;
+
+    let raw = &buf[..info.buffer_size()];
+    let src_w = info.width as usize;
+    let src_h = info.height as usize;
+
+    let scale = (info.width as f64 / MAX_VIEWER_TEXTURE_DIM as f64)
+        .max(info.height as f64 / MAX_VIEWER_TEXTURE_DIM as f64)
+        .max(1.0);
+    let out_w = ((info.width as f64 / scale).round() as u32).clamp(1, MAX_VIEWER_TEXTURE_DIM);
+    let out_h = ((info.height as f64 / scale).round() as u32).clamp(1, MAX_VIEWER_TEXTURE_DIM);
+
+    let bpp = match info.color_type {
+        png::ColorType::Rgba => 4usize,
+        png::ColorType::Rgb => 3usize,
+        png::ColorType::GrayscaleAlpha => 2usize,
+        png::ColorType::Grayscale | png::ColorType::Indexed => 1usize,
+    };
+
+    let mut rgba = Vec::with_capacity((out_w as usize) * (out_h as usize) * 4);
+    let max_r = src_h.saturating_sub(1);
+    let max_c = src_w.saturating_sub(1);
+
+    for or in 0..(out_h as usize) {
+        let sr = if out_h <= 1 {
+            0
+        } else if or + 1 == out_h as usize {
+            max_r
+        } else {
+            (or * max_r) / ((out_h as usize) - 1)
+        };
+        let row_base = sr * src_w;
+        for oc in 0..(out_w as usize) {
+            let sc = if out_w <= 1 {
+                0
+            } else if oc + 1 == out_w as usize {
+                max_c
+            } else {
+                (oc * max_c) / ((out_w as usize) - 1)
+            };
+            let idx = (row_base + sc) * bpp;
+            match info.color_type {
+                png::ColorType::Rgba => {
+                    rgba.extend_from_slice(&raw[idx..idx + 4]);
+                }
+                png::ColorType::Rgb => {
+                    rgba.extend_from_slice(&[raw[idx], raw[idx + 1], raw[idx + 2], 255]);
+                }
+                png::ColorType::GrayscaleAlpha => {
+                    let g = raw[idx];
+                    let a = raw[idx + 1];
+                    rgba.extend_from_slice(&[g, g, g, a]);
+                }
+                png::ColorType::Grayscale | png::ColorType::Indexed => {
+                    let g = raw[idx];
+                    rgba.extend_from_slice(&[g, g, g, 255]);
+                }
+            }
+        }
+    }
+
+    Ok(Image::new(
+        Extent3d {
+            width: out_w,
+            height: out_h,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        rgba,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    ))
+}
+
+/// Builds a procedural 8x8 UV verification checkerboard [`Image`] (`AGENTS.md` §2.4):
+/// - North-West corner tile (`u=0, v=0`) is highlighted in Cyan/Teal.
+/// - South-East corner tile (`u=1, v=1`) is highlighted in Amber/Orange.
+/// - Alternating interior tiles are Light Silver and Dark Slate.
+pub fn build_checkerboard_bevy_image(width: u32, height: u32, tiles: u32) -> Image {
+    let safe_tiles = tiles.max(2);
+    let tile_w = (width / safe_tiles).max(1);
+    let tile_h = (height / safe_tiles).max(1);
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+
+    for y in 0..height {
+        let ty = (y / tile_h).min(safe_tiles - 1);
+        for x in 0..width {
+            let tx = (x / tile_w).min(safe_tiles - 1);
+            let color: [u8; 4] = if tx == 0 && ty == 0 {
+                // North-West corner (u=0, v=0)
+                [0, 210, 220, 255]
+            } else if tx == safe_tiles - 1 && ty == safe_tiles - 1 {
+                // South-East corner (u=1, v=1)
+                [245, 140, 30, 255]
+            } else if (tx + ty) % 2 == 0 {
+                [220, 226, 234, 255]
+            } else {
+                [36, 44, 58, 255]
+            };
+            rgba.extend_from_slice(&color);
+        }
+    }
+
+    Image::new(
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        rgba,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    )
+}
+
+/// Generates the synthetic crater-and-ridge [`WeldedMesh`] in memory for `test_site`
+/// so that the 3D viewer always has an immediate fallback mesh even before disk assets load.
+pub fn generate_synthetic_test_site_welded_mesh(extent: &DemExtent) -> WeldedMesh {
+    let grid_cells = 32usize;
+    let dx = extent.width() / (grid_cells as f32);
+    let dy = extent.height() / (grid_cells as f32);
+    let mut triangles: Vec<[[f32; 3]; 3]> = Vec::with_capacity(grid_cells * grid_cells * 2);
+
+    let elev = |x: f32, y: f32| -> f32 {
+        let r = (x * x + y * y).sqrt();
+        let bowl = -65.0 * (-(r / 320.0).powi(2)).exp();
+        let rim = 85.0 * (-((r - 450.0) / 140.0).powi(2)).exp();
+        let ridge = 20.0 * (x / 350.0).sin() * (y / 400.0).cos();
+        (bowl + rim + ridge + 15.0).clamp(-45.0, 120.0)
+    };
+
+    for iy in 0..grid_cells {
+        let y0 = extent.min_y + (iy as f32) * dy;
+        let y1 = if iy + 1 == grid_cells {
+            extent.max_y
+        } else {
+            extent.min_y + ((iy + 1) as f32) * dy
+        };
+        for ix in 0..grid_cells {
+            let x0 = extent.min_x + (ix as f32) * dx;
+            let x1 = if ix + 1 == grid_cells {
+                extent.max_x
+            } else {
+                extent.min_x + ((ix + 1) as f32) * dx
+            };
+
+            let v00 = [x0, y0, elev(x0, y0)];
+            let v10 = [x1, y0, elev(x1, y0)];
+            let v11 = [x1, y1, elev(x1, y1)];
+            let v01 = [x0, y1, elev(x0, y1)];
+
+            triangles.push([v00, v10, v11]);
+            triangles.push([v00, v11, v01]);
+        }
+    }
+
+    let stl_bytes = encode_binary_stl(&triangles);
+    parse_and_weld_stl(&stl_bytes, extent).expect("synthetic test_site STL must be valid")
+}

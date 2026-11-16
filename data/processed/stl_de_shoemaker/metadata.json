@@ -1,0 +1,28 @@
+{
+  "id": "stl_de_shoemaker",
+  "name": "STL de Shoemaker",
+  "body": "moon",
+  "description": "Morphometric & TDA classification -> Proposed Body: MOON (Analog Score: 0.6588, Similarity to 'STL de Shoemaker' [MOON]: 100.0%). Mesh decimated from 558962 to 49530 triangles (<= 50000 budget). Differential geometry shows mean slope 9.39° (P90 = 14.10°), TRI roughness 3.74 m, and Hypsometric Integral HI = 0.455. 0D Persistent Homology detects β0 = 70 persistent basins/craters and β0 = 5 persistent peaks/domes (max persistence 51.6 m). Simplicial mesh topology: χ = V(25088) - E(74617) + F(49530) = 1, 1 connected component(s), manifold=true.",
+  "dem_extent": {
+    "min_x": -213.0,
+    "max_x": 213.0,
+    "min_y": -325.5,
+    "max_y": 325.5
+  },
+  "elevation_range_m": [
+    -26.2487,
+    25.306
+  ],
+  "triangle_count": 49530,
+  "mesh_path": "stl_de_shoemaker/terrain.stl",
+  "mesh_format": "stl",
+  "texture_path": "stl_de_shoemaker/albedo.png",
+  "feature_scores": {
+    "elevation_relief": 0.4369,
+    "geomorphology_match": 0.8134,
+    "roughness_similarity": 0.7891,
+    "slope_safety": 0.6043
+  },
+  "canonical_score": 0.6588,
+  "generated_by": "analog_core::terrain_analysis"
+}

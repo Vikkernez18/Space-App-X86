@@ -1,3 +1,699 @@
+// AI-assisted
+//! `analog_viewer` — Bevy + `bevy_egui` 3D WebAssembly and Native terrain explorer
+//! for the Space-App-X86 platform.
+//!
+//! Enforces `AGENTS.md` §2 & §4:
+//! - Loads binary `.stl` and `.tif`/`.tiff` DEMs via `analog_core` with Z-up to Y-up conversion.
+//! - Applies planar UVs strictly from `DemExtent` (`min_x`, `max_x`, `min_y`, `max_y`).
+//! - Scales vertical exaggeration exclusively along Bevy's `+Y` up axis:
+//!   `Transform.scale = Vec3::new(1.0, exaggeration, 1.0)`.
+//! - Includes the procedural 8x8 NW/SE UV verification checkerboard toggle.
+//! - Supports passwordless Public Demo Mode for judges and Argon2id Researcher Mode
+//!   with binary `multipart/form-data` 3D/DEM terrain upload and Topological Data Analysis (TDA).
+
+pub mod camera;
+pub mod mesh_loader;
+pub mod net;
+pub mod ui;
+
+use analog_core::scoring::recalculate_catalog;
+use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::prelude::*;
+use bevy::render::view::NoFrustumCulling;
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::window::FileDragAndDrop;
+use bevy_egui::EguiPlugin;
+
+use camera::{OrbitCamera, orbit_camera_system};
+use mesh_loader::{
+    SurfaceSkinMode, apply_surface_skin_to_bevy_mesh, build_checkerboard_bevy_image,
+    compute_mesh_bounding_radius, decode_png_to_bevy_image, generate_synthetic_test_site_welded_mesh,
+    parse_site_terrain_bytes, summarize_site_mesh, welded_mesh_to_bevy_mesh,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use net::BrowserSelectedFile;
+use net::{
+    NetBridge, NetEvent, TerrainSlot, install_browser_file_drop_listener,
+    poll_browser_uploaded_files,
+};
+use ui::{SiteEditorForm, ViewerAppState, viewer_ui_system};
+
+/// Marker component for the primary 3D terrain mesh entity.
+#[derive(Component)]
+pub struct PrimaryTerrain;
+
+/// Marker component for the optional side-by-side comparison 3D terrain mesh entity.
+#[derive(Component)]
+pub struct ComparisonTerrain;
+
+/// Resource storing GPU handles for the primary and comparison terrain meshes, materials, and textures.
+#[derive(Resource)]
+pub struct TerrainSceneHandles {
+    pub checkerboard_texture: Handle<Image>,
+    pub primary_site_texture: Option<Handle<Image>>,
+    pub comparison_site_texture: Option<Handle<Image>>,
+    pub primary_mesh: Handle<Mesh>,
+    pub comparison_mesh: Handle<Mesh>,
+    pub primary_material: Handle<StandardMaterial>,
+    pub comparison_material: Handle<StandardMaterial>,
+    pub applied_skin: SurfaceSkinMode,
+    pub applied_checkerboard: bool,
+}
+
 fn main() {
-    println!("Hello, world!");
+    App::new()
+        .insert_resource(ClearColor(Color::srgb(0.04, 0.055, 0.08)))
+        .insert_resource(AmbientLight {
+            color: Color::srgb(0.78, 0.82, 0.92),
+            brightness: 350.0,
+        })
+        .init_resource::<NetBridge>()
+        .init_resource::<ViewerAppState>()
+        .init_resource::<SurfaceSkinMode>()
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                title: "Space-App-X86 — Lunar & Martian Terrestrial Analogs 3D Explorer"
+                    .to_string(),
+                canvas: Some("#bevy-canvas".to_string()),
+                fit_canvas_to_parent: true,
+                prevent_default_event_handling: false,
+                ..default()
+            }),
+            ..default()
+        }))
+        .add_plugins(EguiPlugin)
+        .add_systems(Startup, setup_scene_system)
+        .add_systems(
+            Update,
+            (
+                process_net_events_system,
+                viewer_ui_system,
+                orbit_camera_system,
+                sync_terrain_visuals_system,
+            )
+                .chain(),
+        )
+        .run();
+}
+
+/// Initializes lighting, the orbital 3D camera, the UV verification checkerboard texture,
+/// the browser file drop listener, and the initial `test_site` terrain mesh.
+fn setup_scene_system(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    app_state: Res<ViewerAppState>,
+    net: Res<NetBridge>,
+) {
+    install_browser_file_drop_listener();
+
+    // Primary solar directional light
+    commands.spawn(DirectionalLightBundle {
+        directional_light: DirectionalLight {
+            illuminance: 11_000.0,
+            shadows_enabled: false,
+            color: Color::srgb(1.0, 0.98, 0.94),
+            ..default()
+        },
+        transform: Transform::from_xyz(1400.0, 2200.0, 1200.0).looking_at(Vec3::ZERO, Vec3::Y),
+        ..default()
+    });
+
+    // Secondary sky/rim fill light to reveal shadow detail in deep craters
+    commands.spawn(DirectionalLightBundle {
+        directional_light: DirectionalLight {
+            illuminance: 3_200.0,
+            shadows_enabled: false,
+            color: Color::srgb(0.65, 0.75, 0.95),
+            ..default()
+        },
+        transform: Transform::from_xyz(-1400.0, 1500.0, -1200.0).looking_at(Vec3::ZERO, Vec3::Y),
+        ..default()
+    });
+
+    // Initial synthetic test_site terrain mesh (centered at origin)
+    let default_extent = app_state
+        .primary_site()
+        .map(|s| s.dem_extent)
+        .unwrap_or_else(|| analog_core::DemExtent::new(-1000.0, 1000.0, -1000.0, 1000.0));
+    let initial_welded = generate_synthetic_test_site_welded_mesh(&default_extent);
+    let initial_bounding_radius = compute_mesh_bounding_radius(&initial_welded);
+
+    // Orbital 3D camera framed to the initial mesh bounding sphere with dynamic near/far clip planes
+    let mut orbit_cam = OrbitCamera::default();
+    orbit_cam.frame_terrain(Vec3::ZERO, initial_bounding_radius);
+    let cam_transform = orbit_cam.compute_transform();
+    let mut cam_projection = Projection::Perspective(PerspectiveProjection::default());
+    orbit_cam.apply_perspective_clip_planes(&mut cam_projection);
+    commands.spawn((
+        Camera3dBundle {
+            projection: cam_projection,
+            transform: cam_transform,
+            tonemapping: Tonemapping::None,
+            ..default()
+        },
+        orbit_cam,
+    ));
+
+    // Procedural 8x8 NW/SE UV alignment checkerboard texture
+    let checker_img = build_checkerboard_bevy_image(512, 512, 8);
+    let checker_handle = images.add(checker_img);
+
+    let primary_mesh_handle = meshes.add(welded_mesh_to_bevy_mesh(initial_welded.clone()));
+    let comparison_mesh_handle = meshes.add(welded_mesh_to_bevy_mesh(initial_welded));
+
+    let primary_mat_handle = materials.add(StandardMaterial {
+        base_color_texture: Some(checker_handle.clone()),
+        perceptual_roughness: 0.88,
+        metallic: 0.04,
+        reflectance: 0.25,
+        ..default()
+    });
+
+    let comparison_mat_handle = materials.add(StandardMaterial {
+        base_color_texture: Some(checker_handle.clone()),
+        perceptual_roughness: 0.88,
+        metallic: 0.04,
+        reflectance: 0.25,
+        ..default()
+    });
+
+    commands.spawn((
+        PbrBundle {
+            mesh: primary_mesh_handle.clone(),
+            material: primary_mat_handle.clone(),
+            transform: Transform::from_scale(Vec3::new(1.0, app_state.vertical_exaggeration, 1.0)),
+            visibility: Visibility::Hidden,
+            ..default()
+        },
+        NoFrustumCulling,
+        PrimaryTerrain,
+    ));
+
+    commands.spawn((
+        PbrBundle {
+            mesh: comparison_mesh_handle.clone(),
+            material: comparison_mat_handle.clone(),
+            transform: Transform::from_xyz(2600.0, 0.0, 0.0)
+                .with_scale(Vec3::new(1.0, app_state.vertical_exaggeration, 1.0)),
+            visibility: Visibility::Hidden,
+            ..default()
+        },
+        NoFrustumCulling,
+        ComparisonTerrain,
+    ));
+
+    commands.insert_resource(TerrainSceneHandles {
+        checkerboard_texture: checker_handle,
+        primary_site_texture: None,
+        comparison_site_texture: None,
+        primary_mesh: primary_mesh_handle,
+        comparison_mesh: comparison_mesh_handle,
+        primary_material: primary_mat_handle,
+        comparison_material: comparison_mat_handle,
+        applied_skin: SurfaceSkinMode::JmarsTexture,
+        applied_checkerboard: app_state.show_checkerboard_uv,
+    });
+
+    // Query existing session status and initial catalog/assets
+    net.check_session();
+    if let Some(site) = app_state.primary_site() {
+        net.fetch_site_assets(TerrainSlot::Primary, site);
+    }
+}
+
+/// Processes asynchronous HTTP / asset loading responses from [`NetBridge`] as well as
+/// browser/native file selections for `.stl`, `.tif`/`.tiff`, and `.png` uploads.
+fn process_net_events_system(
+    net: Res<NetBridge>,
+    mut app_state: ResMut<ViewerAppState>,
+    skin_mode: Res<SurfaceSkinMode>,
+    mut handles: ResMut<TerrainSceneHandles>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut cam_query: Query<(&mut OrbitCamera, &mut Projection)>,
+    #[cfg(not(target_arch = "wasm32"))] mut dnd_events: EventReader<FileDragAndDrop>,
+) {
+    // 1. Poll files selected or dropped in the browser (WASM)
+    for file in poll_browser_uploaded_files() {
+        match app_state.upload_form.ingest_selected_file(file) {
+            Ok(msg) => {
+                app_state.status_message = msg;
+                app_state.error_message = None;
+            }
+            Err(err) => {
+                app_state.error_message = Some(err);
+            }
+        }
+    }
+
+    // 2. Poll native desktop drag-and-drop files (raw binary Vec<u8>, no Base64)
+    #[cfg(not(target_arch = "wasm32"))]
+    for ev in dnd_events.read() {
+        if let FileDragAndDrop::DroppedFile { path_buf, .. } = ev {
+            if let Ok(bytes) = std::fs::read(path_buf) {
+                let name = path_buf
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("dropped.stl")
+                    .to_string();
+                let size = bytes.len();
+                let selected = BrowserSelectedFile { name, size, bytes };
+                match app_state.upload_form.ingest_selected_file(selected) {
+                    Ok(msg) => {
+                        app_state.status_message = msg;
+                        app_state.error_message = None;
+                    }
+                    Err(err) => {
+                        app_state.error_message = Some(err);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Process HTTP / asset events
+    for event in net.drain_events() {
+        match event {
+            NetEvent::DemoLoaded { catalog, message } => {
+                app_state.status_message = message;
+                if app_state.mode_selected {
+                    app_state.error_message = None;
+                }
+                app_state.apply_catalog(catalog);
+                if let Some(site) = app_state.primary_site().cloned() {
+                    net.fetch_site_assets(TerrainSlot::Primary, &site);
+                }
+            }
+            NetEvent::CatalogLoaded(catalog) => {
+                app_state.status_message =
+                    format!("Loaded catalog with {} site(s).", catalog.sites.len());
+                if app_state.mode_selected {
+                    app_state.error_message = None;
+                }
+                app_state.apply_catalog(catalog);
+                if let Some(site) = app_state.primary_site().cloned() {
+                    net.fetch_site_assets(TerrainSlot::Primary, &site);
+                }
+            }
+            NetEvent::SessionStatus {
+                authenticated,
+                username,
+                mode: _,
+                message,
+            } => {
+                app_state.authenticated = authenticated;
+                app_state.researcher_username = username;
+                if !message.is_empty() {
+                    app_state.status_message = message;
+                }
+                if authenticated {
+                    app_state.mode_selected = true;
+                    app_state.error_message = None;
+                }
+            }
+            NetEvent::Recalculated(recalc) => {
+                app_state.ranked_scores = recalc.results;
+            }
+            NetEvent::CanonicalWeightsSaved(catalog) => {
+                app_state.status_message =
+                    "Canonical weights persisted to server (PUT /api/weights).".to_string();
+                app_state.error_message = None;
+                app_state.apply_catalog(catalog);
+            }
+            NetEvent::CatalogReset {
+                catalog,
+                restore_demo,
+            } => {
+                app_state.comparison_site_id = None;
+                app_state.last_analysis_report = None;
+                app_state.error_message = None;
+                app_state.apply_catalog(catalog);
+                if restore_demo {
+                    app_state.status_message =
+                        "Restored reference demo site (test_site) in catalog.".to_string();
+                    if let Some(site) = app_state.primary_site().cloned() {
+                        net.fetch_site_assets(TerrainSlot::Primary, &site);
+                    }
+                } else {
+                    app_state.primary_site_id.clear();
+                    app_state.loaded_primary_triangles = 0;
+                    app_state.loaded_comparison_triangles = 0;
+                    app_state.status_message =
+                        "Workspace reset: cleared all preloaded maps. Ready to upload new terrains."
+                            .to_string();
+                }
+            }
+            NetEvent::SiteSaved(saved_site) => {
+                app_state.status_message = format!(
+                    "Saved site '{}' to catalog (POST /api/sites).",
+                    saved_site.id
+                );
+                app_state.error_message = None;
+                let saved_id = saved_site.id.clone();
+                if let Some(existing) = app_state
+                    .catalog
+                    .sites
+                    .iter_mut()
+                    .find(|s| s.id == saved_id)
+                {
+                    *existing = saved_site.clone();
+                } else {
+                    app_state.catalog.sites.push(saved_site.clone());
+                }
+                let recalc = recalculate_catalog(&app_state.catalog, &app_state.active_weights);
+                app_state.ranked_scores = recalc.results;
+                app_state.primary_site_id = saved_id;
+                app_state.site_editor = SiteEditorForm::from_site(&saved_site);
+                net.fetch_site_assets(TerrainSlot::Primary, &saved_site);
+            }
+            NetEvent::SiteUploaded(uploaded) => {
+                app_state.upload_form.is_uploading = false;
+                app_state.error_message = None;
+                let new_site = uploaded.report.generated_site_metadata.clone();
+                app_state.status_message = format!(
+                    "Analyzed '{}': proposed {} analog (score={:.4}, tris: {}->{}, chi={}, b0 basins={}).",
+                    new_site.name,
+                    uploaded.report.proposal.proposed_body.as_str().to_uppercase(),
+                    uploaded.report.proposal.analog_score,
+                    uploaded.report.original_triangle_count,
+                    uploaded.report.simplified_triangle_count,
+                    uploaded.report.topology.euler_characteristic,
+                    uploaded.report.topology.persistent_basins_b0
+                );
+                app_state.last_analysis_report = Some(uploaded.report);
+                app_state.primary_site_id = new_site.id.clone();
+                app_state.apply_catalog(uploaded.updated_catalog);
+                app_state.primary_site_id = new_site.id.clone();
+                app_state.site_editor = SiteEditorForm::from_site(&new_site);
+                app_state.show_checkerboard_uv = false;
+                net.fetch_site_assets(TerrainSlot::Primary, &new_site);
+            }
+            NetEvent::SiteMeshBytesLoaded {
+                slot,
+                site_id,
+                bytes,
+            } => {
+                let Some(site) = app_state
+                    .catalog
+                    .sites
+                    .iter()
+                    .find(|s| s.id == site_id)
+                    .cloned()
+                else {
+                    continue;
+                };
+
+                match parse_site_terrain_bytes(&bytes, &site) {
+                    Ok(welded) => {
+                        let tri_count = welded.triangle_count;
+                        let bounding_radius = compute_mesh_bounding_radius(&welded);
+                        let summary = summarize_site_mesh(&welded, &site);
+                        let mut bevy_mesh = welded_mesh_to_bevy_mesh(welded);
+                        let effective_skin = if app_state.show_checkerboard_uv {
+                            SurfaceSkinMode::JmarsTexture
+                        } else {
+                            *skin_mode
+                        };
+                        apply_surface_skin_to_bevy_mesh(&mut bevy_mesh, effective_skin);
+                        match slot {
+                            TerrainSlot::Primary => {
+                                if let Some(m) = meshes.get_mut(&handles.primary_mesh) {
+                                    *m = bevy_mesh;
+                                }
+                                app_state.loaded_primary_triangles = tri_count;
+                                app_state.loaded_primary_bounding_radius = bounding_radius;
+                                app_state.loaded_primary_summary = summary;
+                                app_state.status_message = format!(
+                                    "Loaded 3D mesh for '{}' ({} tris, safe <15 deg: {:.1}%, pad <5 deg: {:.1}%).",
+                                    site.name,
+                                    tri_count,
+                                    summary.safe_landing_pct_under_15deg,
+                                    summary.optimal_pad_pct_under_5deg
+                                );
+                                for (mut cam, mut proj) in &mut cam_query {
+                                    cam.frame_terrain(Vec3::ZERO, bounding_radius);
+                                    cam.apply_perspective_clip_planes(&mut proj);
+                                }
+                            }
+                            TerrainSlot::Comparison => {
+                                if let Some(m) = meshes.get_mut(&handles.comparison_mesh) {
+                                    *m = bevy_mesh;
+                                }
+                                app_state.loaded_comparison_triangles = tri_count;
+                                app_state.loaded_comparison_bounding_radius = bounding_radius;
+                                app_state.loaded_comparison_summary = Some(summary);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        app_state.error_message = Some(err);
+                    }
+                }
+            }
+            NetEvent::SiteTextureBytesLoaded {
+                slot,
+                site_id,
+                bytes,
+            } => match decode_png_to_bevy_image(&bytes) {
+                Ok(img) => {
+                    let tex_handle = images.add(img);
+                    match slot {
+                        TerrainSlot::Primary => {
+                            handles.primary_site_texture = Some(tex_handle);
+                            app_state.status_message = format!(
+                                "Loaded surface PNG texture for '{site_id}' (toggle Checkerboard UV to compare)."
+                            );
+                        }
+                        TerrainSlot::Comparison => {
+                            handles.comparison_site_texture = Some(tex_handle);
+                        }
+                    }
+                }
+                Err(err) => {
+                    app_state.error_message =
+                        Some(format!("Texture decode error for '{site_id}': {err}"));
+                }
+            },
+            NetEvent::Error(err) => {
+                app_state.upload_form.is_uploading = false;
+                app_state.error_message = Some(err);
+            }
+        }
+    }
+}
+
+/// Synchronizes vertical exaggeration (`Transform.scale = Vec3::new(1.0, exaggeration, 1.0)`),
+/// synchronized Split-Screen 3D placement along the camera's left/right viewport rays,
+/// dynamic per-vertex [`SurfaceSkinMode`] colors (`Mesh::ATTRIBUTE_COLOR`), and active textures.
+fn sync_terrain_visuals_system(
+    app_state: Res<ViewerAppState>,
+    skin_mode: Res<SurfaceSkinMode>,
+    mut handles: ResMut<TerrainSceneHandles>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    cam_q: Query<
+        (&OrbitCamera, &Transform, &Projection),
+        (Without<PrimaryTerrain>, Without<ComparisonTerrain>),
+    >,
+    mut primary_q: Query<
+        (&mut Transform, &mut Visibility),
+        (
+            With<PrimaryTerrain>,
+            Without<ComparisonTerrain>,
+            Without<OrbitCamera>,
+        ),
+    >,
+    mut comp_q: Query<
+        (&mut Transform, &mut Visibility),
+        (
+            With<ComparisonTerrain>,
+            Without<PrimaryTerrain>,
+            Without<OrbitCamera>,
+        ),
+    >,
+) {
+    let scale = Vec3::new(1.0, app_state.vertical_exaggeration, 1.0);
+    let show_scene = app_state.mode_selected && !app_state.catalog.sites.is_empty();
+    let split_active = show_scene && app_state.comparison_site_id.is_some();
+
+    if !show_scene {
+        for (mut transform, mut vis) in &mut primary_q {
+            transform.scale = scale;
+            *vis = Visibility::Hidden;
+        }
+        for (mut transform, mut vis) in &mut comp_q {
+            transform.scale = scale;
+            *vis = Visibility::Hidden;
+        }
+        return;
+    }
+
+    if split_active
+        && let Ok((cam, cam_transform, cam_proj)) = cam_q.get_single()
+    {
+        let cam_pos = cam_transform.translation;
+        let cam_forward = cam_transform.forward().as_vec3();
+        let cam_right = cam_transform.right().as_vec3();
+
+        let (half_tan_x, _) = match cam_proj {
+            Projection::Perspective(persp) => {
+                let half_tan_y = (persp.fov * 0.5).tan();
+                let aspect = if persp.aspect_ratio.is_finite() && persp.aspect_ratio > 0.2 {
+                    persp.aspect_ratio
+                } else {
+                    1.6
+                };
+                (half_tan_y * aspect, half_tan_y)
+            }
+            _ => (0.68, 0.414),
+        };
+
+        let f = app_state.viewport_left_fraction.clamp(0.0, 0.70);
+        let ndc_x_left = -0.5 + 1.5 * f;
+        let ndc_x_right = 0.5 + 0.5 * f;
+
+        let r_prim = app_state.loaded_primary_bounding_radius.max(10.0);
+        let r_comp = app_state.loaded_comparison_bounding_radius.max(10.0);
+
+        let d_prim = cam.current_radius.max(10.0) * 1.32;
+        let d_comp = d_prim * (r_comp / r_prim).clamp(0.05, 20.0);
+
+        let prim_pos =
+            cam_pos + cam_forward * d_prim + cam_right * (d_prim * half_tan_x * ndc_x_left);
+        let comp_pos =
+            cam_pos + cam_forward * d_comp + cam_right * (d_comp * half_tan_x * ndc_x_right);
+
+        for (mut transform, mut vis) in &mut primary_q {
+            transform.translation = prim_pos;
+            transform.scale = scale;
+            *vis = Visibility::Visible;
+        }
+        for (mut transform, mut vis) in &mut comp_q {
+            transform.translation = comp_pos;
+            transform.scale = scale;
+            *vis = Visibility::Visible;
+        }
+    } else {
+        for (mut transform, mut vis) in &mut primary_q {
+            transform.translation = Vec3::ZERO;
+            transform.scale = scale;
+            *vis = Visibility::Visible;
+        }
+        for (mut transform, mut vis) in &mut comp_q {
+            transform.scale = scale;
+            *vis = Visibility::Hidden;
+        }
+    }
+
+    // Recompute per-vertex colors when SurfaceSkinMode or Checkerboard UV toggle changes
+    if handles.applied_skin != *skin_mode
+        || handles.applied_checkerboard != app_state.show_checkerboard_uv
+    {
+        let effective_skin = if app_state.show_checkerboard_uv {
+            SurfaceSkinMode::JmarsTexture
+        } else {
+            *skin_mode
+        };
+        if let Some(m) = meshes.get_mut(&handles.primary_mesh) {
+            apply_surface_skin_to_bevy_mesh(m, effective_skin);
+        }
+        if let Some(m) = meshes.get_mut(&handles.comparison_mesh) {
+            apply_surface_skin_to_bevy_mesh(m, effective_skin);
+        }
+        handles.applied_skin = *skin_mode;
+        handles.applied_checkerboard = app_state.show_checkerboard_uv;
+    }
+
+    let use_texture = app_state.show_checkerboard_uv || skin_mode.uses_surface_texture();
+
+    // Update primary material texture (Checkerboard vs loaded PNG vs vertex-colored skin)
+    if let Some(mat) = materials.get_mut(&handles.primary_material) {
+        let target_tex = if !use_texture {
+            None
+        } else if app_state.show_checkerboard_uv {
+            Some(handles.checkerboard_texture.clone())
+        } else {
+            Some(
+                handles
+                    .primary_site_texture
+                    .clone()
+                    .unwrap_or_else(|| handles.checkerboard_texture.clone()),
+            )
+        };
+        if mat.base_color_texture != target_tex {
+            mat.base_color_texture = target_tex;
+        }
+    }
+
+    // Update comparison material texture
+    if let Some(mat) = materials.get_mut(&handles.comparison_material) {
+        let target_tex = if !use_texture {
+            None
+        } else if app_state.show_checkerboard_uv {
+            Some(handles.checkerboard_texture.clone())
+        } else {
+            Some(
+                handles
+                    .comparison_site_texture
+                    .clone()
+                    .unwrap_or_else(|| handles.checkerboard_texture.clone()),
+            )
+        };
+        if mat.base_color_texture != target_tex {
+            mat.base_color_texture = target_tex;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use analog_core::tiff_dem::encode_uncompressed_f32_tiff;
+    use analog_core::{Body, DemExtent, MeshFormat, SiteMetadata};
+    use std::collections::BTreeMap;
+
+    use crate::mesh_loader::{
+        build_checkerboard_bevy_image, generate_synthetic_test_site_welded_mesh,
+        parse_site_terrain_bytes,
+    };
+
+    #[test]
+    fn test_viewer_synthetic_test_site_mesh_and_checkerboard() {
+        let extent = DemExtent::new(-1000.0, 1000.0, -1000.0, 1000.0);
+        let welded = generate_synthetic_test_site_welded_mesh(&extent);
+        assert_eq!(welded.triangle_count, 2048);
+        assert!(welded.triangle_count <= 50_000);
+
+        let img = build_checkerboard_bevy_image(64, 64, 8);
+        assert_eq!(img.width(), 64);
+        assert_eq!(img.height(), 64);
+    }
+
+    #[test]
+    fn test_viewer_parses_both_stl_and_tiff_dem_sites() {
+        let extent = DemExtent::new(0.0, 500.0, 0.0, 500.0);
+        let tiff_bytes = encode_uncompressed_f32_tiff(4, 4, &[12.0_f32; 16]);
+
+        let site = SiteMetadata {
+            id: "mars_dem_test".to_string(),
+            name: "Mars DEM Test".to_string(),
+            body: Body::Mars,
+            description: String::new(),
+            center_lat_lon: None,
+            dem_extent: extent,
+            elevation_range_m: None,
+            triangle_count: 18,
+            mesh_path: "sites/mars_dem_test/elevation.tif".to_string(),
+            mesh_format: Some(MeshFormat::Tiff),
+            texture_path: "sites/mars_dem_test/texture.png".to_string(),
+            feature_scores: BTreeMap::new(),
+            canonical_score: 0.75,
+            generated_by: None,
+        };
+
+        let welded = parse_site_terrain_bytes(&tiff_bytes, &site).expect("DEM TIFF should parse");
+        assert_eq!(welded.triangle_count, 18);
+        assert_eq!(welded.positions.len(), 16);
+    }
 }
