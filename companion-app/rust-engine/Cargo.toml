@@ -1,0 +1,9 @@
+[package]
+name = "planetary-settler-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Rust geospatial & 3D mesh mathematical viability engine for JMARS Moon & Mars settlement site selection"
+
+[[bin]]
+name = "planetary-engine"
+path = "src/main.rs"
